@@ -3616,18 +3616,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@envelop/core@npm:^6.0.0-alpha-20261019165905-4e993e96c2903cbe3084f9b49dfbf05042e3fe57":
-  version: 6.0.0-rc-20250306152642-f02839d206a88fa8ebab104fec74f8eca1874bc3
-  resolution: "@envelop/core@npm:6.0.0-rc-20250306152642-f02839d206a88fa8ebab104fec74f8eca1874bc3"
-  dependencies:
-    "@envelop/instrumentation": "npm:^1.0.0-rc-20250306152642-f02839d206a88fa8ebab104fec74f8eca1874bc3"
-    "@envelop/types": "npm:^5.2.1-rc-20250306152642-f02839d206a88fa8ebab104fec74f8eca1874bc3"
-    "@whatwg-node/promise-helpers": "npm:^1.2.4"
-    tslib: "npm:^2.5.0"
-  checksum: 10c0/c8a47af03c7f117d63d43f63382912f9c6e09e8e13af341fa74d8fe8e5db7a4c5339ff2cb1846a1997f6b584d5cf3362385b7524d1e0e0278d968079eb8c15e1
-  languageName: node
-  linkType: hard
-
 "@envelop/disable-introspection@npm:10.0.0-alpha-20261019165905-4e993e96c2903cbe3084f9b49dfbf05042e3fe57":
   version: 10.0.0-alpha-20261019165905-4e993e96c2903cbe3084f9b49dfbf05042e3fe57
   resolution: "@envelop/disable-introspection@npm:10.0.0-alpha-20261019165905-4e993e96c2903cbe3084f9b49dfbf05042e3fe57"
@@ -3686,16 +3674,6 @@ __metadata:
     "@whatwg-node/promise-helpers": "npm:^1.2.1"
     tslib: "npm:^2.5.0"
   checksum: 10c0/134df1ac481fb392aafc4522a22bcdc6ef0701f2d15d51b16207f3c9a4c7d3760adfa5f5bcc84f0c0ec7b011d84bcd40fff671eb471bed54bd928c165994b4e3
-  languageName: node
-  linkType: hard
-
-"@envelop/instrumentation@npm:^1.0.0-rc-20250306152642-f02839d206a88fa8ebab104fec74f8eca1874bc3":
-  version: 1.0.1
-  resolution: "@envelop/instrumentation@npm:1.0.1"
-  dependencies:
-    "@whatwg-node/promise-helpers": "npm:^1.2.1"
-    tslib: "npm:^2.5.0"
-  checksum: 10c0/3177b08e39eae3cbe61e343ead6fa282e011001b538fcfb52c782dc2cbf1290548ebeb3f534229b030623b856328fc3ed9067147d5cfec3a94ca8a10acf71028
   languageName: node
   linkType: hard
 
@@ -3825,16 +3803,6 @@ __metadata:
     "@whatwg-node/promise-helpers": "npm:^1.0.0"
     tslib: "npm:^2.5.0"
   checksum: 10c0/2cdbb29d98350d957e18aff38ddf95670c249df894afab7fc888e2a02b43ca029fde96ca2829e5350bf83b982bc0267a5c8f7ee3ed9d353d4f145ebc0dc0b1e0
-  languageName: node
-  linkType: hard
-
-"@envelop/types@npm:^5.2.1-rc-20250306152642-f02839d206a88fa8ebab104fec74f8eca1874bc3":
-  version: 5.2.2
-  resolution: "@envelop/types@npm:5.2.2"
-  dependencies:
-    "@whatwg-node/promise-helpers": "npm:^1.0.0"
-    tslib: "npm:^2.5.0"
-  checksum: 10c0/67c7ee9ae5f274a9de84d3405e8bb64794839968185c231db68a322f3bf5f560017b877360a055cb488a750ef9b897469f80faa6fab3ef8185e12bbeb75d55b4
   languageName: node
   linkType: hard
 
