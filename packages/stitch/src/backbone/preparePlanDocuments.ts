@@ -294,6 +294,8 @@ export function preparePlanDocuments(
       return root;
     }
     const schema = targetSchema(root.subschema);
+    // Filter only the prebuilt document — keep original selectionSet for the
+    // delegateToSchema / Transformer fallback (abstract/requires need it).
     const filtered = filterSelectionSetForSubschema(
       root.selectionSet,
       root.entityTypeName,
@@ -302,29 +304,32 @@ export function preparePlanDocuments(
     );
     return {
       ...root,
-      selectionSet: filtered,
       document: buildEntitiesDocument(root.entityTypeName, filtered),
     };
   }
   if (root.kind === 'BatchFetch') {
     const schema = targetSchema(root.subschema);
-    const aliases = root.aliases.map((a, i) => {
-      const filtered = filterSelectionSetForSubschema(
-        a.selectionSet,
-        a.entityTypeName,
-        schema,
-        fragments,
-      );
-      return {
+    const aliases: StitchBatchAlias[] = root.aliases.map((a, i) => ({
+      ...a,
+      // Keep original selectionSet for parallel-Fetch fallback.
+      representationsVariable: a.representationsVariable ?? `__batch_reps_${i}`,
+    }));
+    // Filtered selections only inside the prebuilt multi-alias document.
+    const document = buildBatchEntitiesDocument(
+      aliases.map((a) => ({
         ...a,
-        selectionSet: filtered,
-        representationsVariable: a.representationsVariable ?? `__batch_reps_${i}`,
-      };
-    });
+        selectionSet: filterSelectionSetForSubschema(
+          a.selectionSet,
+          a.entityTypeName,
+          schema,
+          fragments,
+        ),
+      })),
+    );
     return {
       ...root,
       aliases,
-      document: buildBatchEntitiesDocument(aliases),
+      document,
     };
   }
   return root;

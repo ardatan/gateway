@@ -947,8 +947,10 @@ function tryExecuteEntitiesBatch(
     }
   };
 
-  // Prebuilt plan document → skip Transformer / prepareGatewayDocument.
-  if (node.document) {
+  // Prebuilt document skips Transformer — only safe for leaf-only selections
+  // (Hive inventory/username style). Nested/abstract/requires need
+  // prepareGatewayDocument (wrapConcreteTypes, fieldNodesByField, transforms).
+  if (node.document && isLeafOnlySelection(node.selectionSet)) {
     const args = entry.argsFromKeys!(keys) as Record<string, any>;
     const executor = getSubschemaExecutor(
       hopSubschema,
@@ -1385,10 +1387,34 @@ type BatchAliasPrep = {
 };
 
 /**
+ * True when selection is only scalar/enum fields (+ __typename) — no nests,
+ * fragments, args, or directives. Directives (`@include`/`@skip`) need
+ * variable defs that Transformer/finalizeGatewayRequest would attach.
+ */
+function isLeafOnlySelection(selectionSet: SelectionSetNode): boolean {
+  for (const sel of selectionSet.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      return false;
+    }
+    if (sel.name.value === '__typename') {
+      continue;
+    }
+    if (
+      sel.selectionSet ||
+      sel.arguments?.length ||
+      sel.directives?.length
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Multi-type BatchFetch — Hive model: one prebuilt multi-alias `_entities`
  * document (`_e0`/`_e1`…), one subgraph HTTP round-trip, then per-alias merge.
- * Falls back to parallel Fetches when the plan has no document or an alias
- * lacks `_entities` merge config.
+ * Nested alias selections fall back to parallel Fetches (batch-execute still
+ * collapses same-tick `_entities` into one HTTP).
  */
 function executeBatchFetchNode(
   node: Extract<StitchPlanNode, { kind: 'BatchFetch' }>,
@@ -1398,6 +1424,9 @@ function executeBatchFetchNode(
     return;
   }
 
+  // Prefer one multi-alias HTTP whenever the plan attached a document.
+  // Alias selectionSets stay unfiltered for the parallel-Fetch fallback;
+  // the document itself carries subgraph-filtered selections.
   if (node.document) {
     const prepared: BatchAliasPrep[] = [];
     const variables: Record<string, any> = Object.create(null);
@@ -1413,7 +1442,6 @@ function executeBatchFetchNode(
         a.flattenPaths,
       );
       if (!parents.length) {
-        // Hive always sends `[]` for empty aliases so required vars stay valid.
         variables[varName] = [];
         continue;
       }
@@ -1514,7 +1542,8 @@ function executeBatchFetchNode(
     }
   }
 
-  // Fallback: parallel per-alias Fetch (delegate / Transformer path).
+  // Nested / abstract aliases: parallel Fetch; getBatchingExecutor merges
+  // same-tick `_entities` into one HTTP like Hive multi-alias.
   const jobs = node.aliases.map((a) =>
     executeFetchNode(
       {
@@ -1558,22 +1587,20 @@ export function executeStitchPlan(
     infoStub: {},
   };
 
-  // Sequence-safe dependsOn (fetchDependsOn + Sequence barriers) lets the
-  // dataflow scheduler fire hops as soon as deps complete — same waves as
-  // the Sequence/Parallel tree, without unsafe early @provides fires.
-  // Islands keep the recursive tree path (local resolver + continue).
-  const run =
-    planHasIslands(plan.root) || plan.incomplete
-      ? () => executePlanNode(plan.root, ctx)
-      : () => executeDataflowPlan(plan.root, ctx);
-  return handleMaybePromise(run, () => {
-    const result: ExecutionResult = {};
-    if (Object.keys(ctx.data).length) {
-      result.data = ctx.data;
-    }
-    if (ctx.errors.length) {
-      result.errors = ctx.errors as any;
-    }
-    return result;
-  });
+  // Tree Sequence/Parallel execute. Dataflow (executeDataflowPlan) needs
+  // complete @provides/abstract edges beyond Sequence barriers — keep tree
+  // until fetchDependsOn covers those cases.
+  return handleMaybePromise(
+    () => executePlanNode(plan.root, ctx),
+    () => {
+      const result: ExecutionResult = {};
+      if (Object.keys(ctx.data).length) {
+        result.data = ctx.data;
+      }
+      if (ctx.errors.length) {
+        result.errors = ctx.errors as any;
+      }
+      return result;
+    },
+  );
 }
