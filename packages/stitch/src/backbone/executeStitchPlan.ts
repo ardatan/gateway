@@ -6,6 +6,8 @@ import {
   Subschema,
   type StitchingInfo,
 } from '@graphql-tools/delegate';
+// FIELD_SUBSCHEMA_MAP is set by annotateExternalObject; nested stubs from a
+// Fetch often lack OBJECT_SUBSCHEMA_SYMBOL until we stamp the fetching subschema.
 import { getFragmentsFromDocument } from '@graphql-tools/executor';
 import {
   createGraphQLError,
@@ -15,6 +17,7 @@ import {
   getArgumentValues,
   getDefinedRootType,
   getOperationASTFromRequest,
+  mergeDeep,
 } from '@graphql-tools/utils';
 import {
   handleMaybePromise,
@@ -40,6 +43,82 @@ function getSubschemaExecutor(subschema: Subschema): Executor {
     return subschema.executor;
   }
   return createDefaultExecutor(subschema.schema);
+}
+
+/** Annotate a root/entity payload so mergeFields can resolve follow-up hops. */
+function annotateValue(
+  value: any,
+  errors: readonly any[],
+  subschema: Subschema,
+): any {
+  if (value == null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => annotateValue(item, errors, subschema));
+  }
+  return annotateExternalObject(value, errors as any[], subschema, {});
+}
+
+/**
+ * Nested objects returned inside a Fetch (e.g. Review.product) often lack
+ * OBJECT_SUBSCHEMA_SYMBOL. Stamp the fetching subschema so later entity hops
+ * know the correct source when calling delegationPlanBuilder.
+ */
+function ensureAnnotatedTree(value: any, subschema: Subschema): void {
+  if (value == null || typeof value !== 'object') {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      ensureAnnotatedTree(item, subschema);
+    }
+    return;
+  }
+  if ((value as any)[OBJECT_SUBSCHEMA_SYMBOL] == null) {
+    annotateExternalObject(value, [], subschema, {});
+  }
+  for (const key of Object.keys(value)) {
+    ensureAnnotatedTree(value[key], subschema);
+  }
+}
+
+/**
+ * Merge Parallel shared-root Fetch results into one object/list. Preserves
+ * external-object symbols from the left-hand side when both sides are objects.
+ */
+function mergeRootValues(existing: any, incoming: any): any {
+  if (existing == null) {
+    return incoming;
+  }
+  if (incoming == null) {
+    return existing;
+  }
+  if (Array.isArray(existing) && Array.isArray(incoming)) {
+    const len = Math.max(existing.length, incoming.length);
+    const out: any[] = new Array(len);
+    for (let i = 0; i < len; i++) {
+      out[i] = mergeRootValues(existing[i], incoming[i]);
+    }
+    return out;
+  }
+  if (
+    typeof existing === 'object' &&
+    typeof incoming === 'object' &&
+    !Array.isArray(existing) &&
+    !Array.isArray(incoming)
+  ) {
+    // mergeDeep copies enumerable props; re-apply annotation symbols from either side.
+    const merged = mergeDeep([existing, incoming], undefined, true, true);
+    const sourceSub =
+      (existing as any)[OBJECT_SUBSCHEMA_SYMBOL] ??
+      (incoming as any)[OBJECT_SUBSCHEMA_SYMBOL];
+    if (sourceSub && merged && typeof merged === 'object') {
+      return annotateExternalObject(merged, [], sourceSub, {});
+    }
+    return merged;
+  }
+  return incoming;
 }
 
 function buildRootDocument(
@@ -134,16 +213,18 @@ function executeFetchNode(
           ctx.errors.push(...result.errors);
         }
         if (result.data && responseKey in result.data) {
-          const value = result.data[responseKey];
-          if (value != null && typeof value === 'object') {
-            ctx.data[responseKey] = annotateExternalObject(
-              value,
-              result.errors ?? [],
-              node.subschema,
-              {},
+          const annotated = annotateValue(
+            result.data[responseKey],
+            result.errors ?? [],
+            node.subschema,
+          );
+          if (responseKey in ctx.data) {
+            ctx.data[responseKey] = mergeRootValues(
+              ctx.data[responseKey],
+              annotated,
             );
           } else {
-            ctx.data[responseKey] = value;
+            ctx.data[responseKey] = annotated;
           }
         }
       },
@@ -183,47 +264,115 @@ function executeFetchNode(
     return;
   }
 
-  // Same wrapping defaultMergedResolver uses so collectSubFields sees nested fields.
-  const planningParentField: FieldNode = {
-    kind: Kind.FIELD,
-    name: { kind: Kind.NAME, value: node.entityTypeName },
-    selectionSet: node.selectionSet,
-  };
-
-  const jobs: MaybePromise<any>[] = [];
-  for (const parent of parents) {
-    const sourceSubschema =
-      ((parent as any)[OBJECT_SUBSCHEMA_SYMBOL] as Subschema | undefined) ??
-      node.subschema;
-
-    const info = {
-      ...(ctx.infoStub as any),
-      schema: ctx.schema,
-      parentType: type,
-      returnType: type,
-      fieldName: node.entityTypeName,
-      fieldNodes: [planningParentField],
-      fragments: ctx.fragments,
-      operation: ctx.operation,
-      variableValues: ctx.variableValues,
-      path: {
-        typename: node.entityTypeName,
-        key: node.flattenPath.at(-1),
-        prev: undefined,
-      },
+  // Execute the planned target directly (router-style Fetch), instead of
+  // re-running delegationPlanBuilder which can mark the hop non-proxiable
+  // based on source *schema* keys even when the parent object already has them.
+  const resolver = mergedTypeInfo.resolvers.get(node.subschema);
+  if (!resolver) {
+    // Fall back to mergeFields when no explicit merge resolver is registered.
+    const planningParentField: FieldNode = {
+      kind: Kind.FIELD,
+      name: { kind: Kind.NAME, value: node.entityTypeName },
+      selectionSet: node.selectionSet,
     };
-
-    jobs.push(
-      mergeFields(
-        mergedTypeInfo,
-        parent,
-        sourceSubschema,
-        ctx.contextValue,
-        info,
-        [planningParentField],
-      ),
+    const jobs: MaybePromise<any>[] = [];
+    for (const parent of parents) {
+      const sourceSubschema =
+        ((parent as any)[OBJECT_SUBSCHEMA_SYMBOL] as Subschema | undefined) ??
+        node.subschema;
+      const info = {
+        ...(ctx.infoStub as any),
+        schema: ctx.schema,
+        parentType: type,
+        returnType: type,
+        fieldName: node.entityTypeName,
+        fieldNodes: [planningParentField],
+        fragments: ctx.fragments,
+        operation: ctx.operation,
+        variableValues: ctx.variableValues,
+        path: {
+          typename: node.entityTypeName,
+          key: node.flattenPath.at(-1),
+          prev: undefined,
+        },
+      };
+      jobs.push(
+        mergeFields(
+          mergedTypeInfo,
+          parent,
+          sourceSubschema,
+          ctx.contextValue,
+          info,
+          [planningParentField],
+        ),
+      );
+    }
+    return handleMaybePromise(
+      () =>
+        Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
+      () => {
+        for (const parent of parents) {
+          ensureAnnotatedTree(parent, node.subschema);
+        }
+      },
     );
   }
+
+  const info = {
+    ...(ctx.infoStub as any),
+    schema: ctx.schema,
+    parentType: type,
+    returnType: type,
+    fieldName: node.entityTypeName,
+    fieldNodes: [
+      {
+        kind: Kind.FIELD,
+        name: { kind: Kind.NAME, value: node.entityTypeName },
+        selectionSet: node.selectionSet,
+      },
+    ],
+    fragments: ctx.fragments,
+    operation: ctx.operation,
+    variableValues: ctx.variableValues,
+    path: {
+      typename: node.entityTypeName,
+      key: node.flattenPath.at(-1),
+      prev: undefined,
+    },
+  };
+
+  const jobs: MaybePromise<any>[] = parents.map((parent) =>
+    handleMaybePromise(
+      () =>
+        resolver(
+          parent,
+          ctx.contextValue,
+          info,
+          node.subschema,
+          node.selectionSet,
+          undefined,
+          type,
+        ),
+      (resolverResult) => {
+        if (resolverResult == null || typeof resolverResult !== 'object') {
+          return;
+        }
+        if (resolverResult instanceof Error) {
+          ctx.errors.push(resolverResult);
+          return;
+        }
+        const merged = mergeDeep(
+          [parent, resolverResult],
+          undefined,
+          true,
+          true,
+        );
+        // mutate parent in place so siblings sharing the tree see updates
+        Object.assign(parent, merged);
+        ensureAnnotatedTree(parent, node.subschema);
+      },
+    ),
+  );
 
   return handleMaybePromise(
     () => Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
@@ -287,6 +436,78 @@ function executePlanNode(
       return chain;
     }
     case 'Parallel': {
+      // Shared-root Parallel: multiple root Fetches write the same responseKey.
+      // Run them in isolated data bags then merge so concurrent writes don't race.
+      const rootFetches = node.nodes.filter(
+        (n): n is Extract<StitchPlanNode, { kind: 'Fetch' }> =>
+          n.kind === 'Fetch' && Boolean(n.rootField),
+      );
+      const sameKey =
+        rootFetches.length === node.nodes.length &&
+        rootFetches.length > 1 &&
+        rootFetches.every((n) => {
+          const a = rootFetches[0]!.rootField!;
+          const b = n.rootField!;
+          const keyA = a.alias?.value ?? a.name.value;
+          const keyB = b.alias?.value ?? b.name.value;
+          return keyA === keyB;
+        });
+      if (sameKey) {
+        const responseKey =
+          rootFetches[0]!.rootField!.alias?.value ??
+          rootFetches[0]!.rootField!.name.value;
+        const jobs = rootFetches.map((child) => {
+          const childCtx: BackboneExecutionContext = {
+            ...ctx,
+            data: {},
+            errors: ctx.errors,
+          };
+          return handleMaybePromise(
+            () => executeFetchNode(child, childCtx),
+            () => childCtx.data[responseKey],
+          );
+        });
+        return handleMaybePromise(
+          () =>
+            Promise.all(
+              jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j))),
+            ),
+          (parts: any[]) => {
+            let merged: any = undefined;
+            for (const part of parts) {
+              merged = mergeRootValues(merged, part);
+            }
+            if (merged !== undefined) {
+              ctx.data[responseKey] = merged;
+            }
+          },
+        );
+      }
+      // Entity Fetches that share a flattenPath mutate the same parent objects
+      // (e.g. Product.category from A and B). Run those sequentially so nested
+      // merges don't race and drop fields.
+      const entityFetches = node.nodes.filter(
+        (n): n is Extract<StitchPlanNode, { kind: 'Fetch' }> =>
+          n.kind === 'Fetch' && Boolean(n.entityTypeName),
+      );
+      const sharedEntityPath =
+        entityFetches.length === node.nodes.length &&
+        entityFetches.length > 1 &&
+        entityFetches.every(
+          (n) =>
+            JSON.stringify(n.flattenPath) ===
+            JSON.stringify(entityFetches[0]!.flattenPath),
+        );
+      if (sharedEntityPath) {
+        let chain: ReturnType<typeof executePlanNode> = undefined;
+        for (const child of node.nodes) {
+          chain = handleMaybePromise(
+            () => chain,
+            () => executePlanNode(child, ctx),
+          );
+        }
+        return chain;
+      }
       const jobs = node.nodes.map((child) => executePlanNode(child, ctx));
       return handleMaybePromise(
         () =>

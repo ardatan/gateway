@@ -112,8 +112,12 @@ function fieldAvailableOnSubschema(
   subschema: Subschema,
   typeName: string,
   fieldName: string,
+  providedFieldNames?: ReadonlySet<string>,
 ): boolean {
   if (fieldName === '__typename') {
+    return true;
+  }
+  if (providedFieldNames?.has(fieldName)) {
     return true;
   }
   const type = subschema.transformedSchema.getType(typeName);
@@ -121,6 +125,102 @@ function fieldAvailableOnSubschema(
     return false;
   }
   return (type as GraphQLObjectType).getFields()[fieldName] != null;
+}
+
+/**
+ * Top-level field names covered by `@provides` on a parent field for a
+ * given subschema (e.g. Query.products → categories on CATEGORY).
+ */
+/**
+ * True when a field is backed by `@requires` / fieldSelectionSets — those need
+ * leftover multi-stage resolution the planned executor does not cover yet.
+ */
+function fieldHasRequiresDependency(
+  stitchingInfo: StitchingInfo,
+  typeName: string,
+  fieldName: string,
+): boolean {
+  const merged = stitchingInfo.mergedTypes[typeName];
+  if (!merged?.fieldSelectionSets?.size) {
+    return false;
+  }
+  for (const [, map] of merged.fieldSelectionSets) {
+    if (map?.[fieldName] != null) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function selectionHasRequiresDependency(
+  stitchingInfo: StitchingInfo,
+  typeName: string,
+  fieldNodes: FieldNode[],
+  fragments: Record<string, FragmentDefinitionNode>,
+  schema: GraphQLSchema,
+  seen = new Set<string>(),
+): boolean {
+  const parentType = schema.getType(typeName);
+  if (!isObjectType(parentType) && !isAbstractType(parentType)) {
+    return false;
+  }
+  for (const fieldNode of fieldNodes) {
+    const fieldName = fieldNode.name.value;
+    if (fieldName === '__typename') {
+      continue;
+    }
+    if (fieldHasRequiresDependency(stitchingInfo, typeName, fieldName)) {
+      return true;
+    }
+    if (!fieldNode.selectionSet || !isObjectType(parentType)) {
+      continue;
+    }
+    const field = parentType.getFields()[fieldName];
+    if (!field) {
+      continue;
+    }
+    const named = getNamedType(field.type);
+    const key = `${named.name}:${fieldName}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    if (
+      selectionHasRequiresDependency(
+        stitchingInfo,
+        named.name,
+        flattenToFieldNodes(fieldNode.selectionSet.selections, fragments),
+        fragments,
+        schema,
+        seen,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getProvidedFieldNames(
+  stitchingInfo: StitchingInfo,
+  parentTypeName: string,
+  parentFieldName: string,
+  subschema: Subschema,
+): Set<string> {
+  const provided =
+    stitchingInfo.mergedTypes[parentTypeName]?.providedSelectionsByField?.get(
+      subschema,
+    )?.[parentFieldName];
+  if (!provided) {
+    return new Set();
+  }
+  const names = new Set<string>();
+  for (const sel of provided.selections) {
+    if (sel.kind === Kind.FIELD) {
+      names.add(sel.name.value);
+    }
+  }
+  return names;
 }
 
 /**
@@ -132,6 +232,7 @@ function partitionSelectionsForSubschema(
   typeName: string,
   selectionSet: SelectionSetNode,
   fragments: Record<string, FragmentDefinitionNode>,
+  providedFieldNames?: ReadonlySet<string>,
 ): { available: SelectionNode[]; unavailable: SelectionNode[] } {
   const available: SelectionNode[] = [];
   const unavailable: SelectionNode[] = [];
@@ -140,7 +241,12 @@ function partitionSelectionsForSubschema(
     for (const selection of selections) {
       if (selection.kind === Kind.FIELD) {
         if (
-          fieldAvailableOnSubschema(subschema, typeName, selection.name.value)
+          fieldAvailableOnSubschema(
+            subschema,
+            typeName,
+            selection.name.value,
+            providedFieldNames,
+          )
         ) {
           available.push(selection);
         } else {
@@ -158,6 +264,8 @@ function partitionSelectionsForSubschema(
             typeCondition,
             selection.selectionSet,
             fragments,
+            // provides apply at the parent field boundary, not nested types
+            undefined,
           );
           if (nested.available.length) {
             available.push({
@@ -241,6 +349,50 @@ function flattenToFieldNodes(
   return fieldNodes;
 }
 
+/**
+ * Expand merge-key / @requires bridge fields the same way
+ * `prepareGatewayDocument` does via `fieldNodesByField` — e.g. requesting
+ * `nickname` also pulls `email` so the next entity hop has its key.
+ */
+function expandFieldDependencies(
+  stitchingInfo: StitchingInfo,
+  typeName: string,
+  fieldNodes: FieldNode[],
+): FieldNode[] {
+  const fieldNodesByField = stitchingInfo.fieldNodesByField?.[typeName];
+  if (!fieldNodesByField) {
+    return fieldNodes;
+  }
+
+  const result: FieldNode[] = [...fieldNodes];
+  const seen = new Set(fieldNodes.map((f) => f.name.value));
+  const queue = [...fieldNodes];
+
+  while (queue.length) {
+    const field = queue.shift()!;
+    const deps = fieldNodesByField[field.name.value];
+    if (!deps?.length) {
+      continue;
+    }
+    for (const dep of deps) {
+      if (seen.has(dep.name.value)) {
+        continue;
+      }
+      seen.add(dep.name.value);
+      result.push(dep);
+      queue.push(dep);
+    }
+  }
+
+  return result;
+}
+
+function selectionSetFromFieldNodes(
+  fieldNodes: readonly FieldNode[],
+): SelectionSetNode {
+  return selectionSetOf(fieldNodes);
+}
+
 function planMergedTypeFollowUps(
   schema: GraphQLSchema,
   stitchingInfo: StitchingInfo,
@@ -274,10 +426,6 @@ function planMergedTypeFollowUps(
     [planningParentField],
   );
 
-  if (!delegationMaps.length) {
-    return null;
-  }
-
   const stages: StitchPlanNode[] = [];
   for (const delegationMap of delegationMaps) {
     const parallel: StitchPlanNode[] = [];
@@ -298,6 +446,19 @@ function planMergedTypeFollowUps(
   }
 
   // Nested selections on fields that were fetched may themselves need merges.
+  // Run even when this type had no entity hops (e.g. Review fields live on the
+  // source, but Review.product.inStock still needs an Inventory fetch).
+  // Candidate sources: the parent source plus every target we just fetched from
+  // (the child object typically arrives stamped with one of those subschemas).
+  const nestedSourceCandidates: Subschema[] = [sourceSubschema];
+  for (const delegationMap of delegationMaps) {
+    for (const [target] of delegationMap) {
+      if (!nestedSourceCandidates.includes(target)) {
+        nestedSourceCandidates.push(target);
+      }
+    }
+  }
+  const uniqueOwner = mergedTypeInfo.uniqueFields;
   for (const fieldNode of fieldNodes) {
     if (!fieldNode.selectionSet || fieldNode.name.value === '__typename') {
       continue;
@@ -319,23 +480,34 @@ function planMergedTypeFollowUps(
     if (!stitchingInfo.mergedTypes[childTypeName]) {
       continue;
     }
-    const uniqueOwner =
-      mergedTypeInfo.uniqueFields[fieldNode.name.value] ?? sourceSubschema;
     const nestedFieldNodes = flattenToFieldNodes(
       fieldNode.selectionSet.selections,
       fragments,
     );
-    const childPlan = planMergedTypeFollowUps(
-      schema,
-      stitchingInfo,
-      childTypeName,
-      uniqueOwner,
-      nestedFieldNodes,
-      fragments,
-      variableValues,
-      [...flattenPath, responseKey],
-      incompleteReasons,
-    );
+    const preferred = uniqueOwner[fieldNode.name.value];
+    const sourcesToTry = preferred
+      ? [
+          preferred,
+          ...nestedSourceCandidates.filter((s) => s !== preferred),
+        ]
+      : nestedSourceCandidates;
+    let childPlan: StitchPlanNode | null = null;
+    for (const candidate of sourcesToTry) {
+      childPlan = planMergedTypeFollowUps(
+        schema,
+        stitchingInfo,
+        childTypeName,
+        candidate,
+        nestedFieldNodes,
+        fragments,
+        variableValues,
+        [...flattenPath, responseKey],
+        incompleteReasons,
+      );
+      if (childPlan) {
+        break;
+      }
+    }
     if (childPlan) {
       stages.push(childPlan);
     }
@@ -420,57 +592,164 @@ function planRootField(
     };
   }
 
-  const primary = owners[0]!;
   const field = rootType.getFields()[fieldName];
   const returnType = field ? getNamedType(field.type) : null;
   const returnTypeName = returnType?.name;
 
-  let selectionSet: SelectionSetNode =
-    fieldNode.selectionSet ?? selectionSetOf([]);
-  if (returnTypeName) {
-    const partitioned = partitionSelectionsForSubschema(
-      primary,
+  const requested: FieldNode[] = fieldNode.selectionSet
+    ? flattenToFieldNodes(fieldNode.selectionSet.selections, fragments)
+    : [];
+
+  // @requires / fieldSelectionSets need leftover multi-hop resolution that the
+  // Fetch executor does not fully cover yet → schema execute for those ops.
+  if (
+    returnTypeName &&
+    requested.length &&
+    selectionHasRequiresDependency(
+      stitchingInfo,
       returnTypeName,
-      selectionSet,
+      requested,
       fragments,
+      schema,
+    )
+  ) {
+    incompleteReasons.push(
+      `@requires on ${returnTypeName} fields require schema execute until leftover planning is complete`,
     );
-    selectionSet = ensureTypename(selectionSetOf(partitioned.available));
-  } else {
-    selectionSet = ensureTypename(selectionSet);
   }
 
-  const rootFetch: StitchPlanNode = {
-    kind: 'Fetch',
-    subschema: primary,
-    rootField: {
-      ...fieldNode,
-      selectionSet,
-    },
-    selectionSet,
+  const withDeps =
+    returnTypeName && requested.length
+      ? expandFieldDependencies(stitchingInfo, returnTypeName, requested)
+      : requested;
+
+  // Per-owner partition: schema fields + @provides on this root field.
+  type OwnerPartition = {
+    owner: Subschema;
+    available: SelectionNode[];
+    unavailable: SelectionNode[];
+    provided: Set<string>;
   };
+  const partitions: OwnerPartition[] = owners.map((owner) => {
+    const provided = getProvidedFieldNames(
+      stitchingInfo,
+      rootType.name,
+      fieldName,
+      owner,
+    );
+    if (!returnTypeName) {
+      return {
+        owner,
+        available: fieldNode.selectionSet?.selections
+          ? [...fieldNode.selectionSet.selections]
+          : [],
+        unavailable: [],
+        provided,
+      };
+    }
+    const partitioned = partitionSelectionsForSubschema(
+      owner,
+      returnTypeName,
+      selectionSetFromFieldNodes(withDeps),
+      fragments,
+      provided,
+    );
+    return {
+      owner,
+      available: partitioned.available,
+      unavailable: partitioned.unavailable,
+      provided,
+    };
+  });
+
+  // Shared-root: several subgraphs each contribute distinct selections for the
+  // same root field → Parallel root Fetches (results deep-merged at execute).
+  const contributing = partitions.filter((p) =>
+    p.available.some(
+      (sel) =>
+        sel.kind !== Kind.FIELD ||
+        (sel.name.value !== '__typename' &&
+          // ignore pure key-only selections when another owner has real fields;
+          // still keep owners that only expose keys if they are the sole owner
+          true),
+    ),
+  );
+
+  const meaningful = contributing.filter((p) =>
+    p.available.some(
+      (sel) => !(sel.kind === Kind.FIELD && sel.name.value === '__typename'),
+    ),
+  );
+  const usedPartitions = meaningful.length ? meaningful : contributing;
+
+  // Prefer owners that cover more of the client selection (override / provides).
+  usedPartitions.sort((a, b) => b.available.length - a.available.length);
+
+  const rootFetches: StitchPlanNode[] = usedPartitions.map((p) => {
+    const selectionSet = ensureTypename(selectionSetOf(p.available));
+    return {
+      kind: 'Fetch' as const,
+      subschema: p.owner,
+      rootField: {
+        ...fieldNode,
+        selectionSet,
+      },
+      selectionSet,
+    };
+  });
+
+  if (!rootFetches.length) {
+    incompleteReasons.push(`No subschema could satisfy root field ${fieldName}`);
+    return {
+      kind: 'Island',
+      parentTypeName: rootType.name,
+      fieldNode,
+    };
+  }
+
+  const rootNode: StitchPlanNode =
+    rootFetches.length === 1
+      ? rootFetches[0]!
+      : { kind: 'Parallel', nodes: rootFetches };
+
+  // Entity follow-ups: fields still missing after all root contributions.
+  const coveredNames = new Set<string>();
+  for (const p of usedPartitions) {
+    for (const sel of p.available) {
+      if (sel.kind === Kind.FIELD) {
+        coveredNames.add(sel.name.value);
+      }
+    }
+  }
+  const followUpFieldNodes = requested.filter(
+    (fn) => !coveredNames.has(fn.name.value),
+  );
+
+  // Source for merge planning: the owner that covered the most (keys live there).
+  const primary = usedPartitions[0]!.owner;
 
   if (
     returnTypeName &&
     stitchingInfo.mergedTypes[returnTypeName] &&
-    fieldNode.selectionSet
+    followUpFieldNodes.length
   ) {
     const followUp = planMergedTypeFollowUps(
       schema,
       stitchingInfo,
       returnTypeName,
       primary,
-      flattenToFieldNodes(fieldNode.selectionSet.selections, fragments),
+      followUpFieldNodes,
       fragments,
       variableValues,
       [responseKey],
       incompleteReasons,
     );
     if (followUp) {
-      return { kind: 'Sequence', nodes: [rootFetch, followUp] };
+      return { kind: 'Sequence', nodes: [rootNode, followUp] };
     }
   }
 
-  return rootFetch;
+  return rootNode;
 }
 
 export function buildStitchPlan(
@@ -545,12 +824,68 @@ export function buildStitchPlan(
     }
   }
 
-  // @skip / @include need Condition nodes + proper variable coercion; until
-  // then, schema execute matches GraphQL.js semantics (incl. missing vars).
+  // @skip / @include need Condition nodes. collectFields/getFieldsNotInSubschema
+  // evaluate those directives and throw when the variable has a default but was
+  // omitted from the variables map — bail out before that walk.
   if (operationHasSkipOrInclude(operation, fragments)) {
-    incompleteReasons.push('@skip/@include require schema execute for now');
+    return {
+      operation,
+      fragments,
+      root: { kind: 'Parallel', nodes: [] },
+      incomplete: true,
+      incompleteReasons: [
+        ...incompleteReasons,
+        '@skip/@include require schema execute until Condition nodes exist',
+      ],
+    };
   }
 
+  if (incompleteReasons.length > 0) {
+    // Still attempt a best-effort plan for warming, but never throw out of here.
+    try {
+      return buildCompletePlan(
+        schema,
+        stitchingInfo,
+        operation,
+        fragments,
+        variableValues,
+        options,
+        rootType,
+        incompleteReasons,
+      );
+    } catch {
+      return {
+        operation,
+        fragments,
+        root: { kind: 'Parallel', nodes: [] },
+        incomplete: true,
+        incompleteReasons,
+      };
+    }
+  }
+
+  return buildCompletePlan(
+    schema,
+    stitchingInfo,
+    operation,
+    fragments,
+    variableValues,
+    options,
+    rootType,
+    incompleteReasons,
+  );
+}
+
+function buildCompletePlan(
+  schema: GraphQLSchema,
+  stitchingInfo: StitchingInfo,
+  operation: OperationDefinitionNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+  variableValues: Record<string, any>,
+  options: BackboneExecutorOptions,
+  rootType: GraphQLObjectType,
+  incompleteReasons: string[],
+): StitchPlan {
   const { fields } = collectFields(
     schema,
     fragments,

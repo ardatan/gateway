@@ -14,7 +14,11 @@ import {
 } from '@graphql-tools/delegate';
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
-import { createMergedTypeResolver } from '@graphql-tools/stitch';
+import {
+  collectLocalFieldsFromResolvers,
+  createBackboneExecutor,
+  createMergedTypeResolver,
+} from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
   asArray,
@@ -482,14 +486,20 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  // NOTE: createBackboneExecutor is not wired here yet. Returning a custom
-  // executor replaces Yoga's execute and currently breaks variable-default
-  // handling for @skip/@include (federation include-skip audit). The planned
-  // path is covered by packages/stitch backbone unit tests; gateway cutover
-  // waits until execute matches audit (or getExecuteFnFromExecutor applies
-  // defaults identically to GraphQL.js).
+  // Always attach the backbone executor: plan once per operation (cached),
+  // execute via Fetch plan when complete, otherwise schema-execute with the
+  // same warmed delegation memoization. Variable defaults for @skip/@include
+  // are sanitized in getExecuteFnFromExecutor (strip undefined entries).
+  const localFields = collectLocalFieldsFromResolvers(additionalResolvers);
+  const executor = createBackboneExecutor(executableUnifiedGraph, {
+    localFields,
+    hasDelegationPlanHooks: Boolean(onDelegationPlanHooks?.length),
+    fallbackToSchemaExecute: true,
+  });
+
   return {
     unifiedGraph: executableUnifiedGraph,
+    executor,
     inContextSDK,
     getSubgraphSchema(subgraphName) {
       const subschema = getSubschema(subgraphName);
