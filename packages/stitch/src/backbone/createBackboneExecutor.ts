@@ -77,8 +77,6 @@ function stableStringify(value: Record<string, any>): string {
  *    fixed in the planner (plan quality = execute model).
  *
  * Introspection still uses schema execute (SDL walk, not a federated plan).
- * `preferPlannedExecute: false` remains an escape hatch for focused unit tests
- * that intentionally exercise schema execute only.
  */
 export function createBackboneExecutor(
   schema: GraphQLSchema,
@@ -162,12 +160,6 @@ export function createBackboneExecutor(
       ...request,
       variables: coerced,
     };
-
-    // preferPlannedExecute: false → schema execute escape hatch (unit tests).
-    // Default / true → always planned execute (incomplete plans must be fixed).
-    if (options.preferPlannedExecute === false) {
-      return schemaExecutor(requestWithCoercedVars);
-    }
 
     if (plan.incomplete) {
       return {

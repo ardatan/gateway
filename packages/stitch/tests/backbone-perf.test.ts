@@ -105,9 +105,7 @@ describe('backbone performance smoke', () => {
 
   it('planned execute stays within 2x of schema execute on this microbench', async () => {
     const schemaExec = createDefaultExecutor(schema);
-    const planned = createBackboneExecutor(schema, {
-      preferPlannedExecute: true,
-    });
+    const planned = createBackboneExecutor(schema);
     const request = {
       document,
       variables: { id: '1' },
