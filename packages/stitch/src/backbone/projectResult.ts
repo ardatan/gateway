@@ -101,6 +101,10 @@ function projectValue(
     const t = schema.getType(value.__typename);
     if (isObjectType(t)) {
       objectType = t;
+    } else {
+      // Concrete type absent from the API schema (@inaccessible) — null the
+      // abstract field value (e.g. Foo resolving to inaccessible Baz).
+      return null;
     }
   } else if (typeof value.__typename === 'string') {
     const t = schema.getType(value.__typename);
