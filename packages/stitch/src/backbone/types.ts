@@ -15,8 +15,11 @@ export interface StitchBatchAlias {
   /** Response key in the batched `_entities` document (`_e0`, …). */
   alias: string;
   entityTypeName: string;
+  /** Subgraph-local selection (foreign fields stripped at plan time). */
   selectionSet: SelectionSetNode;
   flattenPaths: PathSegment[][];
+  /** Variable name for this alias's representations (`__batch_reps_0`). */
+  representationsVariable?: string;
 }
 
 /** Operation-level stitch plan node tree. */
@@ -49,6 +52,11 @@ export type StitchPlanNode =
        * paths in one hop (one DataLoader/_entities wave).
        */
       flattenPaths?: PathSegment[][];
+      /**
+       * Prebuilt subgraph operation (Hive-style). When set, execute skips
+       * prepareGatewayDocument / Transformer and calls the executor directly.
+       */
+      document?: DocumentNode;
     }
   | {
       kind: 'BatchFetch';
@@ -62,6 +70,8 @@ export type StitchPlanNode =
       subschema: Subschema;
       /** Multi-type / multi-selection aliases → one subgraph HTTP call. */
       aliases: StitchBatchAlias[];
+      /** Prebuilt multi-alias `_entities` document for one HTTP round-trip. */
+      document?: DocumentNode;
     }
   | {
       kind: 'Island';

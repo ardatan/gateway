@@ -30,6 +30,7 @@ import {
   valueFromASTUntyped,
 } from 'graphql';
 import { isLocalField } from './localFields.js';
+import { preparePlanDocuments } from './preparePlanDocuments.js';
 import type {
   BackboneExecutorOptions,
   PathSegment,
@@ -4741,18 +4742,21 @@ function buildCompletePlan(
     root:
       operation.operation === 'mutation'
         ? packed
-        : annotateFetchDeps(
-            groupParallelBatchFetches(
-              compressProductsIntoDeepWave(
-                peelLeadingEntityFetches(
-                  peelRootParallelHeads(packed, stitchingInfo),
+        : preparePlanDocuments(
+            annotateFetchDeps(
+              groupParallelBatchFetches(
+                compressProductsIntoDeepWave(
+                  peelLeadingEntityFetches(
+                    peelRootParallelHeads(packed, stitchingInfo),
+                    stitchingInfo,
+                  ),
                   stitchingInfo,
                 ),
                 stitchingInfo,
               ),
               stitchingInfo,
             ),
-            stitchingInfo,
+            fragments,
           ),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
@@ -5222,8 +5226,10 @@ function groupParallelBatchFetches(
 }
 
 /**
- * Attach id/dependsOn for optional barrier-free execute. Uses fetchDependsOn
- * plus tree Sequence order (later Sequence siblings depend on earlier ones).
+ * Attach id/dependsOn for barrier-free execute. Combines:
+ * 1. fetchDependsOn (path / @requires edges)
+ * 2. Sequence order — later siblings depend on every hop completed by earlier
+ *    siblings (Hive wave barriers without flattening the tree unsafely).
  */
 function annotateFetchDeps(
   root: StitchPlanNode,
@@ -5248,17 +5254,19 @@ function annotateFetchDeps(
   }
 
   let counter = 0;
-  const assign = (node: StitchPlanNode): StitchPlanNode => {
+  const assign = (
+    node: StitchPlanNode,
+    sequenceBarrier: string[],
+  ): StitchPlanNode => {
     if (node.kind === 'Fetch') {
       const id = ids[counter]!;
-      const dependsOn = depIds[counter]!;
+      const dependsOn = [...new Set([...depIds[counter]!, ...sequenceBarrier])];
       counter++;
       return { ...node, id, dependsOn, completesIds: [id] };
     }
     if (node.kind === 'BatchFetch') {
-      // Expand aliases into the same id space as collectExecutableFetches.
       const completesIds: string[] = [];
-      const dependsOn = new Set<string>();
+      const dependsOn = new Set<string>(sequenceBarrier);
       for (const _alias of node.aliases) {
         const id = ids[counter]!;
         completesIds.push(id);
@@ -5279,13 +5287,53 @@ function annotateFetchDeps(
     }
     if (node.kind === 'Island') {
       return node.continue
-        ? { ...node, continue: assign(node.continue) }
+        ? { ...node, continue: assign(node.continue, sequenceBarrier) }
         : node;
     }
-    if (node.kind === 'Sequence' || node.kind === 'Parallel') {
-      return { kind: node.kind, nodes: node.nodes.map(assign) };
+    if (node.kind === 'Parallel') {
+      return {
+        kind: 'Parallel',
+        nodes: node.nodes.map((c) => assign(c, sequenceBarrier)),
+      };
+    }
+    if (node.kind === 'Sequence') {
+      const next: StitchPlanNode[] = [];
+      let barrier = sequenceBarrier;
+      for (const child of node.nodes) {
+        const assigned = assign(child, barrier);
+        next.push(assigned);
+        // Later Sequence siblings wait for every hop this child completes.
+        const completed: string[] = [];
+        collectCompletedIds(assigned, completed);
+        if (completed.length) {
+          barrier = [...barrier, ...completed];
+        }
+      }
+      return { kind: 'Sequence', nodes: next };
     }
     return node;
   };
-  return assign(root);
+  return assign(root, []);
+}
+
+function collectCompletedIds(node: StitchPlanNode, out: string[]): void {
+  if (node.kind === 'Fetch' || node.kind === 'BatchFetch') {
+    if (node.completesIds?.length) {
+      out.push(...node.completesIds);
+    } else if (node.id) {
+      out.push(node.id);
+    }
+    return;
+  }
+  if (node.kind === 'Island') {
+    if (node.continue) {
+      collectCompletedIds(node.continue, out);
+    }
+    return;
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    for (const child of node.nodes) {
+      collectCompletedIds(child, out);
+    }
+  }
 }
