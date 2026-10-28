@@ -4,11 +4,15 @@ import {
   FieldNode,
   getNamedType,
   GraphQLSchema,
+  isNullableType,
   isObjectType,
   Kind,
+  OperationDefinitionNode,
   OperationTypeNode,
   SelectionNode,
   SelectionSetNode,
+  VariableDefinitionNode,
+  visit,
 } from 'graphql';
 import type { StitchBatchAlias, StitchPlanNode } from './types.js';
 
@@ -76,7 +80,6 @@ export function filterSelectionSetForSubschema(
       if (sel.typeCondition && !schema.getType(on)) {
         continue;
       }
-      // Drop concrete spreads that cannot apply under an object parent.
       if (
         sel.typeCondition &&
         isObjectType(type) &&
@@ -267,35 +270,214 @@ function targetSchema(subschema: Subschema): GraphQLSchema {
   return subschema.schema;
 }
 
+function stripSkipInclude(selection: SelectionNode): SelectionNode {
+  if (selection.kind === Kind.FIELD) {
+    const directives = selection.directives?.filter(
+      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
+    );
+    const selectionSet = selection.selectionSet
+      ? {
+          ...selection.selectionSet,
+          selections: selection.selectionSet.selections.map(stripSkipInclude),
+        }
+      : undefined;
+    return {
+      ...selection,
+      directives: directives?.length ? directives : undefined,
+      selectionSet,
+    };
+  }
+  if (selection.kind === Kind.INLINE_FRAGMENT) {
+    const directives = selection.directives?.filter(
+      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
+    );
+    return {
+      ...selection,
+      directives: directives?.length ? directives : undefined,
+      selectionSet: {
+        ...selection.selectionSet,
+        selections: selection.selectionSet.selections.map(stripSkipInclude),
+      },
+    };
+  }
+  return selection;
+}
+
+function collectUsedVariableNames(node: SelectionNode): Set<string> {
+  const used = new Set<string>();
+  visit(node, {
+    Variable(v) {
+      used.add(v.name.value);
+    },
+  });
+  return used;
+}
+
+function filterVariableDefinitions(
+  defs: readonly VariableDefinitionNode[] | undefined,
+  used: Set<string>,
+): VariableDefinitionNode[] | undefined {
+  if (!defs?.length) {
+    return undefined;
+  }
+  const filtered = defs.filter((d) => used.has(d.variable.name.value));
+  return filtered.length ? filtered : undefined;
+}
+
+/** Same as execute rewriteNullabilityConflicts — plan-time for root docs. */
+function rewriteNullabilityConflicts(
+  selectionSet: SelectionSetNode,
+  schema: GraphQLSchema,
+): SelectionSetNode {
+  const seenNonNullable = new Set<string>();
+  const seenNullable = new Set<string>();
+  const selections = selectionSet.selections.map((sel) => {
+    if (sel.kind !== Kind.INLINE_FRAGMENT || !sel.typeCondition) {
+      if (sel.kind === Kind.FIELD && sel.selectionSet) {
+        return {
+          ...sel,
+          selectionSet: rewriteNullabilityConflicts(sel.selectionSet, schema),
+        };
+      }
+      return sel;
+    }
+    const type = schema.getType(sel.typeCondition.name.value);
+    if (!type || !('getFields' in type) || !sel.selectionSet) {
+      return sel;
+    }
+    const fields = (type as import('graphql').GraphQLObjectType).getFields();
+    const nextSels = sel.selectionSet.selections.map((sub) => {
+      if (sub.kind !== Kind.FIELD || sub.alias) {
+        if (sub.kind === Kind.FIELD && sub.selectionSet) {
+          return {
+            ...sub,
+            selectionSet: rewriteNullabilityConflicts(sub.selectionSet, schema),
+          };
+        }
+        return sub;
+      }
+      const field = fields[sub.name.value];
+      if (!field) {
+        return sub;
+      }
+      const nullable = isNullableType(field.type);
+      if (nullable) {
+        seenNullable.add(sub.name.value);
+      } else {
+        seenNonNullable.add(sub.name.value);
+      }
+      if (
+        seenNullable.has(sub.name.value) &&
+        seenNonNullable.has(sub.name.value)
+      ) {
+        return {
+          ...sub,
+          alias: {
+            kind: Kind.NAME as const,
+            value: nullable
+              ? `_nullable_${sub.name.value}`
+              : `_nonNullable_${sub.name.value}`,
+          },
+          selectionSet: sub.selectionSet
+            ? rewriteNullabilityConflicts(sub.selectionSet, schema)
+            : undefined,
+        };
+      }
+      return sub.selectionSet
+        ? {
+            ...sub,
+            selectionSet: rewriteNullabilityConflicts(sub.selectionSet, schema),
+          }
+        : sub;
+    });
+    return {
+      ...sel,
+      selectionSet: { ...sel.selectionSet, selections: nextSels },
+    };
+  });
+  return { ...selectionSet, selections };
+}
+
+function buildRootFetchDocument(
+  operation: OperationDefinitionNode,
+  fieldNode: FieldNode,
+  subgraphSchema: GraphQLSchema,
+): DocumentNode {
+  let cleaned = stripSkipInclude(fieldNode) as FieldNode;
+  if (cleaned.selectionSet) {
+    cleaned = {
+      ...cleaned,
+      selectionSet: rewriteNullabilityConflicts(
+        cleaned.selectionSet,
+        subgraphSchema,
+      ),
+    };
+  }
+  const usedVars = collectUsedVariableNames(cleaned);
+  const filteredDefs = filterVariableDefinitions(
+    operation.variableDefinitions,
+    usedVars,
+  );
+  return {
+    kind: Kind.DOCUMENT,
+    definitions: [
+      {
+        kind: Kind.OPERATION_DEFINITION,
+        operation: operation.operation,
+        name: operation.name,
+        variableDefinitions: filteredDefs,
+        selectionSet: {
+          kind: Kind.SELECTION_SET,
+          selections: [cleaned],
+        },
+      },
+    ],
+  };
+}
+
+export interface PreparePlanDocumentsOptions {
+  operation: OperationDefinitionNode;
+  fragments: Record<string, any>;
+}
+
 /**
- * Strip foreign fields and attach prebuilt `_entities` documents so execute
- * can skip Transformer / prepareGatewayDocument (Hive QP model).
+ * Attach prebuilt subgraph documents (Hive QP model).
+ * Original selectionSets stay intact for Transformer fallback on nested/abstract.
  */
 export function preparePlanDocuments(
   root: StitchPlanNode,
-  fragments: Record<string, any>,
+  options: PreparePlanDocumentsOptions,
 ): StitchPlanNode {
+  const { operation, fragments } = options;
   if (root.kind === 'Sequence' || root.kind === 'Parallel') {
     return {
       kind: root.kind,
-      nodes: root.nodes.map((n) => preparePlanDocuments(n, fragments)),
+      nodes: root.nodes.map((n) => preparePlanDocuments(n, options)),
     };
   }
   if (root.kind === 'Island') {
     return root.continue
       ? {
           ...root,
-          continue: preparePlanDocuments(root.continue, fragments),
+          continue: preparePlanDocuments(root.continue, options),
         }
       : root;
   }
   if (root.kind === 'Fetch') {
-    if (!root.entityTypeName || root.rootField) {
+    if (root.rootField) {
+      return {
+        ...root,
+        document: buildRootFetchDocument(
+          operation,
+          root.rootField,
+          targetSchema(root.subschema),
+        ),
+      };
+    }
+    if (!root.entityTypeName) {
       return root;
     }
     const schema = targetSchema(root.subschema);
-    // Filter only the prebuilt document — keep original selectionSet for the
-    // delegateToSchema / Transformer fallback (abstract/requires need it).
     const filtered = filterSelectionSetForSubschema(
       root.selectionSet,
       root.entityTypeName,
@@ -311,10 +493,8 @@ export function preparePlanDocuments(
     const schema = targetSchema(root.subschema);
     const aliases: StitchBatchAlias[] = root.aliases.map((a, i) => ({
       ...a,
-      // Keep original selectionSet for parallel-Fetch fallback.
       representationsVariable: a.representationsVariable ?? `__batch_reps_${i}`,
     }));
-    // Filtered selections only inside the prebuilt multi-alias document.
     const document = buildBatchEntitiesDocument(
       aliases.map((a) => ({
         ...a,

@@ -4756,7 +4756,7 @@ function buildCompletePlan(
               ),
               stitchingInfo,
             ),
-            fragments,
+            { operation, fragments },
           ),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,

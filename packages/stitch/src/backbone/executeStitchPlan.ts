@@ -615,14 +615,31 @@ function executeFetchNode(
   );
 
   if (node.rootField) {
-    const { document, variables } = buildRootDocument(
-      ctx.operation.name?.value,
-      ctx.operation.operation,
-      node.rootField,
-      ctx.operation.variableDefinitions,
-      ctx.variableValues,
-      node.subschema.schema,
-    );
+    let document = node.document;
+    let variables: Record<string, any>;
+    if (document) {
+      variables = {};
+      const op = document.definitions.find(
+        (d) => d.kind === Kind.OPERATION_DEFINITION,
+      );
+      for (const def of op?.variableDefinitions ?? []) {
+        const name = def.variable.name.value;
+        if (name in ctx.variableValues) {
+          variables[name] = ctx.variableValues[name];
+        }
+      }
+    } else {
+      const built = buildRootDocument(
+        ctx.operation.name?.value,
+        ctx.operation.operation,
+        node.rootField,
+        ctx.operation.variableDefinitions,
+        ctx.variableValues,
+        node.subschema.schema,
+      );
+      document = built.document;
+      variables = built.variables;
+    }
     const responseKey =
       node.rootField.alias?.value ?? node.rootField.name.value;
     return handleMaybePromise(
