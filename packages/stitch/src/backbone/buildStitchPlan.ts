@@ -260,11 +260,13 @@ function partitionSelectionsForSubschema(
   fragments: Record<string, FragmentDefinitionNode>,
   providedFieldNames?: ReadonlySet<string>,
   stitchingInfo?: StitchingInfo,
+  /** Gateway schema — needed to resolve nested return types for @provides fields absent from the subgraph SDL. */
+  gatewaySchema?: GraphQLSchema,
 ): { available: SelectionNode[]; unavailable: SelectionNode[] } {
   const available: SelectionNode[] = [];
   const unavailable: SelectionNode[] = [];
-  const fetchable = (fieldName: string) =>
-    stitchingInfo
+  const fetchable = (fieldName: string) => {
+    const ok = stitchingInfo
       ? fieldFetchableOnSubschema(
           stitchingInfo,
           subschema,
@@ -278,6 +280,8 @@ function partitionSelectionsForSubschema(
           fieldName,
           providedFieldNames,
         );
+    return ok;
+  };
 
   const visit = (selections: readonly SelectionNode[]) => {
     for (const selection of selections) {
@@ -292,18 +296,28 @@ function partitionSelectionsForSubschema(
         }
         // Recurse into nested selections so union/interface fragments for
         // types absent from this subgraph are stripped (Movie on graph A).
-        const parentGqlType =
+        // Prefer the subgraph field type when present (Viewer.book → Book on A
+        // so `... on Song` is rejected); fall back to the gateway schema for
+        // @provides fields absent from the subgraph SDL (Product.categories).
+        const subParent =
           subschema.transformedSchema.getType(typeName) ??
           subschema.schema.getType(typeName);
-        const fieldType =
-          parentGqlType && 'getFields' in parentGqlType
-            ? (parentGqlType as GraphQLObjectType)
+        const gatewayParent = gatewaySchema?.getType(typeName);
+        const subField =
+          subParent && 'getFields' in subParent
+            ? (subParent as GraphQLObjectType).getFields()[selection.name.value]
             : undefined;
-        const nestedReturn = fieldType?.getFields()?.[selection.name.value]
-          ? getNamedType(
-              fieldType.getFields()[selection.name.value]!.type,
-            )
-          : undefined;
+        const gatewayField =
+          gatewayParent && 'getFields' in gatewayParent
+            ? (gatewayParent as GraphQLObjectType).getFields()[
+                selection.name.value
+              ]
+            : undefined;
+        const nestedReturn = subField
+          ? getNamedType(subField.type)
+          : gatewayField
+            ? getNamedType(gatewayField.type)
+            : undefined;
         const nestedTypeName = nestedReturn?.name ?? typeName;
         // @provides on this field (e.g. products.categories → name) apply to
         // the nested type's partition, not the parent type's.
@@ -323,6 +337,7 @@ function partitionSelectionsForSubschema(
           fragments,
           nestedProvided?.size ? nestedProvided : undefined,
           stitchingInfo,
+          gatewaySchema,
         );
         if (nested.available.length) {
           available.push({
@@ -341,6 +356,12 @@ function partitionSelectionsForSubschema(
                 name: { kind: Kind.NAME, value: '__typename' },
               },
             ]),
+          });
+        }
+        if (nested.unavailable.length && nested.available.length) {
+          unavailable.push({
+            ...selection,
+            selectionSet: selectionSetOf(nested.unavailable),
           });
         }
       } else if (selection.kind === Kind.INLINE_FRAGMENT) {
@@ -388,6 +409,7 @@ function partitionSelectionsForSubschema(
             // provides apply at the parent field boundary, not nested types
             undefined,
             stitchingInfo,
+            gatewaySchema,
           );
           if (nested.available.length) {
             available.push({
@@ -418,6 +440,7 @@ function partitionSelectionsForSubschema(
           fragments,
           undefined,
           stitchingInfo,
+          gatewaySchema,
         );
         if (nested.available.length) {
           available.push({
@@ -1102,6 +1125,7 @@ function planRootField(
             owner,
           );
           const fieldDef = (
+            schema.getType(returnTypeName) ??
             owner.transformedSchema.getType(returnTypeName) ??
             owner.schema.getType(returnTypeName)
           ) as GraphQLObjectType | undefined;
@@ -1115,6 +1139,7 @@ function planRootField(
             fragments,
             nestedProvided.size ? nestedProvided : provided,
             stitchingInfo,
+            schema,
           );
           if (nested.available.length) {
             available.push({
@@ -1149,6 +1174,7 @@ function planRootField(
               fragments,
               provided,
               stitchingInfo,
+              schema,
             );
             if (nested.available.length) {
               available.push({
@@ -1173,6 +1199,7 @@ function planRootField(
               fragments,
               provided,
               stitchingInfo,
+              schema,
             );
             for (const a of nested.available) {
               available.push(a);
@@ -1213,6 +1240,7 @@ function planRootField(
               fragments,
               undefined,
               stitchingInfo,
+              schema,
             );
             if (nested.available.length) {
               available.push({
@@ -1244,6 +1272,7 @@ function planRootField(
               fragments,
               undefined,
               stitchingInfo,
+              schema,
             );
             for (const a of nested.available) {
               available.push(a);
@@ -1306,6 +1335,7 @@ function planRootField(
       fragments,
       provided,
       stitchingInfo,
+      schema,
     );
     return {
       owner,
@@ -1423,6 +1453,7 @@ function planRootField(
           continue;
         }
         const responseKey = sel.alias?.value ?? sel.name.value;
+        const rootKey = fieldNode.alias?.value ?? fieldNode.name.value;
         if (isAbstractType(namedReturn)) {
           for (const concrete of schema.getPossibleTypes(namedReturn)) {
             if (!stitchingInfo.mergedTypes[concrete.name]) {
@@ -1446,14 +1477,114 @@ function planRootField(
               forConcrete,
               fragments,
               variableValues,
-              [
-                fieldNode.alias?.value ?? fieldNode.name.value,
-                responseKey,
-              ],
+              [rootKey, responseKey],
               incompleteReasons,
             );
             if (child) {
               partialUnavailableFollowUps.push(child);
+            }
+          }
+        } else if (
+          isObjectType(namedReturn) &&
+          stitchingInfo.mergedTypes[namedReturn.name]
+        ) {
+          // Nested object remainder (categories.subCategories { name }).
+          const nestedFields = flattenToFieldNodes(
+            sel.selectionSet.selections,
+            fragments,
+          );
+          // May need a further hop under list items: plan from the nested
+          // field's children (subCategories → Category.name).
+          for (const nestedFn of nestedFields) {
+            if (!nestedFn.selectionSet) {
+              // Scalar remainder on the object itself
+              const child = planMergedTypeFollowUps(
+                schema,
+                stitchingInfo,
+                namedReturn.name,
+                p.owner,
+                nestedFields,
+                fragments,
+                variableValues,
+                [rootKey, responseKey],
+                incompleteReasons,
+              );
+              if (child) {
+                partialUnavailableFollowUps.push(child);
+              }
+              break;
+            }
+            const nestedFieldDef = namedReturn.getFields()[nestedFn.name.value];
+            if (!nestedFieldDef) {
+              continue;
+            }
+            const nestedNamed = getNamedType(nestedFieldDef.type);
+            if (
+              !isObjectType(nestedNamed) &&
+              !isAbstractType(nestedNamed)
+            ) {
+              continue;
+            }
+            if (!stitchingInfo.mergedTypes[nestedNamed.name]) {
+              continue;
+            }
+            const deepFields = flattenToFieldNodes(
+              nestedFn.selectionSet.selections,
+              fragments,
+            );
+            if (isAbstractType(nestedNamed)) {
+              for (const concrete of schema.getPossibleTypes(nestedNamed)) {
+                if (!stitchingInfo.mergedTypes[concrete.name]) {
+                  continue;
+                }
+                const forConcrete = collectFieldsForConcreteType(
+                  nestedNamed,
+                  concrete,
+                  nestedFn.selectionSet,
+                  fragments,
+                  schema,
+                );
+                if (!forConcrete.length) {
+                  continue;
+                }
+                const child = planMergedTypeFollowUps(
+                  schema,
+                  stitchingInfo,
+                  concrete.name,
+                  p.owner,
+                  forConcrete,
+                  fragments,
+                  variableValues,
+                  [
+                    rootKey,
+                    responseKey,
+                    nestedFn.alias?.value ?? nestedFn.name.value,
+                  ],
+                  incompleteReasons,
+                );
+                if (child) {
+                  partialUnavailableFollowUps.push(child);
+                }
+              }
+            } else {
+              const child = planMergedTypeFollowUps(
+                schema,
+                stitchingInfo,
+                nestedNamed.name,
+                p.owner,
+                deepFields,
+                fragments,
+                variableValues,
+                [
+                  rootKey,
+                  responseKey,
+                  nestedFn.alias?.value ?? nestedFn.name.value,
+                ],
+                incompleteReasons,
+              );
+              if (child) {
+                partialUnavailableFollowUps.push(child);
+              }
             }
           }
         }
