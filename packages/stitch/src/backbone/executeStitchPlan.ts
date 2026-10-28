@@ -52,7 +52,10 @@ function getSubschemaExecutor(subschema: Subschema): Executor {
   return createDefaultExecutor(subschema.schema);
 }
 
-/** Annotate a root/entity payload so mergeFields can resolve follow-up hops. */
+/**
+ * Deep-annotate a root Fetch payload once so nested objects carry
+ * OBJECT_SUBSCHEMA_SYMBOL for later entity hops.
+ */
 function annotateValue(
   value: any,
   errors: readonly any[],
@@ -64,30 +67,98 @@ function annotateValue(
   if (Array.isArray(value)) {
     return value.map((item) => annotateValue(item, errors, subschema));
   }
-  return annotateExternalObject(value, errors as any[], subschema, {});
+  const annotated = annotateExternalObject(
+    value,
+    errors as any[],
+    subschema,
+    {},
+  );
+  for (const key of Object.keys(annotated)) {
+    const child = annotated[key];
+    if (child != null && typeof child === 'object') {
+      annotated[key] = annotateValue(child, [], subschema);
+    }
+  }
+  return annotated;
+}
+
+/** Stamp subschema on one object without recursing. */
+function stampSubschema(object: Record<string, any>, subschema: Subschema): void {
+  if ((object as any)[OBJECT_SUBSCHEMA_SYMBOL] == null) {
+    annotateExternalObject(object, [], subschema, {});
+  } else {
+    (object as any)[OBJECT_SUBSCHEMA_SYMBOL] = subschema;
+  }
 }
 
 /**
- * Nested objects returned inside a Fetch (e.g. Review.product) often lack
- * OBJECT_SUBSCHEMA_SYMBOL. Stamp the fetching subschema so later entity hops
- * know the correct source when calling delegationPlanBuilder.
+ * Annotate only branches introduced by this entity hop (not the whole parent
+ * tree — that was O(response×hops) on large lists).
  */
-function ensureAnnotatedTree(value: any, subschema: Subschema): void {
-  if (value == null || typeof value !== 'object') {
-    return;
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      ensureAnnotatedTree(item, subschema);
+function annotateResolverBranches(
+  parent: Record<string, any>,
+  resolverResult: Record<string, any>,
+  subschema: Subschema,
+): void {
+  stampSubschema(parent, subschema);
+  for (const key of Object.keys(resolverResult)) {
+    if (key === '__typename') {
+      continue;
     }
+    const child = parent[key];
+    if (child != null && typeof child === 'object') {
+      // Fresh subgraph payload for this field — deep-annotate once.
+      parent[key] = annotateValue(child, [], subschema);
+    }
+  }
+}
+
+/**
+ * Prefer concrete object __typename over @interfaceObject interface names.
+ */
+function preferConcreteTypename(
+  parent: Record<string, any>,
+  resolverResult: Record<string, any>,
+  schema: GraphQLSchema,
+): void {
+  const priorTypename = parent.__typename;
+  const resultTypename = resolverResult.__typename;
+  if (!priorTypename || !resultTypename || priorTypename === resultTypename) {
     return;
   }
-  if ((value as any)[OBJECT_SUBSCHEMA_SYMBOL] == null) {
-    annotateExternalObject(value, [], subschema, {});
+  const priorType = schema.getType(priorTypename);
+  const resultType = schema.getType(resultTypename);
+  if (isObjectType(priorType) && isInterfaceType(resultType)) {
+    parent.__typename = priorTypename;
+  } else if (isInterfaceType(priorType) && isObjectType(resultType)) {
+    parent.__typename = resultTypename;
   }
-  for (const key of Object.keys(value)) {
-    ensureAnnotatedTree(value[key], subschema);
+}
+
+/**
+ * Light entity merge: copy hop fields onto the parent in place. Avoids
+ * mergeDeep over the full parent on every entity (hot path with large lists).
+ */
+function mergeEntityIntoParent(
+  parent: Record<string, any>,
+  resolverResult: Record<string, any>,
+  schema: GraphQLSchema,
+  subschema: Subschema,
+): void {
+  for (const key of Object.keys(resolverResult)) {
+    if (key === '__typename') {
+      continue;
+    }
+    const incoming = resolverResult[key];
+    if (incoming !== undefined) {
+      parent[key] = incoming;
+    }
   }
+  preferConcreteTypename(parent, resolverResult, schema);
+  if (resolverResult.__typename != null && parent.__typename == null) {
+    parent.__typename = resolverResult.__typename;
+  }
+  annotateResolverBranches(parent, resolverResult, subschema);
 }
 
 /**
@@ -534,7 +605,7 @@ function executeFetchNode(
         Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
       () => {
         for (const parent of parents) {
-          ensureAnnotatedTree(parent, node.subschema);
+          stampSubschema(parent, node.subschema);
         }
       },
     );
@@ -583,32 +654,13 @@ function executeFetchNode(
           ctx.errors.push(resolverResult);
           return;
         }
-        const priorTypename = parent.__typename;
-        const merged = mergeDeep(
-          [parent, resolverResult],
-          undefined,
-          true,
-          true,
-        );
         // mutate parent in place so siblings sharing the tree see updates
-        Object.assign(parent, merged);
-        // Prefer concrete object __typename over @interfaceObject interface
-        // names so `... on Admin` / `... on User` can discriminate.
-        const resultTypename = resolverResult.__typename;
-        if (
-          priorTypename &&
-          resultTypename &&
-          priorTypename !== resultTypename
-        ) {
-          const priorType = ctx.schema.getType(priorTypename);
-          const resultType = ctx.schema.getType(resultTypename);
-          if (isObjectType(priorType) && isInterfaceType(resultType)) {
-            parent.__typename = priorTypename;
-          } else if (isInterfaceType(priorType) && isObjectType(resultType)) {
-            parent.__typename = resultTypename;
-          }
-        }
-        ensureAnnotatedTree(parent, node.subschema);
+        mergeEntityIntoParent(
+          parent,
+          resolverResult as Record<string, any>,
+          ctx.schema,
+          node.subschema,
+        );
       },
     ),
   );
