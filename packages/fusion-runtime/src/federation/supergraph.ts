@@ -14,7 +14,11 @@ import {
 } from '@graphql-tools/delegate';
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
-import { createMergedTypeResolver } from '@graphql-tools/stitch';
+import {
+  collectLocalFieldsFromResolvers,
+  createBackboneExecutor,
+  createMergedTypeResolver,
+} from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
   asArray,
@@ -481,8 +485,19 @@ export const handleFederationSupergraph = function ({
   const overrideLabels = executableUnifiedGraph.extensions?.[
     'overrideLabels'
   ] as Set<string> | undefined;
+
+  const localFields = collectLocalFieldsFromResolvers(additionalResolvers);
+  const executor = createBackboneExecutor(executableUnifiedGraph, {
+    localFields,
+    hasDelegationPlanHooks: Boolean(onDelegationPlanHooks?.length),
+    // Incomplete plans (introspection, subscriptions, plan hooks) still use
+    // GraphQL.js schema execute until those paths are planned too.
+    fallbackToSchemaExecute: true,
+  });
+
   return {
     unifiedGraph: executableUnifiedGraph,
+    executor,
     inContextSDK,
     getSubgraphSchema(subgraphName) {
       const subschema = getSubschema(subgraphName);
