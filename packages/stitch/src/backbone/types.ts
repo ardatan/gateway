@@ -26,6 +26,11 @@ export type StitchPlanNode =
       selectionSet: SelectionSetNode;
       /** Path from operation root to the list/object being flattened into. */
       flattenPath?: PathSegment[];
+      /**
+       * Hive-QP BatchFetch: same entity selection applied at multiple flatten
+       * paths in one hop (one DataLoader/_entities wave).
+       */
+      flattenPaths?: PathSegment[][];
     }
   | {
       kind: 'Island';

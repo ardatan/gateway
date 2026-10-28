@@ -427,15 +427,17 @@ function executeFetchNode(
     );
   }
 
-  if (!node.entityTypeName || !node.flattenPath) {
+  const flattenPaths =
+    node.flattenPaths ??
+    (node.flattenPath != null ? [node.flattenPath] : null);
+  if (!node.entityTypeName || !flattenPaths?.length) {
     return;
   }
 
-  const atPath = collectEntitiesAtPath(ctx.data, node.flattenPath);
   // Cast/Flatten: hydrate parents matching this entity type, including
   // concrete implementers of an @interfaceObject interface (User → NodeWithName).
   const entityType = ctx.schema.getType(node.entityTypeName);
-  const parents = atPath.filter((p) => {
+  const matchParent = (p: Record<string, any>) => {
     if (p == null) {
       return false;
     }
@@ -455,7 +457,17 @@ function executeFetchNode(
       isObjectType(runtime) &&
       runtime.getInterfaces().some((i) => i.name === node.entityTypeName)
     );
-  });
+  };
+  const parents: Array<Record<string, any>> = [];
+  const seen = new Set<Record<string, any>>();
+  for (const path of flattenPaths) {
+    for (const p of collectEntitiesAtPath(ctx.data, path)) {
+      if (matchParent(p) && !seen.has(p)) {
+        seen.add(p);
+        parents.push(p);
+      }
+    }
+  }
   if (!parents.length) {
     return;
   }
@@ -502,7 +514,7 @@ function executeFetchNode(
         variableValues: ctx.variableValues,
         path: {
           typename: node.entityTypeName,
-          key: node.flattenPath.at(-1),
+          key: flattenPaths[0]!.at(-1),
           prev: undefined,
         },
       };
@@ -546,7 +558,7 @@ function executeFetchNode(
     variableValues: ctx.variableValues,
     path: {
       typename: node.entityTypeName,
-      key: node.flattenPath.at(-1),
+      key: flattenPaths[0]!.at(-1),
       prev: undefined,
     },
   };
