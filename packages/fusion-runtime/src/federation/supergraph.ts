@@ -486,15 +486,14 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  // Always attach the backbone executor: plan once per operation (cached),
-  // execute via Fetch plan when complete, otherwise schema-execute with the
-  // same warmed delegation memoization. Variable defaults for @skip/@include
-  // are sanitized in getExecuteFnFromExecutor (strip undefined entries).
+  // Backbone executor replaces classic stitching execute: plan once (cached)
+  // and run Fetch/Parallel/Sequence/Island. No schema-execute fallback —
+  // incomplete plans surface as errors until the planner covers them.
+  // Variable defaults for @skip/@include: getExecuteFnFromExecutor.
   const localFields = collectLocalFieldsFromResolvers(additionalResolvers);
   const executor = createBackboneExecutor(executableUnifiedGraph, {
     localFields,
     hasDelegationPlanHooks: Boolean(onDelegationPlanHooks?.length),
-    fallbackToSchemaExecute: true,
   });
 
   return {
