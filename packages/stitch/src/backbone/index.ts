@@ -5,6 +5,7 @@ export {
   collectLocalFieldsFromResolvers,
   isLocalField,
 } from './localFields.js';
+export { projectDataToOperation } from './projectResult.js';
 export type {
   BackboneExecutorOptions,
   StitchPlan,
