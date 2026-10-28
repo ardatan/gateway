@@ -4728,17 +4728,564 @@ function buildCompletePlan(
 
   const optimized = optimizeStitchPlanNode(rootRaw, stitchingInfo);
   const coalesced = coalesceSamePathEntityFields(optimized, stitchingInfo);
+  const packed = packIndependentWaves(
+    optimizeStitchPlanNode(coalesced, stitchingInfo),
+    stitchingInfo,
+  );
   return {
     operation,
     fragments,
-    // Re-optimize to BatchFetch identical selections after field coalesce.
-    // Independent-wave packing is applied only after requires-safe coalesce
-    // and never nests a path under a sibling Fetch in the same Parallel.
-    root: packIndependentWaves(
-      optimizeStitchPlanNode(coalesced, stitchingInfo),
-      stitchingInfo,
-    ),
+    // Peel independent root heads + BatchFetch same-subschema entity hops
+    // inside Parallel waves. Full Kahn reschedule is incorrect when
+    // fetchDependsOn misses provides/abstract edges — keep tree order.
+    root:
+      operation.operation === 'mutation'
+        ? packed
+        : annotateFetchDeps(
+            groupParallelBatchFetches(
+              compressProductsIntoDeepWave(
+                peelLeadingEntityFetches(
+                  peelRootParallelHeads(packed, stitchingInfo),
+                  stitchingInfo,
+                ),
+                stitchingInfo,
+              ),
+              stitchingInfo,
+            ),
+            stitchingInfo,
+          ),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
   };
+}
+
+function collectExecutableFetches(
+  node: StitchPlanNode,
+  out: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
+): void {
+  if (node.kind === 'Fetch') {
+    out.push(node);
+    return;
+  }
+  if (node.kind === 'BatchFetch') {
+    // Expand for reschedule input — shouldn't appear before reschedule.
+    for (const alias of node.aliases) {
+      out.push({
+        kind: 'Fetch',
+        subschema: node.subschema,
+        entityTypeName: alias.entityTypeName,
+        selectionSet: alias.selectionSet,
+        flattenPaths: alias.flattenPaths,
+        flattenPath: alias.flattenPaths[0],
+      });
+    }
+    return;
+  }
+  if (node.kind === 'Island') {
+    if (node.continue) {
+      collectExecutableFetches(node.continue, out);
+    }
+    return;
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    for (const child of node.nodes) {
+      collectExecutableFetches(child, out);
+    }
+  }
+}
+
+/**
+ * One-level Hive peel: Parallel(Sequence(root,…), Sequence(root,…)) →
+ * Sequence(Parallel(roots), Parallel(rests)) when heads are independent
+ * root Fetches. Does not peel entity hops (that starved overlapping work).
+ */
+function peelRootParallelHeads(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? {
+          ...node,
+          continue: peelRootParallelHeads(node.continue, stitchingInfo),
+        }
+      : node;
+  }
+  if (node.kind === 'Sequence') {
+    return {
+      kind: 'Sequence',
+      nodes: node.nodes.map((c) => peelRootParallelHeads(c, stitchingInfo)),
+    };
+  }
+  if (node.kind !== 'Parallel' || node.nodes.length < 2) {
+    return node.kind === 'Parallel' && node.nodes.length === 1
+      ? peelRootParallelHeads(node.nodes[0]!, stitchingInfo)
+      : node;
+  }
+
+  const children = node.nodes.map((c) =>
+    peelRootParallelHeads(c, stitchingInfo),
+  );
+  type Peel = { head: StitchPlanNode; rest: StitchPlanNode | null };
+  const peels: Array<Peel | null> = children.map((child) => {
+    if (child.kind === 'Sequence' && child.nodes.length > 0) {
+      const head = child.nodes[0]!;
+      if (head.kind !== 'Fetch' || !head.rootField) {
+        return null;
+      }
+      return {
+        head,
+        rest:
+          child.nodes.length > 1
+            ? toSeqOrSingle(child.nodes.slice(1))
+            : null,
+      };
+    }
+    if (child.kind === 'Fetch' && child.rootField) {
+      return { head: child, rest: null };
+    }
+    return null;
+  });
+  if (peels.some((p) => p == null) || !peels.some((p) => p!.rest != null)) {
+    return { kind: 'Parallel', nodes: children };
+  }
+
+  const heads = peels.map((p) => p!.head);
+  // Root heads never depend on each other via requires.
+  const rests = peels
+    .map((p) => p!.rest)
+    .filter((r): r is StitchPlanNode => r != null);
+  const next: StitchPlanNode[] = [{ kind: 'Parallel', nodes: heads }];
+  if (rests.length === 1) {
+    next.push(rests[0]!);
+  } else if (rests.length > 1) {
+    next.push({ kind: 'Parallel', nodes: rests });
+  }
+  return toSeqOrSingle(next);
+}
+
+/**
+ * Parallel(Sequence(entityFetch, …rest), siblings…) →
+ * Sequence(Parallel(entityFetch, siblings…), rest) when the entity hop does
+ * not depend on any sibling. Pulls reviews@users into the same wave as
+ * inventory∥reviews@TP (Hive wave 2).
+ */
+function peelLeadingEntityFetches(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? {
+          ...node,
+          continue: peelLeadingEntityFetches(node.continue, stitchingInfo),
+        }
+      : node;
+  }
+  if (node.kind === 'Sequence') {
+    return {
+      kind: 'Sequence',
+      nodes: node.nodes.map((c) =>
+        peelLeadingEntityFetches(c, stitchingInfo),
+      ),
+    };
+  }
+  if (node.kind !== 'Parallel' || node.nodes.length < 2) {
+    return node;
+  }
+  const children = node.nodes.map((c) =>
+    peelLeadingEntityFetches(c, stitchingInfo),
+  );
+
+  const lifted: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+  const rests: StitchPlanNode[] = [];
+  const kept: StitchPlanNode[] = [];
+  let changed = false;
+  for (const child of children) {
+    if (child.kind !== 'Sequence' || child.nodes.length < 2) {
+      kept.push(child);
+      continue;
+    }
+    const head = child.nodes[0]!;
+    if (
+      head.kind !== 'Fetch' ||
+      !head.entityTypeName ||
+      head.rootField
+    ) {
+      kept.push(child);
+      continue;
+    }
+    // Never peel @requires-bearing hops — providers must stay ordered.
+    if (collectRequiresDeps(stitchingInfo, head).length > 0) {
+      kept.push(child);
+      continue;
+    }
+    const siblings = children.filter((c) => c !== child);
+    const blocked = siblings.some(
+      (sib) =>
+        sequenceContainsFetchDependingOn(sib, head, stitchingInfo) ||
+        (sib.kind === 'Fetch'
+          ? fetchDependsOn(stitchingInfo, head, sib)
+          : false) ||
+        collectFetchesDeep(sib).some((f) =>
+          fetchDependsOn(stitchingInfo, head, f),
+        ),
+    );
+    if (blocked) {
+      kept.push(child);
+      continue;
+    }
+    lifted.push(head);
+    rests.push(toSeqOrSingle(child.nodes.slice(1)));
+    changed = true;
+  }
+  if (!changed) {
+    return { kind: 'Parallel', nodes: children };
+  }
+  // Heads + untouched siblings run together; peeled rests continue after
+  // (products@users must not race its reviews@users provider).
+  // Unwrap Parallel-of-Fetches siblings so reviews@TP sits next to
+  // reviews@users for BatchFetch — without flattening arbitrary nests.
+  const wave: StitchPlanNode[] = [...lifted];
+  for (const k of kept) {
+    if (
+      k.kind === 'Parallel' &&
+      k.nodes.every(
+        (n) =>
+          n.kind === 'Fetch' && Boolean(n.entityTypeName) && !n.rootField,
+      )
+    ) {
+      wave.push(...k.nodes);
+    } else {
+      wave.push(k);
+    }
+  }
+  return toSeqOrSingle([
+    { kind: 'Parallel', nodes: wave },
+    ...(rests.length === 1
+      ? rests
+      : rests.length > 1
+        ? [{ kind: 'Parallel' as const, nodes: rests }]
+        : []),
+  ]);
+}
+
+function collectFetchesDeep(
+  node: StitchPlanNode,
+): Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> {
+  const out: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+  collectExecutableFetches(node, out);
+  return out;
+}
+
+/**
+ * Sequence(…, Fetch(products@users), Parallel(accounts, products_deep), …)
+ * → Sequence(…, Parallel(products@users, accounts, products_deep), …)
+ * when products@users is independent of the Parallel children.
+ */
+function compressProductsIntoDeepWave(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? {
+          ...node,
+          continue: compressProductsIntoDeepWave(
+            node.continue,
+            stitchingInfo,
+          ),
+        }
+      : node;
+  }
+  if (node.kind === 'Parallel') {
+    return {
+      kind: 'Parallel',
+      nodes: node.nodes.map((c) =>
+        compressProductsIntoDeepWave(c, stitchingInfo),
+      ),
+    };
+  }
+  if (node.kind !== 'Sequence') {
+    return node;
+  }
+  const nodes = node.nodes.map((c) =>
+    compressProductsIntoDeepWave(c, stitchingInfo),
+  );
+  const flat: StitchPlanNode[] = [];
+  for (const n of nodes) {
+    if (n.kind === 'Sequence') {
+      flat.push(...n.nodes);
+    } else {
+      flat.push(n);
+    }
+  }
+  for (let i = 0; i + 1 < flat.length; i++) {
+    const cur = flat[i]!;
+    const next = flat[i + 1]!;
+    if (
+      cur.kind !== 'Fetch' ||
+      !cur.entityTypeName ||
+      next.kind !== 'Parallel'
+    ) {
+      continue;
+    }
+    // Only fold into a deep wave that already has the same entity selection
+    // (Hive products@users ∪ products_deep). Avoid lifting unrelated hops
+    // into arbitrary Parallels (complex-entity-call).
+    const curKey = `${cur.subschema.name}|${cur.entityTypeName}|${selectionSetKey(cur.selectionSet)}`;
+    const hasMatch = next.nodes.some(
+      (n) =>
+        n.kind === 'Fetch' &&
+        !n.rootField &&
+        `${n.subschema.name}|${n.entityTypeName}|${selectionSetKey(n.selectionSet)}` ===
+          curKey,
+    );
+    if (!hasMatch) {
+      continue;
+    }
+    const midFetches = collectFetchesDeep(next);
+    if (
+      midFetches.some(
+        (m) =>
+          fetchDependsOn(stitchingInfo, cur, m) ||
+          fetchDependsOn(stitchingInfo, m, cur),
+      )
+    ) {
+      continue;
+    }
+    // Merge same-type same-selection entity Fetches into multi-path (Hive
+    // products wave) while keeping other Parallel children.
+    const parallelNodes: StitchPlanNode[] = [cur, ...next.nodes];
+    const byKey = new Map<
+      string,
+      Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
+    >();
+    const others: StitchPlanNode[] = [];
+    for (const n of parallelNodes) {
+      if (n.kind === 'Fetch' && n.entityTypeName && !n.rootField) {
+        const key = `${n.subschema.name}|${n.entityTypeName}|${selectionSetKey(n.selectionSet)}`;
+        let list = byKey.get(key);
+        if (!list) {
+          list = [];
+          byKey.set(key, list);
+        }
+        list.push(n);
+      } else {
+        others.push(n);
+      }
+    }
+    const mergedParallel: StitchPlanNode[] = [...others];
+    for (const group of byKey.values()) {
+      mergedParallel.push(
+        group.length > 1 ? mergeMultiPathFetches(group) : group[0]!,
+      );
+    }
+    flat.splice(i, 2, {
+      kind: 'Parallel',
+      nodes: mergedParallel,
+    });
+    return compressProductsIntoDeepWave(
+      toSeqOrSingle(flat),
+      stitchingInfo,
+    );
+  }
+  return toSeqOrSingle(flat);
+}
+
+/**
+ * Inside each Parallel, collapse same-subschema entity Fetches with different
+ * types (or selections) into one BatchFetch — Hive multi-type reviews.
+ */
+function groupParallelBatchFetches(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? {
+          ...node,
+          continue: groupParallelBatchFetches(node.continue, stitchingInfo),
+        }
+      : node;
+  }
+  if (node.kind === 'Sequence') {
+    return {
+      kind: 'Sequence',
+      nodes: node.nodes.map((c) =>
+        groupParallelBatchFetches(c, stitchingInfo),
+      ),
+    };
+  }
+  if (node.kind !== 'Parallel') {
+    return node;
+  }
+  const children = node.nodes.map((c) =>
+    groupParallelBatchFetches(c, stitchingInfo),
+  );
+  const entityFetches = children.filter(
+    (c): c is Extract<StitchPlanNode, { kind: 'Fetch' }> =>
+      c.kind === 'Fetch' && Boolean(c.entityTypeName) && !c.rootField,
+  );
+  if (entityFetches.length < 2) {
+    return { kind: 'Parallel', nodes: children };
+  }
+
+  const bySub = new Map<Subschema, typeof entityFetches>();
+  for (const f of entityFetches) {
+    let list = bySub.get(f.subschema);
+    if (!list) {
+      list = [];
+      bySub.set(f.subschema, list);
+    }
+    list.push(f);
+  }
+
+  const consumed = new Set<StitchPlanNode>();
+  const next: StitchPlanNode[] = [];
+  for (const child of children) {
+    if (consumed.has(child)) {
+      continue;
+    }
+    if (
+      child.kind !== 'Fetch' ||
+      !child.entityTypeName ||
+      child.rootField
+    ) {
+      next.push(child);
+      continue;
+    }
+    const group = bySub.get(child.subschema);
+    if (!group || group.length < 2) {
+      next.push(child);
+      continue;
+    }
+    // Distinct entity types or selections → BatchFetch once per group.
+    const typeKeys = new Set(
+      group.map(
+        (g) =>
+          `${g.entityTypeName}\0${selectionSetKey(g.selectionSet)}`,
+      ),
+    );
+    if (typeKeys.size < 2) {
+      // Same type+selection left as separate Fetches (or already multi-path).
+      next.push(child);
+      continue;
+    }
+    // Only BatchFetch when every alias lives under a distinct root field
+    // (users vs topProducts). Same-root multi-type batches race on entity
+    // identity (corrupted-supergraph-node-id).
+    const rootKeys = group.map((g) => {
+      const paths = fetchFlattenPaths(g);
+      const roots = new Set(paths.map((p) => String(p[0] ?? '')));
+      return roots;
+    });
+    const seenRoots = new Set<string>();
+    let rootClash = false;
+    for (const roots of rootKeys) {
+      if (roots.size !== 1) {
+        rootClash = true;
+        break;
+      }
+      const root = [...roots][0]!;
+      if (!root || seenRoots.has(root)) {
+        rootClash = true;
+        break;
+      }
+      seenRoots.add(root);
+    }
+    if (rootClash) {
+      next.push(child);
+      continue;
+    }
+    if (group[0] !== child) {
+      // Batched when we visited group[0].
+      continue;
+    }
+    for (const g of group) {
+      consumed.add(g);
+    }
+    next.push({
+      kind: 'BatchFetch',
+      subschema: child.subschema,
+      aliases: group.map((g, i) => ({
+        alias: `_e${i}`,
+        entityTypeName: g.entityTypeName!,
+        selectionSet: g.selectionSet,
+        flattenPaths: fetchFlattenPaths(g),
+      })),
+    });
+  }
+  return next.length === 1
+    ? next[0]!
+    : { kind: 'Parallel', nodes: next };
+}
+
+/**
+ * Attach id/dependsOn for optional barrier-free execute. Uses fetchDependsOn
+ * plus tree Sequence order (later Sequence siblings depend on earlier ones).
+ */
+function annotateFetchDeps(
+  root: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  const fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+  collectExecutableFetches(root, fetches);
+  if (!fetches.length) {
+    return root;
+  }
+  const ids = fetches.map((_, i) => `f${i}`);
+  const depIds: string[][] = fetches.map(() => []);
+  for (let i = 0; i < fetches.length; i++) {
+    for (let j = 0; j < fetches.length; j++) {
+      if (i === j) {
+        continue;
+      }
+      if (fetchDependsOn(stitchingInfo, fetches[i]!, fetches[j]!)) {
+        depIds[i]!.push(ids[j]!);
+      }
+    }
+  }
+
+  let counter = 0;
+  const assign = (node: StitchPlanNode): StitchPlanNode => {
+    if (node.kind === 'Fetch') {
+      const id = ids[counter]!;
+      const dependsOn = depIds[counter]!;
+      counter++;
+      return { ...node, id, dependsOn, completesIds: [id] };
+    }
+    if (node.kind === 'BatchFetch') {
+      // Expand aliases into the same id space as collectExecutableFetches.
+      const completesIds: string[] = [];
+      const dependsOn = new Set<string>();
+      for (const _alias of node.aliases) {
+        const id = ids[counter]!;
+        completesIds.push(id);
+        for (const d of depIds[counter]!) {
+          dependsOn.add(d);
+        }
+        counter++;
+      }
+      for (const id of completesIds) {
+        dependsOn.delete(id);
+      }
+      return {
+        ...node,
+        id: completesIds[0],
+        completesIds,
+        dependsOn: [...dependsOn],
+      };
+    }
+    if (node.kind === 'Island') {
+      return node.continue
+        ? { ...node, continue: assign(node.continue) }
+        : node;
+    }
+    if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+      return { kind: node.kind, nodes: node.nodes.map(assign) };
+    }
+    return node;
+  };
+  return assign(root);
 }
