@@ -2955,18 +2955,6 @@ export function buildStitchPlan(
     };
   }
 
-  if (options.hasDelegationPlanHooks) {
-    return {
-      operation,
-      fragments,
-      root: { kind: 'Parallel', nodes: [] },
-      incomplete: true,
-      incompleteReasons: [
-        'Delegation plan hooks are installed; backbone planning disabled',
-      ],
-    };
-  }
-
   if (operation.operation === 'subscription') {
     return {
       operation,

@@ -97,11 +97,6 @@ export interface BackboneExecutorOptions {
    * typeDefs. Keyed by parent type name → field names.
    */
   localFields?: Map<string, Set<string>>;
-  /**
-   * When delegation-plan hooks are installed, backbone planning is skipped for
-   * safety (hooks may replace the plan with live context).
-   */
-  hasDelegationPlanHooks?: boolean;
 }
 
 export interface BackboneExecutionContext {
