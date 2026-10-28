@@ -27,6 +27,7 @@ import {
 import {
   FieldNode,
   GraphQLSchema,
+  isInterfaceType,
   isObjectType,
   Kind,
   OperationTypeNode,
@@ -318,7 +319,26 @@ function executeFetchNode(
     return;
   }
 
-  const parents = collectEntitiesAtPath(ctx.data, node.flattenPath);
+  const atPath = collectEntitiesAtPath(ctx.data, node.flattenPath);
+  // Cast/Flatten: hydrate parents matching this entity type, including
+  // concrete implementers of an @interfaceObject interface (User → NodeWithName).
+  const entityType = ctx.schema.getType(node.entityTypeName);
+  const parents = atPath.filter((p) => {
+    if (p == null) {
+      return false;
+    }
+    if (p.__typename == null || p.__typename === node.entityTypeName) {
+      return true;
+    }
+    if (!isInterfaceType(entityType)) {
+      return false;
+    }
+    const runtime = ctx.schema.getType(p.__typename);
+    return (
+      isObjectType(runtime) &&
+      runtime.getInterfaces().some((i) => i.name === node.entityTypeName)
+    );
+  });
   if (!parents.length) {
     return;
   }
@@ -332,7 +352,8 @@ function executeFetchNode(
   }
 
   const type = ctx.schema.getType(node.entityTypeName);
-  if (!isObjectType(type)) {
+  // Object types and @interfaceObject interfaces both carry merge resolvers.
+  if (!isObjectType(type) && !isInterfaceType(type)) {
     return;
   }
 
@@ -423,7 +444,7 @@ function executeFetchNode(
           node.subschema,
           node.selectionSet,
           undefined,
-          type,
+          type as any,
         ),
       (resolverResult) => {
         if (resolverResult == null || typeof resolverResult !== 'object') {
@@ -433,6 +454,7 @@ function executeFetchNode(
           ctx.errors.push(resolverResult);
           return;
         }
+        const priorTypename = parent.__typename;
         const merged = mergeDeep(
           [parent, resolverResult],
           undefined,
@@ -441,6 +463,22 @@ function executeFetchNode(
         );
         // mutate parent in place so siblings sharing the tree see updates
         Object.assign(parent, merged);
+        // Prefer concrete object __typename over @interfaceObject interface
+        // names so `... on Admin` / `... on User` can discriminate.
+        const resultTypename = resolverResult.__typename;
+        if (
+          priorTypename &&
+          resultTypename &&
+          priorTypename !== resultTypename
+        ) {
+          const priorType = ctx.schema.getType(priorTypename);
+          const resultType = ctx.schema.getType(resultTypename);
+          if (isObjectType(priorType) && isInterfaceType(resultType)) {
+            parent.__typename = priorTypename;
+          } else if (isInterfaceType(priorType) && isObjectType(resultType)) {
+            parent.__typename = resultTypename;
+          }
+        }
         ensureAnnotatedTree(parent, node.subschema);
       },
     ),

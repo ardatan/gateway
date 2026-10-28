@@ -108,9 +108,6 @@ function projectValue(
       objectType = t;
     }
   }
-  if (!objectType) {
-    return value;
-  }
 
   const selectionSet: SelectionSetNode = {
     kind: Kind.SELECTION_SET,
@@ -122,6 +119,24 @@ function projectValue(
     // Leaf field — return scalar/object as-is without __typename injection noise
     const { __typename: _t, ...rest } = value as Record<string, any>;
     return Object.keys(rest).length ? rest : value;
+  }
+
+  // @interfaceObject responses may keep the interface name as __typename
+  // (NodeWithName / Account). Project interface fields directly and only apply
+  // concrete fragments when a real object __typename is present.
+  if (!objectType && isAbstractType(runtimeType)) {
+    return projectInterfaceObjectValue(
+      schema,
+      fragments,
+      variableValues,
+      runtimeType,
+      selectionSet,
+      value,
+    );
+  }
+  if (!objectType) {
+    const { __typename: _t, ...rest } = value as Record<string, any>;
+    return rest;
   }
 
   const { fields } = collectFields(
@@ -153,6 +168,84 @@ function projectValue(
       nestedFieldNodes,
       raw,
     );
+  }
+  return projected;
+}
+
+/**
+ * Project a value whose runtime __typename is still an interface (federation
+ * @interfaceObject). Include interface fields; skip concrete-typed fragments
+ * unless the value carries a matching concrete __typename.
+ */
+function projectInterfaceObjectValue(
+  schema: GraphQLSchema,
+  fragments: Record<string, FragmentDefinitionNode>,
+  variableValues: Record<string, any>,
+  abstractType: NonNullable<ReturnType<typeof getNamedType>>,
+  selectionSet: SelectionSetNode,
+  value: Record<string, any>,
+): Record<string, any> {
+  const projected: Record<string, any> = {};
+  const abstractFields =
+    isAbstractType(abstractType) && 'getFields' in abstractType
+      ? (abstractType as any).getFields()
+      : {};
+
+  const applyField = (fieldNode: FieldNode) => {
+    const responseKey = fieldNode.alias?.value ?? fieldNode.name.value;
+    if (fieldNode.name.value === '__typename') {
+      projected[responseKey] = value.__typename ?? abstractType.name;
+      return;
+    }
+    if (!(responseKey in value) && !(fieldNode.name.value in value)) {
+      return;
+    }
+    const field = abstractFields[fieldNode.name.value];
+    const raw =
+      responseKey in value ? value[responseKey] : value[fieldNode.name.value];
+    projected[responseKey] = projectValue(
+      schema,
+      fragments,
+      variableValues,
+      field ? getNamedType(field.type) : undefined,
+      [fieldNode],
+      raw,
+    );
+  };
+
+  for (const sel of selectionSet.selections) {
+    if (sel.kind === Kind.FIELD) {
+      applyField(sel);
+    } else if (sel.kind === Kind.INLINE_FRAGMENT) {
+      const cond = sel.typeCondition?.name.value;
+      if (!cond || cond === abstractType.name) {
+        for (const nested of sel.selectionSet.selections) {
+          if (nested.kind === Kind.FIELD) {
+            applyField(nested);
+          }
+        }
+      } else if (value.__typename === cond) {
+        for (const nested of sel.selectionSet.selections) {
+          if (nested.kind === Kind.FIELD) {
+            applyField(nested);
+          }
+        }
+      }
+      // Concrete fragment with interface-object __typename: omit (no match).
+    } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
+      const fragment = fragments[sel.name.value];
+      if (!fragment) {
+        continue;
+      }
+      const cond = fragment.typeCondition.name.value;
+      if (cond === abstractType.name || value.__typename === cond) {
+        for (const nested of fragment.selectionSet.selections) {
+          if (nested.kind === Kind.FIELD) {
+            applyField(nested);
+          }
+        }
+      }
+    }
   }
   return projected;
 }
