@@ -1135,7 +1135,7 @@ function selectionFullyLocalOnSubschema(
  * another subgraph (parent-entity-call), emit that entity Fetch directly.
  */
 function planParentEntityNestedHop(
-  schema: GraphQLSchema,
+  _schema: GraphQLSchema,
   stitchingInfo: StitchingInfo,
   entityTypeName: string,
   sourceSubschema: Subschema,
@@ -2572,14 +2572,6 @@ function planRootField(
     return parts.length === 1
       ? parts[0]!
       : { kind: 'Sequence', nodes: parts };
-  };
-
-  const withPartialFollowUps = (node: StitchPlanNode): StitchPlanNode => {
-    const prereq = nestedPrereqNode();
-    if (!prereq) {
-      return node;
-    }
-    return { kind: 'Sequence', nodes: [node, prereq] };
   };
 
   // Interface/union returns:
