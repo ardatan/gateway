@@ -1,3 +1,4 @@
+import { getBatchingExecutor } from '@graphql-tools/batch-execute';
 import {
   createDefaultExecutor,
   delegateToSchema,
@@ -50,11 +51,32 @@ import type {
   StitchPlanNode,
 } from './types.js';
 
-function getSubschemaExecutor(subschema: Subschema): Executor {
-  if (subschema.executor) {
-    return subschema.executor;
+const BATCH_EXECUTOR_CONTEXT = Object.create(null);
+
+/**
+ * Subgraph executor with same-tick request merging via batch-execute.
+ * Parallel hops to the same subgraph (e.g. reviews User|_entities +
+ * reviews Product|_entities) collapse into one HTTP round-trip — Hive-like
+ * multi-alias BatchFetch without building the document by hand.
+ */
+function getSubschemaExecutor(
+  subschema: Subschema,
+  context?: Record<string, any> | null,
+): Executor {
+  const base = subschema.executor ?? createDefaultExecutor(subschema.schema);
+  return getBatchingExecutor(context ?? BATCH_EXECUTOR_CONTEXT, base);
+}
+
+/** Ensure delegateToSchema enables batch-execute on this hop's executor. */
+function withBatching(subschema: Subschema): Subschema {
+  if (subschema.batch) {
+    return subschema;
   }
-  return createDefaultExecutor(subschema.schema);
+  return Object.assign(
+    Object.create(Object.getPrototypeOf(subschema)),
+    subschema,
+    { batch: true },
+  ) as Subschema;
 }
 
 /**
@@ -631,7 +653,10 @@ function executeFetchNode(
   node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
   ctx: BackboneExecutionContext,
 ): MaybePromise<void> {
-  const executor = getSubschemaExecutor(node.subschema);
+  const executor = getSubschemaExecutor(
+    node.subschema,
+    ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
+  );
 
   if (node.rootField) {
     const { document, variables } = buildRootDocument(
@@ -969,13 +994,13 @@ function tryExecuteEntitiesBatch(
   return handleMaybePromise(
     () =>
       delegateToSchema({
-        schema: hopSubschema,
+        schema: withBatching(hopSubschema),
         operation: 'query',
         fieldName: '_entities',
         returnType: new GraphQLList(type),
         args: entry.argsFromKeys!(keys),
         selectionSet: node.selectionSet,
-        context: ctx.contextValue,
+        context: ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
         info: info as any,
         skipTypeMerging: true,
       }),
