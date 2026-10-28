@@ -58,6 +58,58 @@ function getSubschemaExecutor(subschema: Subschema): Executor {
 }
 
 /**
+ * Hive Parallel pattern: only real promises enter `Promise.all`. Sync
+ * completions stay sync — never `Promise.resolve` every job (extra microtasks).
+ */
+function awaitMaybePromises(
+  jobs: ReadonlyArray<MaybePromise<unknown>>,
+): MaybePromise<void> {
+  const promises: PromiseLike<unknown>[] = [];
+  for (const job of jobs) {
+    if (isPromise(job)) {
+      promises.push(job);
+    }
+  }
+  if (promises.length === 0) {
+    return;
+  }
+  if (promises.length === 1) {
+    return promises[0] as PromiseLike<void>;
+  }
+  return Promise.all(promises) as PromiseLike<void>;
+}
+
+/**
+ * Like `awaitMaybePromises` but preserves per-job values. Sync slots are kept
+ * as-is; only promise slots are awaited and filled back by index.
+ */
+function allMaybePromises<T>(
+  jobs: ReadonlyArray<MaybePromise<T>>,
+): MaybePromise<T[]> {
+  const results: T[] = new Array(jobs.length);
+  const promises: PromiseLike<T>[] = [];
+  const indices: number[] = [];
+  for (let i = 0; i < jobs.length; i++) {
+    const job = jobs[i]!;
+    if (isPromise(job)) {
+      promises.push(job);
+      indices.push(i);
+    } else {
+      results[i] = job as T;
+    }
+  }
+  if (promises.length === 0) {
+    return results;
+  }
+  return Promise.all(promises).then((resolved) => {
+    for (let k = 0; k < resolved.length; k++) {
+      results[indices[k]!] = resolved[k]!;
+    }
+    return results;
+  });
+}
+
+/**
  * Computed-field isolation installs TransformCompositeFields that strip
  * sibling fields (inStock vs shippingEstimate) onto separate Subschema clones.
  * When a backbone Fetch unions fields from both clones, drop the strip
@@ -741,8 +793,7 @@ function executeFetchNode(
       );
     }
     return handleMaybePromise(
-      () =>
-        Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
+      () => awaitMaybePromises(jobs),
       () => {
         for (const parent of parents) {
           stampSubschema(parent, node.subschema);
@@ -826,7 +877,7 @@ function executeFetchNode(
   );
 
   return handleMaybePromise(
-    () => Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
+    () => awaitMaybePromises(jobs),
     () => undefined,
   );
 }
@@ -1026,10 +1077,7 @@ function executePlanNode(
           );
         });
         return handleMaybePromise(
-          () =>
-            Promise.all(
-              jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j))),
-            ),
+          () => allMaybePromises(jobs),
           (parts: Array<{ data: any; errors: any[] }>) => {
             let merged: any = undefined;
             let anyData = false;
@@ -1104,13 +1152,7 @@ function executePlanNode(
         }
       }
       const jobs = node.nodes.map((child) => executePlanNode(child, ctx));
-      return handleMaybePromise(
-        () =>
-          Promise.all(
-            jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j))),
-          ),
-        () => undefined,
-      );
+      return awaitMaybePromises(jobs);
     }
     case 'Fetch':
       return executeFetchNode(node, ctx);
@@ -1223,8 +1265,7 @@ function executeDataflowPlan(
       ),
     );
     return handleMaybePromise(
-      () =>
-        Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
+      () => awaitMaybePromises(jobs),
       () => runReady(),
     );
   };
@@ -1565,10 +1606,7 @@ function executeBatchFetchNode(
       ctx,
     ),
   );
-  return handleMaybePromise(
-    () => Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
-    () => undefined,
-  );
+  return awaitMaybePromises(jobs);
 }
 
 export function executeStitchPlan(
