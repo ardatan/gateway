@@ -1509,26 +1509,113 @@ function planMergedTypeFollowUps(
       }
       list.push(fieldNode);
     }
-    if (leftoverByTarget.size === 1) {
-      const [target, fields] = [...leftoverByTarget.entries()][0]!;
-      stages.push({
-        kind: 'Fetch',
-        subschema: target,
-        entityTypeName: typeName,
-        selectionSet: ensureTypename(selectionSetOf(fields)),
-        flattenPath,
-      });
-    } else if (leftoverByTarget.size > 1) {
-      stages.push({
-        kind: 'Parallel',
-        nodes: [...leftoverByTarget.entries()].map(([target, fields]) => ({
-          kind: 'Fetch' as const,
+    // Order leftovers by @requires edges among themselves (byNovice before
+    // byExpert in requires-circular). Independent leftovers stay Parallel.
+    const leftoverEntries = [...leftoverByTarget.entries()];
+    const leftoverFieldNodes = leftoverEntries.flatMap(([, fields]) => fields);
+    const leftoverNames = new Set(leftoverFieldNodes.map((f) => f.name.value));
+    const dependsOnLeftover = (fieldName: string): string[] => {
+      const deps = stitchingInfo.fieldNodesByField?.[typeName]?.[fieldName];
+      if (!deps?.length) {
+        return [];
+      }
+      return deps
+        .map((d) => d.name.value)
+        .filter((n) => n !== fieldName && leftoverNames.has(n));
+    };
+    const hasCrossDeps = leftoverFieldNodes.some(
+      (f) => dependsOnLeftover(f.name.value).length > 0,
+    );
+    if (!hasCrossDeps) {
+      if (leftoverByTarget.size === 1) {
+        const [target, fields] = leftoverEntries[0]!;
+        stages.push({
+          kind: 'Fetch',
           subschema: target,
           entityTypeName: typeName,
           selectionSet: ensureTypename(selectionSetOf(fields)),
           flattenPath,
-        })),
+        });
+      } else if (leftoverByTarget.size > 1) {
+        stages.push({
+          kind: 'Parallel',
+          nodes: leftoverEntries.map(([target, fields]) => ({
+            kind: 'Fetch' as const,
+            subschema: target,
+            entityTypeName: typeName,
+            selectionSet: ensureTypename(selectionSetOf(fields)),
+            flattenPath,
+          })),
+        });
+      }
+    } else {
+      // Topological batches: fields with no unmet leftover deps first.
+      const remaining = new Map(
+        leftoverFieldNodes.map((f) => [f.name.value, f] as const),
+      );
+      const ownerOf = new Map<string, Subschema>();
+      for (const [target, fields] of leftoverEntries) {
+        for (const f of fields) {
+          ownerOf.set(f.name.value, target);
+        }
+      }
+      const orderedBatches: FieldNode[][] = [];
+      while (remaining.size) {
+        const batch: FieldNode[] = [];
+        for (const [name, field] of remaining) {
+          const unmet = dependsOnLeftover(name).filter((d) => remaining.has(d));
+          if (!unmet.length) {
+            batch.push(field);
+          }
+        }
+        if (!batch.length) {
+          // Cycle fallback — emit the rest in one parallel group.
+          batch.push(...remaining.values());
+          remaining.clear();
+        } else {
+          for (const f of batch) {
+            remaining.delete(f.name.value);
+          }
+        }
+        orderedBatches.push(batch);
+      }
+      const batchNodes: StitchPlanNode[] = orderedBatches.map((batch) => {
+        const byTarget = new Map<Subschema, FieldNode[]>();
+        for (const f of batch) {
+          const target = ownerOf.get(f.name.value)!;
+          let list = byTarget.get(target);
+          if (!list) {
+            list = [];
+            byTarget.set(target, list);
+          }
+          list.push(f);
+        }
+        if (byTarget.size === 1) {
+          const [target, fields] = [...byTarget.entries()][0]!;
+          return {
+            kind: 'Fetch' as const,
+            subschema: target,
+            entityTypeName: typeName,
+            selectionSet: ensureTypename(selectionSetOf(fields)),
+            flattenPath,
+          };
+        }
+        return {
+          kind: 'Parallel' as const,
+          nodes: [...byTarget.entries()].map(([target, fields]) => ({
+            kind: 'Fetch' as const,
+            subschema: target,
+            entityTypeName: typeName,
+            selectionSet: ensureTypename(selectionSetOf(fields)),
+            flattenPath,
+          })),
+        };
       });
+      if (batchNodes.length === 1) {
+        stages.push(batchNodes[0]!);
+      } else {
+        stages.push({ kind: 'Sequence', nodes: batchNodes });
+      }
     }
   }
 
