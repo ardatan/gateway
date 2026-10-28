@@ -92,52 +92,93 @@ function stampSubschema(object: Record<string, any>, subschema: Subschema): void
 }
 
 /**
- * Annotate only branches introduced by this entity hop (not the whole parent
- * tree — that was O(response×hops) on large lists).
- */
-function annotateResolverBranches(
-  parent: Record<string, any>,
-  resolverResult: Record<string, any>,
-  subschema: Subschema,
-): void {
-  stampSubschema(parent, subschema);
-  for (const key of Object.keys(resolverResult)) {
-    if (key === '__typename') {
-      continue;
-    }
-    const child = parent[key];
-    if (child != null && typeof child === 'object') {
-      // Fresh subgraph payload for this field — deep-annotate once.
-      parent[key] = annotateValue(child, [], subschema);
-    }
-  }
-}
-
-/**
  * Prefer concrete object __typename over @interfaceObject interface names.
  */
-function preferConcreteTypename(
-  parent: Record<string, any>,
-  resolverResult: Record<string, any>,
+function resolveMergedTypename(
+  priorTypename: string | undefined,
+  resultTypename: string | undefined,
   schema: GraphQLSchema,
-): void {
-  const priorTypename = parent.__typename;
-  const resultTypename = resolverResult.__typename;
-  if (!priorTypename || !resultTypename || priorTypename === resultTypename) {
-    return;
+): string | undefined {
+  if (!resultTypename) {
+    return priorTypename;
+  }
+  if (!priorTypename || priorTypename === resultTypename) {
+    return resultTypename;
   }
   const priorType = schema.getType(priorTypename);
   const resultType = schema.getType(resultTypename);
   if (isObjectType(priorType) && isInterfaceType(resultType)) {
-    parent.__typename = priorTypename;
-  } else if (isInterfaceType(priorType) && isObjectType(resultType)) {
-    parent.__typename = resultTypename;
+    return priorTypename;
   }
+  if (isInterfaceType(priorType) && isObjectType(resultType)) {
+    return resultTypename;
+  }
+  return resultTypename;
 }
 
 /**
- * Light entity merge: copy hop fields onto the parent in place. Avoids
- * mergeDeep over the full parent on every entity (hot path with large lists).
+ * In-place merge of entity hop fields into an existing parent. Only walks
+ * keys from `source` (unlike mergeDeep over the full parent tree). Nested
+ * objects keep prior-hop siblings; fresh subgraph payloads are annotated.
+ */
+function mergeInto(
+  target: any,
+  source: any,
+  schema: GraphQLSchema,
+  subschema: Subschema,
+): any {
+  if (source === undefined) {
+    return target;
+  }
+  if (source == null || typeof source !== 'object') {
+    return source;
+  }
+  if (Array.isArray(source)) {
+    if (Array.isArray(target) && target.length === source.length) {
+      for (let i = 0; i < source.length; i++) {
+        target[i] = mergeInto(target[i], source[i], schema, subschema);
+      }
+      return target;
+    }
+    return annotateValue(source, [], subschema);
+  }
+  if (target == null || typeof target !== 'object' || Array.isArray(target)) {
+    return annotateValue(source, [], subschema);
+  }
+
+  const priorTypename = target.__typename as string | undefined;
+  for (const key of Object.keys(source)) {
+    if (
+      key === '__proto__' ||
+      key === 'constructor' ||
+      key === 'prototype' ||
+      key === '__typename'
+    ) {
+      continue;
+    }
+    const incoming = source[key];
+    if (
+      Object.prototype.hasOwnProperty.call(target, key) &&
+      incoming !== undefined
+    ) {
+      target[key] = mergeInto(target[key], incoming, schema, subschema);
+    } else if (incoming != null && typeof incoming === 'object') {
+      target[key] = annotateValue(incoming, [], subschema);
+    } else {
+      target[key] = incoming;
+    }
+  }
+  target.__typename = resolveMergedTypename(
+    priorTypename,
+    source.__typename as string | undefined,
+    schema,
+  );
+  stampSubschema(target, subschema);
+  return target;
+}
+
+/**
+ * Light entity merge: deep-merge only hop fields onto the parent in place.
  */
 function mergeEntityIntoParent(
   parent: Record<string, any>,
@@ -145,20 +186,7 @@ function mergeEntityIntoParent(
   schema: GraphQLSchema,
   subschema: Subschema,
 ): void {
-  for (const key of Object.keys(resolverResult)) {
-    if (key === '__typename') {
-      continue;
-    }
-    const incoming = resolverResult[key];
-    if (incoming !== undefined) {
-      parent[key] = incoming;
-    }
-  }
-  preferConcreteTypename(parent, resolverResult, schema);
-  if (resolverResult.__typename != null && parent.__typename == null) {
-    parent.__typename = resolverResult.__typename;
-  }
-  annotateResolverBranches(parent, resolverResult, subschema);
+  mergeInto(parent, resolverResult, schema, subschema);
 }
 
 /**
