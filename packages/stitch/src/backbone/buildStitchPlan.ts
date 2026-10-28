@@ -1178,15 +1178,161 @@ function planParentEntityNestedHop(
   return null;
 }
 
+/**
+ * Keep only selections fetchable on `subschema`, recursively stripping nested
+ * fields the subgraph does not own (e.g. ProductList key `products { id pid }`
+ * on PRODUCTS → `products { id }` — pid lives on LINK).
+ */
+function filterSelectionTreeForSubschema(
+  subschema: Subschema,
+  typeName: string,
+  selection: SelectionNode,
+  stitchingInfo: StitchingInfo,
+  gatewaySchema: GraphQLSchema,
+  providedFieldNames?: ReadonlySet<string>,
+): SelectionNode | null {
+  if (selection.kind === Kind.FIELD) {
+    if (selection.name.value === '__typename') {
+      return selection;
+    }
+    if (
+      !fieldFetchableOnSubschema(
+        stitchingInfo,
+        subschema,
+        typeName,
+        selection.name.value,
+        providedFieldNames,
+      )
+    ) {
+      return null;
+    }
+    if (!selection.selectionSet) {
+      return selection;
+    }
+    const parent =
+      subschema.transformedSchema.getType(typeName) ??
+      subschema.schema.getType(typeName) ??
+      gatewaySchema.getType(typeName);
+    const field =
+      parent && 'getFields' in parent
+        ? (parent as GraphQLObjectType).getFields()[selection.name.value]
+        : undefined;
+    if (!field) {
+      return null;
+    }
+    const nestedTypeName = getNamedType(field.type).name;
+    const nested: SelectionNode[] = [];
+    for (const sel of selection.selectionSet.selections) {
+      const kept = filterSelectionTreeForSubschema(
+        subschema,
+        nestedTypeName,
+        sel,
+        stitchingInfo,
+        gatewaySchema,
+        undefined,
+      );
+      if (kept) {
+        nested.push(kept);
+      }
+    }
+    if (!nested.length) {
+      return null;
+    }
+    return {
+      ...selection,
+      selectionSet: selectionSetOf(nested),
+    };
+  }
+  if (selection.kind === Kind.INLINE_FRAGMENT) {
+    const cond = selection.typeCondition?.name.value ?? typeName;
+    if (
+      subschema.transformedSchema.getType(cond) == null &&
+      subschema.schema.getType(cond) == null
+    ) {
+      return null;
+    }
+    const nested: SelectionNode[] = [];
+    for (const sel of selection.selectionSet.selections) {
+      const kept = filterSelectionTreeForSubschema(
+        subschema,
+        cond,
+        sel,
+        stitchingInfo,
+        gatewaySchema,
+        providedFieldNames,
+      );
+      if (kept) {
+        nested.push(kept);
+      }
+    }
+    if (!nested.length) {
+      return null;
+    }
+    return {
+      ...selection,
+      selectionSet: selectionSetOf(nested),
+    };
+  }
+  return null;
+}
+
+/** Strip bridge selections to fields the Fetch's subschema can actually query. */
+function filterBridgesForRootFetch(
+  node: StitchPlanNode,
+  bridges: readonly SelectionNode[],
+  stitchingInfo: StitchingInfo,
+  gatewaySchema: GraphQLSchema,
+  parentTypeName: string,
+): SelectionNode[] {
+  if (node.kind !== 'Fetch' || !node.rootField) {
+    return [];
+  }
+  const kept: SelectionNode[] = [];
+  for (const bridge of bridges) {
+    const filtered = filterSelectionTreeForSubschema(
+      node.subschema,
+      parentTypeName,
+      bridge,
+      stitchingInfo,
+      gatewaySchema,
+    );
+    if (filtered) {
+      kept.push(filtered);
+    }
+  }
+  return kept;
+}
+
 /** Add selections (e.g. requires bridges) into every root Fetch of a plan node. */
 function injectSelectionsIntoRootFetches(
   node: StitchPlanNode,
   extra: readonly SelectionNode[],
+  /**
+   * When set, each Fetch only receives the subset of `extra` valid on its
+   * subschema (nested key fields like Product.pid on PRODUCTS are dropped).
+   */
+  filterCtx?: {
+    stitchingInfo: StitchingInfo;
+    gatewaySchema: GraphQLSchema;
+    parentTypeName: string;
+  },
 ): StitchPlanNode {
   if (node.kind === 'Fetch' && node.rootField) {
+    const toInject = filterCtx
+      ? filterBridgesForRootFetch(
+          node,
+          extra,
+          filterCtx.stitchingInfo,
+          filterCtx.gatewaySchema,
+          filterCtx.parentTypeName,
+        )
+      : extra;
+    if (!toInject.length) {
+      return node;
+    }
     const selectionSet = selectionSetOf([
       ...(node.rootField.selectionSet?.selections ?? []),
-      ...extra,
+      ...toInject,
     ]);
     return {
       ...node,
@@ -1197,7 +1343,9 @@ function injectSelectionsIntoRootFetches(
   if (node.kind === 'Parallel' || node.kind === 'Sequence') {
     return {
       ...node,
-      nodes: node.nodes.map((n) => injectSelectionsIntoRootFetches(n, extra)),
+      nodes: node.nodes.map((n) =>
+        injectSelectionsIntoRootFetches(n, extra, filterCtx),
+      ),
     };
   }
   return node;
@@ -1957,6 +2105,63 @@ function planRootField(
     };
   }
 
+  // Hive QP: bare fields on an abstract root (node { id }) need a subgraph that
+  // can resolve the field for every runtime type it may return. Complementary
+  // Parallel fetches (`A: ... on Account { id }` + `B: ... on Chat { id }`) are
+  // not a valid path — corrupted-supergraph-node-id expects plan failure.
+  // Only when multiple root owners contribute: a single owner can finish via
+  // entity hops (override-type-interface createdAt, @interfaceObject).
+  if (
+    returnType &&
+    isAbstractType(returnType) &&
+    fieldNode.selectionSet &&
+    usedPartitions.length > 1
+  ) {
+    for (const sel of fieldNode.selectionSet.selections) {
+      if (sel.kind !== Kind.FIELD || sel.name.value === '__typename') {
+        continue;
+      }
+      const bareName = sel.name.value;
+      const resolvableOnSomeOwner = usedPartitions.some((p) => {
+        // @interfaceObject: no local concretes — interface-level fields are OK.
+        const localConcretes = concretesOnSubschema(
+          p.owner,
+          returnType.name,
+          schema,
+        );
+        if (!localConcretes.length) {
+          return fieldFetchableOnSubschema(
+            stitchingInfo,
+            p.owner,
+            returnType.name,
+            bareName,
+            p.provided,
+          );
+        }
+        // Every concrete this subgraph may return must own the field locally.
+        return localConcretes.every((c) =>
+          fieldFetchableOnSubschema(
+            stitchingInfo,
+            p.owner,
+            c.name,
+            bareName,
+            p.provided,
+          ),
+        );
+      });
+      if (!resolvableOnSomeOwner) {
+        incompleteReasons.push(
+          `No paths found for selection item: ${fieldName} (unresolvable interface field ${bareName})`,
+        );
+        return {
+          kind: 'Island',
+          parentTypeName: rootType.name,
+          fieldNode,
+        };
+      }
+    }
+  }
+
   const rootNode: StitchPlanNode =
     rootFetches.length === 1
       ? rootFetches[0]!
@@ -2319,15 +2524,43 @@ function planRootField(
     }
   }
 
-  const withPartialFollowUps = (node: StitchPlanNode): StitchPlanNode => {
+  const nestedPrereqNode = (): StitchPlanNode | null => {
     if (!partialUnavailableFollowUps.length) {
+      return null;
+    }
+    return partialUnavailableFollowUps.length === 1
+      ? partialUnavailableFollowUps[0]!
+      : { kind: 'Parallel' as const, nodes: partialUnavailableFollowUps };
+  };
+
+  /**
+   * Hive QP orders key-providing nested hops (Product.pid via LINK) before
+   * parent-entity hops that need those keys (ProductList → LIST). Sequence:
+   * root → nested prereqs → parent follow-ups.
+   */
+  const sequenceRootFollowUps = (
+    rooted: StitchPlanNode,
+    followUp: StitchPlanNode | null,
+  ): StitchPlanNode => {
+    const parts: StitchPlanNode[] = [rooted];
+    const prereq = nestedPrereqNode();
+    if (prereq) {
+      parts.push(prereq);
+    }
+    if (followUp) {
+      parts.push(followUp);
+    }
+    return parts.length === 1
+      ? parts[0]!
+      : { kind: 'Sequence', nodes: parts };
+  };
+
+  const withPartialFollowUps = (node: StitchPlanNode): StitchPlanNode => {
+    const prereq = nestedPrereqNode();
+    if (!prereq) {
       return node;
     }
-    const extra =
-      partialUnavailableFollowUps.length === 1
-        ? partialUnavailableFollowUps[0]!
-        : { kind: 'Parallel' as const, nodes: partialUnavailableFollowUps };
-    return { kind: 'Sequence', nodes: [node, extra] };
+    return { kind: 'Sequence', nodes: [node, prereq] };
   };
 
   // Interface/union returns:
@@ -2538,14 +2771,15 @@ function planRootField(
           coveredNames,
         );
         const withKeys = keySels.length
-          ? injectSelectionsIntoRootFetches(rooted, keySels)
+          ? injectSelectionsIntoRootFetches(rooted, keySels, {
+              stitchingInfo,
+              gatewaySchema: schema,
+              parentTypeName: returnType.name,
+            })
           : rooted;
-        return withPartialFollowUps({
-          kind: 'Sequence',
-          nodes: [withKeys, child],
-        });
+        return sequenceRootFollowUps(withKeys, child);
       }
-      return withPartialFollowUps(rooted);
+      return sequenceRootFollowUps(rooted, null);
     }
 
     const concreteFollowUps: StitchPlanNode[] = [];
@@ -2616,22 +2850,23 @@ function planRootField(
 
     let rooted = rootNode;
     if (bridgeFragments.length) {
-      rooted = injectSelectionsIntoRootFetches(rootNode, bridgeFragments);
+      rooted = injectSelectionsIntoRootFetches(rootNode, bridgeFragments, {
+        stitchingInfo,
+        gatewaySchema: schema,
+        parentTypeName: returnType.name,
+      });
     }
 
     if (concreteFollowUps.length === 1) {
-      return withPartialFollowUps({
-        kind: 'Sequence',
-        nodes: [rooted, concreteFollowUps[0]!],
-      });
+      return sequenceRootFollowUps(rooted, concreteFollowUps[0]!);
     }
     if (concreteFollowUps.length > 1) {
-      return withPartialFollowUps({
-        kind: 'Sequence',
-        nodes: [rooted, { kind: 'Parallel', nodes: concreteFollowUps }],
+      return sequenceRootFollowUps(rooted, {
+        kind: 'Parallel',
+        nodes: concreteFollowUps,
       });
     }
-    return withPartialFollowUps(rooted);
+    return sequenceRootFollowUps(rooted, null);
   }
 
   const followUpFieldNodes = requested.filter(
@@ -2647,6 +2882,8 @@ function planRootField(
     // parent field name is already covered (e.g. client asked for
     // `data { __typename }` but requirer needs `data { foo ... on Bar { … } }`).
     // Duplicate field names are fine — execute/collectFields merges them.
+    // Nested key fields not owned by the root subgraph (Product.pid on
+    // PRODUCTS) are stripped — Hive fetches them via an earlier entity hop.
     let rooted = rootNode;
     const withDeps = expandFieldDependencies(
       stitchingInfo,
@@ -2660,7 +2897,11 @@ function planRootField(
         fieldAvailableOnSubschema(primary, returnTypeName, fn.name.value),
     );
     if (bridges.length) {
-      rooted = injectSelectionsIntoRootFetches(rooted, bridges);
+      rooted = injectSelectionsIntoRootFetches(rooted, bridges, {
+        stitchingInfo,
+        gatewaySchema: schema,
+        parentTypeName: returnTypeName,
+      });
     }
 
     const followUp = planMergedTypeFollowUps(
@@ -2674,16 +2915,10 @@ function planRootField(
       [responseKey],
       incompleteReasons,
     );
-    if (followUp) {
-      return withPartialFollowUps({
-        kind: 'Sequence',
-        nodes: [rooted, followUp],
-      });
-    }
-    return withPartialFollowUps(rooted);
+    return sequenceRootFollowUps(rooted, followUp);
   }
 
-  return withPartialFollowUps(rootNode);
+  return sequenceRootFollowUps(rootNode, null);
 }
 
 export function buildStitchPlan(
