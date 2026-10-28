@@ -1049,9 +1049,9 @@ function executePlanNode(
           },
         );
       }
-      // Entity Fetches that share a flattenPath mutate the same parent objects
-      // (e.g. Product.category from A and B). Run those sequentially so nested
-      // merges don't race and drop fields.
+      // Entity Fetches that share a flattenPath mutate the same parent objects.
+      // Serialize only when selected fields overlap (true merge races). Disjoint
+      // hops (inventory {inStock} ∥ reviews {reviews}) run in parallel like Hive.
       const entityFetches = node.nodes.filter(
         (n): n is Extract<StitchPlanNode, { kind: 'Fetch' }> =>
           n.kind === 'Fetch' && Boolean(n.entityTypeName),
@@ -1061,18 +1061,45 @@ function executePlanNode(
         entityFetches.length > 1 &&
         entityFetches.every(
           (n) =>
-            JSON.stringify(n.flattenPath) ===
-            JSON.stringify(entityFetches[0]!.flattenPath),
+            JSON.stringify(n.flattenPath ?? n.flattenPaths) ===
+            JSON.stringify(
+              entityFetches[0]!.flattenPath ?? entityFetches[0]!.flattenPaths,
+            ),
         );
       if (sharedEntityPath) {
-        let chain: ReturnType<typeof executePlanNode> = undefined;
-        for (const child of node.nodes) {
-          chain = handleMaybePromise(
-            () => chain,
-            () => executePlanNode(child, ctx),
-          );
+        const fieldSets = entityFetches.map((f) => {
+          const names = new Set<string>();
+          for (const sel of f.selectionSet.selections) {
+            if (sel.kind === Kind.FIELD && sel.name.value !== '__typename') {
+              names.add(sel.name.value);
+            }
+          }
+          return names;
+        });
+        let overlapping = false;
+        for (let i = 0; i < fieldSets.length && !overlapping; i++) {
+          for (let j = i + 1; j < fieldSets.length; j++) {
+            for (const name of fieldSets[i]!) {
+              if (fieldSets[j]!.has(name)) {
+                overlapping = true;
+                break;
+              }
+            }
+            if (overlapping) {
+              break;
+            }
+          }
         }
-        return chain;
+        if (overlapping) {
+          let chain: ReturnType<typeof executePlanNode> = undefined;
+          for (const child of node.nodes) {
+            chain = handleMaybePromise(
+              () => chain,
+              () => executePlanNode(child, ctx),
+            );
+          }
+          return chain;
+        }
       }
       const jobs = node.nodes.map((child) => executePlanNode(child, ctx));
       return handleMaybePromise(
