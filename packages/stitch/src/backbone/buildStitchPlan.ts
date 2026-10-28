@@ -4053,6 +4053,7 @@ function splitSeqAroundLoc(
  */
 function tryCrossBatchSequences(
   parallelNodes: StitchPlanNode[],
+  stitchingInfo?: StitchingInfo,
 ): StitchPlanNode | null {
   if (parallelNodes.length < 2) {
     return null;
@@ -4061,7 +4062,18 @@ function tryCrossBatchSequences(
   const allLocs = collectBatchLocs(seqs);
   const byKey = new Map<string, BatchLoc[]>();
   for (const loc of allLocs) {
-    const key = entityBatchKey(loc.fetch)!;
+    const key = entityBatchKey(loc.fetch);
+    if (!key) {
+      continue;
+    }
+    // Keep @requires hops on their home branch (Hive: inventory@topProducts
+    // stays in wave 2 beside reviews; do not sink it past the users branch).
+    if (
+      stitchingInfo &&
+      collectRequiresDeps(stitchingInfo, loc.fetch).length > 0
+    ) {
+      continue;
+    }
     let list = byKey.get(key);
     if (!list) {
       list = [];
@@ -4330,7 +4342,7 @@ function optimizeStitchPlanNode(
     );
     const seqNodes =
       pathCoalesced.kind === 'Sequence' ? pathCoalesced.nodes : [pathCoalesced];
-    const withinBatched = tryBatchWithinSequence(seqNodes);
+    const withinBatched = tryBatchWithinSequence(seqNodes, stitchingInfo);
     if (withinBatched) {
       return optimizeStitchPlanNode(
         { kind: 'Sequence', nodes: withinBatched },
@@ -4348,7 +4360,7 @@ function optimizeStitchPlanNode(
   }
 
   if (kind === 'Parallel') {
-    const crossBatched = tryCrossBatchSequences(coalesced);
+    const crossBatched = tryCrossBatchSequences(coalesced, stitchingInfo);
     if (crossBatched) {
       return optimizeStitchPlanNode(crossBatched, stitchingInfo);
     }
@@ -4359,11 +4371,14 @@ function optimizeStitchPlanNode(
 
 /**
  * Within one Sequence, merge identical entity selections at different paths
- * into one multi-path Fetch placed at the latest occurrence (prefixes for all
- * paths have already run by then).
+ * into one multi-path Fetch. Non-requires batches still land at the latest
+ * loc (all prefixes ready). @requires batches refuse to move an early hop
+ * past intervening work — that delayed topProducts inventory behind the
+ * users branch and widened the Hive gap.
  */
 function tryBatchWithinSequence(
   nodes: StitchPlanNode[],
+  stitchingInfo: StitchingInfo,
 ): StitchPlanNode[] | null {
   const locs = collectBatchLocs([nodes]);
   const byKey = new Map<string, BatchLoc[]>();
@@ -4392,6 +4407,27 @@ function tryBatchWithinSequence(
     }
     if (pathsHaveNesting(paths)) {
       continue;
+    }
+    const sortedGroup = [...group].sort(
+      (a, b) =>
+        a.pos - b.pos || (a.parallelIdx ?? 0) - (b.parallelIdx ?? 0),
+    );
+    const earliest = sortedGroup[0]!;
+    const latest = sortedGroup[sortedGroup.length - 1]!;
+    if (collectRequiresDeps(stitchingInfo, earliest.fetch).length > 0) {
+      // Intervening Sequence slots (e.g. the users∥topProducts Parallel)
+      // between early and late inventory — keep waves split like Hive.
+      const removePos = new Set(group.map((l) => l.pos));
+      let intervening = false;
+      for (let p = earliest.pos + 1; p < latest.pos; p++) {
+        if (!removePos.has(p) && nodes[p]) {
+          intervening = true;
+          break;
+        }
+      }
+      if (intervening) {
+        continue;
+      }
     }
     if (!best || group.length > best.length) {
       best = group;
