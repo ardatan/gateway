@@ -11,6 +11,7 @@ import {
   getNamedType,
   isAbstractType,
   isLeafType,
+  isNonNullType,
   isObjectType,
   Kind,
 } from 'graphql';
@@ -101,11 +102,13 @@ function projectValue(
     const t = schema.getType(value.__typename);
     if (isObjectType(t)) {
       objectType = t;
-    } else {
-      // Concrete type absent from the API schema (@inaccessible) — null the
+    } else if (t == null) {
+      // Concrete type removed from the API schema (@inaccessible) — null the
       // abstract field value (e.g. Foo resolving to inaccessible Baz).
       return null;
     }
+    // else: __typename is still an interface (@interfaceObject) — project
+    // via projectInterfaceObjectValue below.
   } else if (typeof value.__typename === 'string') {
     const t = schema.getType(value.__typename);
     if (isObjectType(t)) {
@@ -158,10 +161,15 @@ function projectValue(
         value[responseKey] ?? value.__typename ?? objectType.name;
       continue;
     }
+    const field = objectType.getFields()[nestedFieldNode.name.value];
     if (!(responseKey in value) && !(nestedFieldNode.name.value in value)) {
+      // GraphQL completion: unresolved nullable fields become null (e.g.
+      // Book.author when the id-key hop returned null for that entity).
+      if (field && !isNonNullType(field.type)) {
+        projected[responseKey] = null;
+      }
       continue;
     }
-    const field = objectType.getFields()[nestedFieldNode.name.value];
     const raw =
       responseKey in value ? value[responseKey] : value[nestedFieldNode.name.value];
     projected[responseKey] = projectValue(
