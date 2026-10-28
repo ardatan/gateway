@@ -25,7 +25,6 @@ import {
   valueFromASTUntyped,
 } from 'graphql';
 import { isLocalField } from './localFields.js';
-import { selectionHasAbstractTypes } from './projectResult.js';
 import type {
   BackboneExecutorOptions,
   StitchPlan,
@@ -880,32 +879,9 @@ export function buildStitchPlan(
 
   const rootType = getDefinedRootType(schema, operation.operation);
 
-  // Abstract types / union fragments need Flatten+Cast for cross-subgraph
-  // member hydration. Root pass-through plans are still built (inline
-  // fragments partitioned per owner) for warming, but execute falls back.
-  if (
-    selectionHasAbstractTypes(
-      schema,
-      operation.selectionSet,
-      rootType,
-      fragments,
-    )
-  ) {
-    incompleteReasons.push(
-      'Abstract types in selection require schema execute until Cast/Flatten is complete',
-    );
-  }
-
-  if (Object.keys(fragments).length > 0) {
-    for (const fragment of Object.values(fragments)) {
-      const t = schema.getType(fragment.typeCondition.name.value);
-      if (isAbstractType(t)) {
-        incompleteReasons.push(
-          `Fragment ${fragment.name.value} on abstract type ${fragment.typeCondition.name.value}`,
-        );
-      }
-    }
-  }
+  // Abstract / interface / union selections are planned (inline fragments on
+  // root + entity hops on concrete members). Do not mark incomplete solely for
+  // abstracts — Cast/Flatten gaps must fail at execute so we fix plan quality.
 
   // Apply variable defaults so @skip/@include + collectFields evaluate safely.
   // Plans that depend on directive variables are cached per coerced variable map
