@@ -61,6 +61,11 @@ export interface BackboneExecutorOptions {
    * safety (hooks may replace the plan with live context).
    */
   hasDelegationPlanHooks?: boolean;
+  /**
+   * When true, always run the planned Fetch executor even if the plan is
+   * marked incomplete (used by focused backbone unit tests).
+   */
+  preferPlannedExecute?: boolean;
 }
 
 export interface BackboneExecutionContext {

@@ -97,11 +97,26 @@ export function delayInMs(ms: number, signal?: AbortSignal) {
 export const getExecuteFnFromExecutor = memoize1(
   function getExecuteFnFromExecutor(executor: Executor) {
     return function executeFn(args: ExecutionArgs) {
+      // Preserve undefined vs {} — GraphQL.js applies operation variable
+      // defaults when the variables map is omitted; an empty object that
+      // somehow bypasses defaulting breaks `@skip`/`@include(if: $var)`.
+      // Also unwrap graphql@17 `{ sources, coerced }` wrappers.
+      let variables: Record<string, unknown> | undefined;
+      if (args.variableValues != null) {
+        const raw = args.variableValues as {
+          coerced?: Record<string, unknown>;
+          sources?: unknown;
+        };
+        variables =
+          raw.coerced != null && raw.sources != null
+            ? raw.coerced
+            : (args.variableValues as Record<string, unknown>);
+      }
       return executor({
         document: args.document,
         rootValue: args.rootValue,
         context: args.contextValue,
-        variables: args.variableValues,
+        variables,
         operationName: args.operationName ?? undefined,
         signal: args.signal,
       });

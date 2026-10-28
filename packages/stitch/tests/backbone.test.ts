@@ -119,7 +119,9 @@ describe('stitching backbone', () => {
 
   it('executes a merged query via the backbone executor', async () => {
     const schema = createStitched();
-    const executor = createBackboneExecutor(schema);
+    const executor = createBackboneExecutor(schema, {
+      preferPlannedExecute: true,
+    });
     const result = await executor({
       document: parse(/* GraphQL */ `
         query ($id: ID!) {
@@ -137,7 +139,7 @@ describe('stitching backbone', () => {
       context: {},
     });
     expect(result.errors).toBeUndefined();
-    expect(result.data).toMatchObject({
+    expect(result.data).toEqual({
       userById: {
         id: '1',
         email: '1@example.com',
@@ -181,7 +183,10 @@ describe('stitching backbone', () => {
     });
     expect(localFields.get('Query')?.has('me')).toBe(true);
 
-    const executor = createBackboneExecutor(schema, { localFields });
+    const executor = createBackboneExecutor(schema, {
+      localFields,
+      preferPlannedExecute: true,
+    });
     const result = await executor({
       document: parse(/* GraphQL */ `
         {
@@ -194,7 +199,7 @@ describe('stitching backbone', () => {
       context: {},
     });
     expect(result.errors).toBeUndefined();
-    expect(result.data).toMatchObject({
+    expect(result.data).toEqual({
       me: { id: '42', email: '42@example.com' },
     });
   });

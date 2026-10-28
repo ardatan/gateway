@@ -21,6 +21,7 @@ import {
   SelectionSetNode,
 } from 'graphql';
 import { isLocalField } from './localFields.js';
+import { selectionHasAbstractTypes } from './projectResult.js';
 import type {
   BackboneExecutorOptions,
   StitchPlan,
@@ -31,6 +32,44 @@ function selectionSetOf(
   selections: readonly SelectionNode[],
 ): SelectionSetNode {
   return { kind: Kind.SELECTION_SET, selections: [...selections] };
+}
+
+function operationHasSkipOrInclude(
+  operation: OperationDefinitionNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+): boolean {
+  const visitSelections = (selections: readonly SelectionNode[]): boolean => {
+    for (const selection of selections) {
+      if (
+        selection.directives?.some(
+          (d) => d.name.value === 'skip' || d.name.value === 'include',
+        )
+      ) {
+        return true;
+      }
+      if (
+        selection.kind === Kind.FIELD ||
+        selection.kind === Kind.INLINE_FRAGMENT
+      ) {
+        if (
+          selection.selectionSet &&
+          visitSelections(selection.selectionSet.selections)
+        ) {
+          return true;
+        }
+      } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
+        const fragment = fragments[selection.name.value];
+        if (
+          fragment &&
+          visitSelections(fragment.selectionSet.selections)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  return visitSelections(operation.selectionSet.selections);
 }
 
 function ensureTypename(selectionSet: SelectionSetNode): SelectionSetNode {
@@ -479,6 +518,39 @@ export function buildStitchPlan(
   }
 
   const rootType = getDefinedRootType(schema, operation.operation);
+
+  // Abstract types / union fragments need Flatten+Cast semantics the planned
+  // executor does not fully cover yet — fall back to schema execute.
+  if (
+    selectionHasAbstractTypes(
+      schema,
+      operation.selectionSet,
+      rootType,
+      fragments,
+    )
+  ) {
+    incompleteReasons.push(
+      'Abstract types in selection require schema execute until Cast/Flatten is complete',
+    );
+  }
+
+  if (Object.keys(fragments).length > 0) {
+    for (const fragment of Object.values(fragments)) {
+      const t = schema.getType(fragment.typeCondition.name.value);
+      if (isAbstractType(t)) {
+        incompleteReasons.push(
+          `Fragment ${fragment.name.value} on abstract type ${fragment.typeCondition.name.value}`,
+        );
+      }
+    }
+  }
+
+  // @skip / @include need Condition nodes + proper variable coercion; until
+  // then, schema execute matches GraphQL.js semantics (incl. missing vars).
+  if (operationHasSkipOrInclude(operation, fragments)) {
+    incompleteReasons.push('@skip/@include require schema execute for now');
+  }
+
   const { fields } = collectFields(
     schema,
     fragments,
@@ -512,6 +584,10 @@ export function buildStitchPlan(
         incompleteReasons,
       ),
     );
+  }
+
+  if (!rootNodes.length && incompleteReasons.length === 0) {
+    incompleteReasons.push('Empty operation plan');
   }
 
   const root: StitchPlanNode =
