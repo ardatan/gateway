@@ -3929,221 +3929,169 @@ function packIndependentWaves(
     packIndependentWaves(c, stitchingInfo),
   );
   if (node.kind === 'Parallel') {
-    if (children.length === 1) {
-      return children[0]!;
-    }
-    return hoistParallelSequenceHeads(
-      { kind: 'Parallel', nodes: children },
-      stitchingInfo,
-    );
-  }
-  const packed = packIndependentSequenceFetches(children, stitchingInfo);
-  return compressPeeledWaves(
-    flattenPlanSequences(toSeqOrSingle(packed)),
-    stitchingInfo,
-  );
-}
-
-function collectHeadFetches(
-  node: StitchPlanNode,
-): Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> | null {
-  if (node.kind === 'Fetch') {
-    return [node];
-  }
-  if (node.kind === 'Parallel') {
-    const out: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
-    for (const c of node.nodes) {
-      if (c.kind !== 'Fetch') {
-        return null;
-      }
-      out.push(c);
-    }
-    return out;
-  }
-  return null;
-}
-
-function flattenPlanSequences(node: StitchPlanNode): StitchPlanNode {
-  if (node.kind === 'Island') {
-    return node.continue
-      ? { ...node, continue: flattenPlanSequences(node.continue) }
-      : node;
-  }
-  if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
-    return node;
-  }
-  const children = node.nodes.map(flattenPlanSequences);
-  if (node.kind === 'Parallel') {
     return children.length === 1
       ? children[0]!
       : { kind: 'Parallel', nodes: children };
   }
-  const flat: StitchPlanNode[] = [];
-  for (const c of children) {
-    if (c.kind === 'Sequence') {
-      flat.push(...c.nodes);
-    } else {
-      flat.push(c);
-    }
-  }
-  return toSeqOrSingle(flat);
+  // Keep branch Sequences intact: peeling heads into Sequence barriers
+  // stalls independent work (products@users waited on inventory@TP).
+  const packed = packIndependentSequenceFetches(children, stitchingInfo);
+  return liftTrailingInventoryPastParallelJoin(
+    toSeqOrSingle(packed),
+    stitchingInfo,
+  );
 }
 
 /**
- * Hive-style wave peel: Parallel(Sequence(a,…), Sequence(b,…)) →
- * Sequence(Parallel(a,b), rests) when heads are independent.
+ * Trailing inventory inside Parallel(Sequence…) forces the join to wait on
+ * I_user even though deep accounts/products don't need it. Lift that hop out
+ * and BatchFetch it with the post-join inventory wave when selections match.
+ *
+ *   Parallel(Seq(A,R,P,I_user), Seq(Pt,…)) ; Parallel(acc,prod) ; I_deep
+ * → Parallel(Seq(A,R,P), Seq(Pt,…)) ; Parallel(acc,prod) ; Batch(I_user,I_deep)
  */
-function hoistParallelSequenceHeads(
+function liftTrailingInventoryPastParallelJoin(
   node: StitchPlanNode,
   stitchingInfo: StitchingInfo,
 ): StitchPlanNode {
-  if (node.kind !== 'Parallel' || node.nodes.length < 2) {
-    return node.kind === 'Parallel' && node.nodes.length === 1
-      ? node.nodes[0]!
-      : node;
-  }
-
-  type Peel = { head: StitchPlanNode; rest: StitchPlanNode | null };
-  const peels: Array<Peel | null> = node.nodes.map((child) => {
-    if (child.kind === 'Sequence' && child.nodes.length > 0) {
-      return {
-        head: child.nodes[0]!,
-        rest:
-          child.nodes.length > 1
-            ? toSeqOrSingle(child.nodes.slice(1))
-            : null,
-      };
-    }
-    if (child.kind === 'Fetch' || child.kind === 'Parallel') {
-      return { head: child, rest: null };
-    }
-    return null;
-  });
-  if (peels.some((p) => p == null)) {
+  if (node.kind !== 'Sequence' || node.nodes.length < 2) {
     return node;
   }
-  if (!peels.some((p) => p!.rest != null)) {
+  const [first, ...rest] = node.nodes;
+  if (first?.kind !== 'Parallel' || first.nodes.length < 2) {
     return node;
   }
 
-  const heads = peels.map((p) => p!.head);
-  const headFetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
-  for (const h of heads) {
-    const fetches = collectHeadFetches(h);
-    if (!fetches) {
-      return node;
+  const lifted: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+  const rewrittenBranches: StitchPlanNode[] = [];
+  for (const branch of first.nodes) {
+    if (branch.kind !== 'Sequence' || branch.nodes.length < 2) {
+      rewrittenBranches.push(branch);
+      continue;
     }
-    headFetches.push(...fetches);
-  }
-  for (let i = 0; i < headFetches.length; i++) {
-    for (let j = i + 1; j < headFetches.length; j++) {
-      if (
-        fetchDependsOn(stitchingInfo, headFetches[i]!, headFetches[j]!) ||
-        fetchDependsOn(stitchingInfo, headFetches[j]!, headFetches[i]!)
-      ) {
-        return node;
-      }
-    }
-  }
-
-  const rests = peels
-    .map((p) => p!.rest)
-    .filter((r): r is StitchPlanNode => r != null);
-  const next: StitchPlanNode[] = [{ kind: 'Parallel', nodes: heads }];
-  if (rests.length === 1) {
-    next.push(rests[0]!);
-  } else if (rests.length > 1) {
-    next.push(
-      hoistParallelSequenceHeads(
-        { kind: 'Parallel', nodes: rests },
-        stitchingInfo,
-      ),
-    );
-  }
-  return flattenPlanSequences(toSeqOrSingle(next));
-}
-
-/**
- * After peeling roots/reviews, pack
- *   …, P_user, I_user, Parallel(accounts, products_deep), I_deep
- * into
- *   …, Parallel(P_user, accounts, products_deep), Batch/Parallel(I_user, I_deep)
- * so the critical path matches Hive's ~4 waves.
- */
-function compressPeeledWaves(
-  node: StitchPlanNode,
-  stitchingInfo: StitchingInfo,
-): StitchPlanNode {
-  if (node.kind !== 'Sequence' || node.nodes.length < 4) {
-    return node;
-  }
-  const nodes = [...node.nodes];
-  // Look for: Fetch(PRODUCTS), Fetch(INV), Parallel(...), Fetch(INV)
-  for (let i = 0; i + 3 < nodes.length; i++) {
-    const pUser = nodes[i]!;
-    const iUser = nodes[i + 1]!;
-    const mid = nodes[i + 2]!;
-    const iDeep = nodes[i + 3]!;
+    const last = branch.nodes[branch.nodes.length - 1]!;
+    // Lift trailing leaf entity hops (e.g. inventory {inStock,shippingEstimate})
+    // that sibling branches don't need — they only delay the Parallel join.
     if (
-      pUser.kind !== 'Fetch' ||
-      iUser.kind !== 'Fetch' ||
-      mid.kind !== 'Parallel' ||
-      iDeep.kind !== 'Fetch'
+      last.kind !== 'Fetch' ||
+      !last.entityTypeName ||
+      last.rootField ||
+      !selectionIsLeafOnly(last.selectionSet)
     ) {
+      rewrittenBranches.push(branch);
       continue;
     }
+    const siblings = first.nodes.filter((b) => b !== branch);
     if (
-      !entityTypeKey(pUser) ||
-      !entityTypeKey(iUser) ||
-      !entityTypeKey(iDeep)
-    ) {
-      continue;
-    }
-    if (entityTypeKey(iUser) !== entityTypeKey(iDeep)) {
-      continue;
-    }
-    // I_user must not need anything in mid; I_deep may need mid.
-    const midFetches = collectHeadFetches(mid) ?? [];
-    if (
-      midFetches.some(
-        (m) =>
-          fetchDependsOn(stitchingInfo, iUser, m) ||
-          fetchDependsOn(stitchingInfo, m, iUser),
+      siblings.some((sib) =>
+        sequenceContainsFetchDependingOn(sib, last, stitchingInfo),
       )
     ) {
+      rewrittenBranches.push(branch);
       continue;
     }
-    const blockedP = midFetches.some(
-      (m) =>
-        fetchDependsOn(stitchingInfo, pUser, m) ||
-        fetchDependsOn(stitchingInfo, m, pUser),
+    lifted.push(last);
+    rewrittenBranches.push(toSeqOrSingle(branch.nodes.slice(0, -1)));
+  }
+
+  if (!lifted.length) {
+    return node;
+  }
+
+  const newFirst: StitchPlanNode =
+    rewrittenBranches.length === 1
+      ? rewrittenBranches[0]!
+      : { kind: 'Parallel', nodes: rewrittenBranches };
+
+  // Find a later inventory Fetch with the same selection to BatchFetch into.
+  const nextNodes = [...rest];
+  let merged = false;
+  for (let i = 0; i < nextNodes.length; i++) {
+    const cand = nextNodes[i]!;
+    if (
+      cand.kind === 'Fetch' &&
+      lifted.every(
+        (l) =>
+          entityTypeKey(l) === entityTypeKey(cand) &&
+          selectionSetKey(l.selectionSet) ===
+            selectionSetKey(cand.selectionSet) &&
+          l.subschema === cand.subschema,
+      )
+    ) {
+      nextNodes[i] = mergeMultiPathFetches([...lifted, cand]);
+      merged = true;
+      break;
+    }
+  }
+  if (!merged) {
+    // Place lifted hops just before the first post-join node that any of them
+    // don't depend on — typically Parallel(accounts, products) then inventory.
+    const invNode =
+      lifted.length === 1
+        ? lifted[0]!
+        : mergeMultiPathFetches(lifted);
+    // Prefer appending before a trailing inventory, else at end of the
+    // independent mid-wave (after first Parallel of entity hops).
+    let inserted = false;
+    for (let i = 0; i < nextNodes.length; i++) {
+      const cand = nextNodes[i]!;
+      if (
+        cand.kind === 'Fetch' &&
+        entityTypeKey(cand) &&
+        selectionSetKey(cand.selectionSet) ===
+          selectionSetKey(invNode.selectionSet)
+      ) {
+        nextNodes[i] = mergeMultiPathFetches(
+          cand.kind === 'Fetch' ? [invNode, cand] : [invNode],
+        );
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      nextNodes.push(invNode);
+    }
+  }
+
+  return toSeqOrSingle([newFirst, ...nextNodes]);
+}
+
+function selectionIsLeafOnly(ss: SelectionSetNode): boolean {
+  for (const sel of ss.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      return false;
+    }
+    if (sel.name.value === '__typename') {
+      continue;
+    }
+    if (sel.selectionSet?.selections.length) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sequenceContainsFetchDependingOn(
+  node: StitchPlanNode,
+  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  stitchingInfo: StitchingInfo,
+): boolean {
+  if (node.kind === 'Fetch') {
+    return fetchDependsOn(stitchingInfo, earlier, node);
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    return node.nodes.some((c) =>
+      sequenceContainsFetchDependingOn(c, earlier, stitchingInfo),
     );
-    if (blockedP) {
-      continue;
-    }
-
-    const invWave: StitchPlanNode =
-      selectionSetKey(iUser.selectionSet) ===
-      selectionSetKey(iDeep.selectionSet)
-        ? mergeMultiPathFetches([iUser, iDeep])
-        : { kind: 'Parallel', nodes: [iUser, iDeep] };
-
-    const productWave: StitchPlanNode = {
-      kind: 'Parallel',
-      nodes: [pUser, ...mid.nodes],
-    };
-    const rebuilt = [
-      ...nodes.slice(0, i),
-      productWave,
-      invWave,
-      ...nodes.slice(i + 4),
-    ];
-    return compressPeeledWaves(
-      toSeqOrSingle(rebuilt),
+  }
+  if (node.kind === 'Island' && node.continue) {
+    return sequenceContainsFetchDependingOn(
+      node.continue,
+      earlier,
       stitchingInfo,
     );
   }
-  return node;
+  return false;
 }
 
 function fetchFlattenPaths(
