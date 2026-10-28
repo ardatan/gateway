@@ -1,4 +1,3 @@
-import { getBatchingExecutor } from '@graphql-tools/batch-execute';
 import {
   createDefaultExecutor,
   delegateToSchema,
@@ -16,7 +15,6 @@ import {
   createGraphQLError,
   ExecutionRequest,
   ExecutionResult,
-  Executor,
   getArgumentValues,
   getDefinedRootType,
   getOperationASTFromRequest,
@@ -49,32 +47,12 @@ import type {
   StitchPlanNode,
 } from './types.js';
 
-const BATCH_EXECUTOR_CONTEXT = Object.create(null);
-
 /**
- * Subgraph executor with same-tick request merging via batch-execute.
- * Parallel hops to the same subgraph (e.g. reviews User|_entities +
- * reviews Product|_entities) collapse into one HTTP round-trip — Hive-like
- * multi-alias BatchFetch without building the document by hand.
+ * Subgraph executor as configured on the Subschema. Gateway/fusion already
+ * wraps with getBatchingExecutor when `batch` is enabled — do not re-wrap.
  */
-function getSubschemaExecutor(
-  subschema: Subschema,
-  context?: Record<string, any> | null,
-): Executor {
-  const base = subschema.executor ?? createDefaultExecutor(subschema.schema);
-  return getBatchingExecutor(context ?? BATCH_EXECUTOR_CONTEXT, base);
-}
-
-/** Ensure delegateToSchema enables batch-execute on this hop's executor. */
-function withBatching(subschema: Subschema): Subschema {
-  if (subschema.batch) {
-    return subschema;
-  }
-  return Object.assign(
-    Object.create(Object.getPrototypeOf(subschema)),
-    subschema,
-    { batch: true },
-  ) as Subschema;
+function getSubschemaExecutor(subschema: Subschema) {
+  return subschema.executor ?? createDefaultExecutor(subschema.schema);
 }
 
 /**
@@ -609,10 +587,7 @@ function executeFetchNode(
   node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
   ctx: BackboneExecutionContext,
 ): MaybePromise<void> {
-  const executor = getSubschemaExecutor(
-    node.subschema,
-    ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
-  );
+  const executor = getSubschemaExecutor(node.subschema);
 
   if (node.rootField) {
     let document = node.document;
@@ -969,10 +944,7 @@ function tryExecuteEntitiesBatch(
   // prepareGatewayDocument (wrapConcreteTypes, fieldNodesByField, transforms).
   if (node.document && isLeafOnlySelection(node.selectionSet)) {
     const args = entry.argsFromKeys!(keys) as Record<string, any>;
-    const executor = getSubschemaExecutor(
-      hopSubschema,
-      ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
-    );
+    const executor = getSubschemaExecutor(hopSubschema);
     return handleMaybePromise(
       () =>
         executor({
@@ -996,13 +968,13 @@ function tryExecuteEntitiesBatch(
   return handleMaybePromise(
     () =>
       delegateToSchema({
-        schema: withBatching(hopSubschema),
+        schema: hopSubschema,
         operation: 'query',
         fieldName: '_entities',
         returnType: new GraphQLList(type),
         args: entry.argsFromKeys!(keys),
         selectionSet: node.selectionSet,
-        context: ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
+        context: ctx.contextValue,
         info: info as any,
         skipTypeMerging: true,
       }),
@@ -1420,8 +1392,8 @@ function isLeafOnlySelection(selectionSet: SelectionSetNode): boolean {
 /**
  * Multi-type BatchFetch — Hive model: one prebuilt multi-alias `_entities`
  * document (`_e0`/`_e1`…), one subgraph HTTP round-trip, then per-alias merge.
- * Nested alias selections fall back to parallel Fetches (batch-execute still
- * collapses same-tick `_entities` into one HTTP).
+ * Nested alias selections fall back to parallel Fetches (gateway `batch`
+ * executor still collapses same-tick `_entities` into one HTTP).
  */
 function executeBatchFetchNode(
   node: Extract<StitchPlanNode, { kind: 'BatchFetch' }>,
@@ -1481,10 +1453,7 @@ function executeBatchFetchNode(
       if (!anyKeys) {
         return;
       }
-      const executor = getSubschemaExecutor(
-        node.subschema,
-        ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
-      );
+      const executor = getSubschemaExecutor(node.subschema);
       return handleMaybePromise(
         () =>
           executor({
@@ -1549,8 +1518,8 @@ function executeBatchFetchNode(
     }
   }
 
-  // Nested / abstract aliases: parallel Fetch; getBatchingExecutor merges
-  // same-tick `_entities` into one HTTP like Hive multi-alias.
+  // Nested / abstract aliases: parallel Fetch (gateway batch executor merges
+  // same-tick `_entities` when `batch` is enabled).
   const jobs = node.aliases.map((a) =>
     executeFetchNode(
       {
