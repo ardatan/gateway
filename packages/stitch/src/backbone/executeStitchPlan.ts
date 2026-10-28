@@ -26,7 +26,6 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   FieldNode,
-  getNamedType,
   GraphQLSchema,
   isInterfaceType,
   isNullableType,
@@ -146,7 +145,7 @@ function mergeInto(
     return annotateValue(source, [], subschema);
   }
 
-  const priorTypename = target.__typename as string | undefined;
+  const priorTypename = target['__typename'] as string | undefined;
   for (const key of Object.keys(source)) {
     if (
       key === '__proto__' ||
@@ -168,9 +167,9 @@ function mergeInto(
       target[key] = incoming;
     }
   }
-  target.__typename = resolveMergedTypename(
+  target['__typename'] = resolveMergedTypename(
     priorTypename,
-    source.__typename as string | undefined,
+    source['__typename'] as string | undefined,
     schema,
   );
   stampSubschema(target, subschema);
@@ -491,7 +490,7 @@ function executeFetchNode(
           operationName: ctx.operation.name?.value,
           signal: ctx.signal,
           subgraphName: node.subschema.name,
-        } satisfies ExecutionRequest),
+        } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
       (result: ExecutionResult) => {
         if (result.errors?.length) {
           ctx.errors.push(...result.errors);
@@ -540,18 +539,18 @@ function executeFetchNode(
     if (p == null) {
       return false;
     }
-    if (p.__typename === node.entityTypeName) {
+    if (p['__typename'] === node.entityTypeName) {
       return true;
     }
     // Typeless parents: only valid for @interfaceObject interface hops.
     // Concrete Cast (Cat vs Dog) must not claim every typeless list item.
-    if (p.__typename == null) {
+    if (p['__typename'] == null) {
       return isInterfaceType(entityType);
     }
     if (!isInterfaceType(entityType)) {
       return false;
     }
-    const runtime = ctx.schema.getType(p.__typename);
+    const runtime = ctx.schema.getType(p['__typename']);
     return (
       isObjectType(runtime) &&
       runtime.getInterfaces().some((i) => i.name === node.entityTypeName)
