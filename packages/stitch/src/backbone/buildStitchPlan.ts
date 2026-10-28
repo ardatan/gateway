@@ -224,14 +224,18 @@ function fieldFetchableOnSubschema(
 }
 
 /**
- * Top-level field names covered by `@provides` on a parent field for a
- * given subschema (e.g. Query.products → categories on CATEGORY).
+ * Field names covered by `@provides` on a parent field for a given subschema.
+ *
+ * - `forTypeName` omitted: only unconditional fields (e.g. `categories { id }`).
+ * - `forTypeName` set: also fields under `... on forTypeName` (e.g. media
+ *   provides `... on Book { title }` → title when partitioning Book).
  */
 function getProvidedFieldNames(
   stitchingInfo: StitchingInfo,
   parentTypeName: string,
   parentFieldName: string,
   subschema: Subschema,
+  forTypeName?: string,
 ): Set<string> {
   const provided =
     stitchingInfo.mergedTypes[parentTypeName]?.providedSelectionsByField?.get(
@@ -241,11 +245,28 @@ function getProvidedFieldNames(
     return new Set();
   }
   const names = new Set<string>();
-  for (const sel of provided.selections) {
-    if (sel.kind === Kind.FIELD) {
-      names.add(sel.name.value);
+  const visit = (
+    selections: readonly SelectionNode[],
+    activeType: string | null,
+  ) => {
+    for (const sel of selections) {
+      if (sel.kind === Kind.FIELD) {
+        if (
+          forTypeName == null
+            ? activeType == null
+            : activeType == null || activeType === forTypeName
+        ) {
+          names.add(sel.name.value);
+        }
+      } else if (sel.kind === Kind.INLINE_FRAGMENT) {
+        visit(
+          sel.selectionSet.selections,
+          sel.typeCondition?.name.value ?? activeType,
+        );
+      }
     }
-  }
+  };
+  visit(provided.selections, null);
   return names;
 }
 
@@ -253,6 +274,12 @@ function getProvidedFieldNames(
  * Split a selection set into fields available on `subschema` vs the rest.
  * Used when building a root/entity Fetch for one subgraph.
  */
+/** Origin of @provides on a parent field — used to expand type-conditioned provides. */
+type ProvidesOrigin = {
+  parentTypeName: string;
+  parentFieldName: string;
+};
+
 function partitionSelectionsForSubschema(
   subschema: Subschema,
   typeName: string,
@@ -262,9 +289,27 @@ function partitionSelectionsForSubschema(
   stitchingInfo?: StitchingInfo,
   /** Gateway schema — needed to resolve nested return types for @provides fields absent from the subgraph SDL. */
   gatewaySchema?: GraphQLSchema,
+  providesOrigin?: ProvidesOrigin,
 ): { available: SelectionNode[]; unavailable: SelectionNode[] } {
   const available: SelectionNode[] = [];
   const unavailable: SelectionNode[] = [];
+  // Merge type-conditioned provides (e.g. `... on Book { title }`) for this typeName.
+  let effectiveProvided = providedFieldNames;
+  if (stitchingInfo && providesOrigin) {
+    const typed = getProvidedFieldNames(
+      stitchingInfo,
+      providesOrigin.parentTypeName,
+      providesOrigin.parentFieldName,
+      subschema,
+      typeName,
+    );
+    if (typed.size) {
+      effectiveProvided = new Set([
+        ...(providedFieldNames ?? []),
+        ...typed,
+      ]);
+    }
+  }
   const fetchable = (fieldName: string) => {
     const ok = stitchingInfo
       ? fieldFetchableOnSubschema(
@@ -272,13 +317,13 @@ function partitionSelectionsForSubschema(
           subschema,
           typeName,
           fieldName,
-          providedFieldNames,
+          effectiveProvided,
         )
       : fieldAvailableOnSubschema(
           subschema,
           typeName,
           fieldName,
-          providedFieldNames,
+          effectiveProvided,
         );
     return ok;
   };
@@ -321,6 +366,12 @@ function partitionSelectionsForSubschema(
         const nestedTypeName = nestedReturn?.name ?? typeName;
         // @provides on this field (e.g. products.categories → name) apply to
         // the nested type's partition, not the parent type's.
+        const nestedOrigin: ProvidesOrigin | undefined = stitchingInfo
+          ? {
+              parentTypeName: typeName,
+              parentFieldName: selection.name.value,
+            }
+          : undefined;
         const nestedProvided =
           stitchingInfo != null
             ? getProvidedFieldNames(
@@ -338,6 +389,7 @@ function partitionSelectionsForSubschema(
           nestedProvided?.size ? nestedProvided : undefined,
           stitchingInfo,
           gatewaySchema,
+          nestedOrigin,
         );
         if (nested.available.length) {
           available.push({
@@ -406,10 +458,11 @@ function partitionSelectionsForSubschema(
             typeCondition,
             selection.selectionSet,
             fragments,
-            // provides apply at the parent field boundary, not nested types
-            undefined,
+            // Keep parent provides origin so `... on Book { title }` applies.
+            providedFieldNames,
             stitchingInfo,
             gatewaySchema,
+            providesOrigin,
           );
           if (nested.available.length) {
             available.push({
@@ -438,9 +491,10 @@ function partitionSelectionsForSubschema(
           typeCondition,
           fragment.selectionSet,
           fragments,
-          undefined,
+          providedFieldNames,
           stitchingInfo,
           gatewaySchema,
+          providesOrigin,
         );
         if (nested.available.length) {
           available.push({
@@ -1140,6 +1194,10 @@ function planRootField(
             nestedProvided.size ? nestedProvided : provided,
             stitchingInfo,
             schema,
+            {
+              parentTypeName: returnTypeName,
+              parentFieldName: sel.name.value,
+            },
           );
           if (nested.available.length) {
             available.push({
@@ -1166,6 +1224,10 @@ function planRootField(
           }
         } else if (sel.kind === Kind.INLINE_FRAGMENT) {
           const cond = sel.typeCondition?.name.value ?? returnTypeName;
+          const mediaProvidesOrigin: ProvidesOrigin = {
+            parentTypeName: rootType.name,
+            parentFieldName: fieldName,
+          };
           if (owner.transformedSchema.getType(cond) != null) {
             const nested = partitionSelectionsForSubschema(
               owner,
@@ -1175,6 +1237,7 @@ function planRootField(
               provided,
               stitchingInfo,
               schema,
+              mediaProvidesOrigin,
             );
             if (nested.available.length) {
               available.push({
@@ -1200,6 +1263,7 @@ function planRootField(
               provided,
               stitchingInfo,
               schema,
+              mediaProvidesOrigin,
             );
             for (const a of nested.available) {
               available.push(a);
@@ -1232,15 +1296,20 @@ function planRootField(
             continue;
           }
           const cond = fragment.typeCondition.name.value;
+          const spreadProvidesOrigin: ProvidesOrigin = {
+            parentTypeName: rootType.name,
+            parentFieldName: fieldName,
+          };
           if (owner.transformedSchema.getType(cond) != null) {
             const nested = partitionSelectionsForSubschema(
               owner,
               cond,
               fragment.selectionSet,
               fragments,
-              undefined,
+              provided,
               stitchingInfo,
               schema,
+              spreadProvidesOrigin,
             );
             if (nested.available.length) {
               available.push({
@@ -1270,9 +1339,10 @@ function planRootField(
               returnTypeName,
               fragment.selectionSet,
               fragments,
-              undefined,
+              provided,
               stitchingInfo,
               schema,
+              spreadProvidesOrigin,
             );
             for (const a of nested.available) {
               available.push(a);
@@ -1336,6 +1406,7 @@ function planRootField(
       provided,
       stitchingInfo,
       schema,
+      { parentTypeName: rootType.name, parentFieldName: fieldName },
     );
     return {
       owner,
@@ -1404,15 +1475,44 @@ function planRootField(
       ? rootFetches[0]!
       : { kind: 'Parallel', nodes: rootFetches };
 
-  // Fields already fetched on any root contribution (including those nested
-  // under inline fragments on abstract return types).
+  // Fields already fetched on any root contribution.
+  // Unconditional fields (shared) vs type-conditioned (`... on Book { title }`)
+  // stay separate — Book.title must not suppress Movie.title hops.
   const coveredNames = new Set<string>();
-  const collectCovered = (sels: readonly SelectionNode[]) => {
+  const coveredByType = new Map<string, Set<string>>();
+  const markCovered = (fieldName: string, typeCond?: string | null) => {
+    if (typeCond) {
+      let set = coveredByType.get(typeCond);
+      if (!set) {
+        set = new Set();
+        coveredByType.set(typeCond, set);
+      }
+      set.add(fieldName);
+    } else {
+      coveredNames.add(fieldName);
+    }
+  };
+  const isFieldCovered = (fieldName: string, typeName?: string) => {
+    if (coveredNames.has(fieldName)) {
+      return true;
+    }
+    if (typeName && coveredByType.get(typeName)?.has(fieldName)) {
+      return true;
+    }
+    return false;
+  };
+  const collectCovered = (
+    sels: readonly SelectionNode[],
+    typeCond?: string | null,
+  ) => {
     for (const sel of sels) {
       if (sel.kind === Kind.FIELD) {
-        coveredNames.add(sel.name.value);
+        markCovered(sel.name.value, typeCond);
       } else if (sel.kind === Kind.INLINE_FRAGMENT) {
-        collectCovered(sel.selectionSet.selections);
+        collectCovered(
+          sel.selectionSet.selections,
+          sel.typeCondition?.name.value ?? typeCond,
+        );
       }
     }
   };
@@ -1626,7 +1726,7 @@ function planRootField(
         if (sel.kind === Kind.FIELD) {
           if (
             sel.name.value !== '__typename' &&
-            !coveredNames.has(sel.name.value)
+            !isFieldCovered(sel.name.value, returnType.name)
           ) {
             interfaceFields.push(sel);
           }
@@ -1644,7 +1744,7 @@ function planRootField(
           ).filter(
             (fn) =>
               fn.name.value !== '__typename' &&
-              !coveredNames.has(fn.name.value),
+              !isFieldCovered(fn.name.value, cond),
           );
           if (!nested.length) {
             // Still keep a typename probe so Cast can resolve Admin vs Regular
@@ -1685,7 +1785,7 @@ function planRootField(
           ).filter(
             (fn) =>
               fn.name.value !== '__typename' &&
-              !coveredNames.has(fn.name.value),
+              !isFieldCovered(fn.name.value, cond),
           );
           if (!nested.length) {
             if (cond !== returnType.name) {
@@ -1724,12 +1824,12 @@ function planRootField(
         );
         const bridge = withDeps.filter(
           (fn) =>
-            !coveredNames.has(fn.name.value) &&
+            !isFieldCovered(fn.name.value, returnType.name) &&
             !interfaceFields.some((m) => m.name.value === fn.name.value) &&
             fieldAvailableOnSubschema(primary, returnType.name, fn.name.value),
         );
         for (const b of bridge) {
-          coveredNames.add(b.name.value);
+          markCovered(b.name.value, returnType.name);
           bridgeFragments.push(b);
         }
       }
@@ -1836,7 +1936,8 @@ function planRootField(
       );
       const missing = forConcrete.filter(
         (fn) =>
-          fn.name.value !== '__typename' && !coveredNames.has(fn.name.value),
+          fn.name.value !== '__typename' &&
+          !isFieldCovered(fn.name.value, concrete.name),
       );
       if (!missing.length) {
         continue;
@@ -1849,7 +1950,7 @@ function planRootField(
       const bridge = withDeps.filter(
         (fn) =>
           fn.name.value !== '__typename' &&
-          !coveredNames.has(fn.name.value) &&
+          !isFieldCovered(fn.name.value, concrete.name) &&
           !missing.some((m) => m.name.value === fn.name.value) &&
           fieldAvailableOnSubschema(primary, concrete.name, fn.name.value),
       );
@@ -1902,7 +2003,7 @@ function planRootField(
   }
 
   const followUpFieldNodes = requested.filter(
-    (fn) => !coveredNames.has(fn.name.value),
+    (fn) => !isFieldCovered(fn.name.value, returnTypeName),
   );
 
   if (
@@ -1910,6 +2011,26 @@ function planRootField(
     stitchingInfo.mergedTypes[returnTypeName] &&
     followUpFieldNodes.length
   ) {
+    // Inject @requires / merge-key bridges onto the root Fetch even when the
+    // parent field name is already covered (e.g. client asked for
+    // `data { __typename }` but requirer needs `data { foo ... on Bar { … } }`).
+    // Duplicate field names are fine — execute/collectFields merges them.
+    let rooted = rootNode;
+    const withDeps = expandFieldDependencies(
+      stitchingInfo,
+      returnTypeName,
+      followUpFieldNodes,
+    );
+    const bridges = withDeps.filter(
+      (fn) =>
+        fn.name.value !== '__typename' &&
+        !followUpFieldNodes.some((m) => m.name.value === fn.name.value) &&
+        fieldAvailableOnSubschema(primary, returnTypeName, fn.name.value),
+    );
+    if (bridges.length) {
+      rooted = injectSelectionsIntoRootFetches(rooted, bridges);
+    }
+
     const followUp = planMergedTypeFollowUps(
       schema,
       stitchingInfo,
@@ -1924,9 +2045,10 @@ function planRootField(
     if (followUp) {
       return withPartialFollowUps({
         kind: 'Sequence',
-        nodes: [rootNode, followUp],
+        nodes: [rooted, followUp],
       });
     }
+    return withPartialFollowUps(rooted);
   }
 
   return withPartialFollowUps(rootNode);
