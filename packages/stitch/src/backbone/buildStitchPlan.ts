@@ -32,6 +32,7 @@ import {
 import { isLocalField } from './localFields.js';
 import type {
   BackboneExecutorOptions,
+  PathSegment,
   StitchPlan,
   StitchPlanNode,
 } from './types.js';
@@ -3030,13 +3031,16 @@ export function buildStitchPlan(
   );
 }
 
-/** Stable identity for coalescing sibling/adjacent Fetches. */
+/** Stable identity for coalescing sibling/adjacent Fetches (includes path). */
 function coalesceFetchKey(
   node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
 ): string | null {
   const sub = node.subschema.name ?? '';
-  if (node.entityTypeName && node.flattenPath) {
-    return `e:${sub}:${node.entityTypeName}:${node.flattenPath.join('\0')}`;
+  const paths =
+    node.flattenPaths ??
+    (node.flattenPath != null ? [node.flattenPath] : null);
+  if (node.entityTypeName && paths?.length) {
+    return `e:${sub}:${node.entityTypeName}:${paths.map((p) => p.join('\0')).join('/')}`;
   }
   if (node.rootField) {
     const rk = node.rootField.alias?.value ?? node.rootField.name.value;
@@ -3059,6 +3063,267 @@ function selectionIdentity(sel: SelectionNode): string {
     return `s:${sel.name.value}`;
   }
   return '?';
+}
+
+function selectionSetKey(ss: SelectionSetNode): string {
+  return ss.selections.map(selectionIdentity).join(',');
+}
+
+/** Batch key ignores flatten path — same entity selection across paths. */
+function entityBatchKey(
+  node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): string | null {
+  if (node.rootField || !node.entityTypeName) {
+    return null;
+  }
+  const paths =
+    node.flattenPaths ??
+    (node.flattenPath != null ? [node.flattenPath] : null);
+  if (!paths?.length) {
+    return null;
+  }
+  return `${node.subschema.name ?? ''}|${node.entityTypeName}|${selectionSetKey(node.selectionSet)}`;
+}
+
+function fetchFlattenPaths(
+  node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): PathSegment[][] {
+  if (node.flattenPaths?.length) {
+    return node.flattenPaths.map((p) => [...p]);
+  }
+  if (node.flattenPath) {
+    return [[...node.flattenPath]];
+  }
+  return [];
+}
+
+function pathIsPrefix(
+  shorter: PathSegment[],
+  longer: PathSegment[],
+): boolean {
+  if (shorter.length >= longer.length) {
+    return false;
+  }
+  return shorter.every((seg, i) => seg === longer[i]);
+}
+
+function flattenSequenceNodes(node: StitchPlanNode): StitchPlanNode[] {
+  if (node.kind === 'Sequence') {
+    return node.nodes.flatMap(flattenSequenceNodes);
+  }
+  return [node];
+}
+
+function toSeqOrSingle(nodes: StitchPlanNode[]): StitchPlanNode {
+  if (nodes.length === 1) {
+    return nodes[0]!;
+  }
+  return { kind: 'Sequence', nodes };
+}
+
+function toParOrSingle(nodes: StitchPlanNode[]): StitchPlanNode {
+  if (nodes.length === 1) {
+    return nodes[0]!;
+  }
+  return { kind: 'Parallel', nodes };
+}
+
+type BatchLoc = {
+  seqIdx: number;
+  /** Index in the flattened sequence (Parallel wrapper or Fetch). */
+  pos: number;
+  /** When set, Fetch lives inside seq[pos] Parallel at this index. */
+  parallelIdx?: number;
+  fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>;
+};
+
+function collectBatchLocs(seqs: StitchPlanNode[][]): BatchLoc[] {
+  const locs: BatchLoc[] = [];
+  for (let si = 0; si < seqs.length; si++) {
+    const seq = seqs[si]!;
+    for (let pos = 0; pos < seq.length; pos++) {
+      const n = seq[pos]!;
+      if (n.kind === 'Fetch') {
+        if (entityBatchKey(n)) {
+          locs.push({ seqIdx: si, pos, fetch: n });
+        }
+      } else if (n.kind === 'Parallel') {
+        for (let pi = 0; pi < n.nodes.length; pi++) {
+          const c = n.nodes[pi]!;
+          if (c.kind === 'Fetch' && entityBatchKey(c)) {
+            locs.push({
+              seqIdx: si,
+              pos,
+              parallelIdx: pi,
+              fetch: c,
+            });
+          }
+        }
+      }
+    }
+  }
+  return locs;
+}
+
+/** Remove a batched Fetch from its sequence, returning { prefix, suffix }. */
+function splitSeqAroundLoc(
+  seq: StitchPlanNode[],
+  loc: BatchLoc,
+): { prefix: StitchPlanNode[]; suffix: StitchPlanNode[] } {
+  const pos = loc.pos;
+  if (loc.parallelIdx == null) {
+    return {
+      prefix: seq.slice(0, pos),
+      suffix: seq.slice(pos + 1),
+    };
+  }
+  const par = seq[pos]!;
+  if (par.kind !== 'Parallel') {
+    return { prefix: seq.slice(0, pos), suffix: seq.slice(pos + 1) };
+  }
+  const remaining = par.nodes.filter((_, i) => i !== loc.parallelIdx);
+  const prefix = seq.slice(0, pos);
+  const suffix = seq.slice(pos + 1);
+  if (remaining.length === 1) {
+    return {
+      prefix: [...prefix, remaining[0]!],
+      suffix,
+    };
+  }
+  if (remaining.length > 1) {
+    return {
+      prefix: [...prefix, { kind: 'Parallel', nodes: remaining }],
+      suffix,
+    };
+  }
+  return { prefix, suffix };
+}
+
+/**
+ * Hive-QP BatchFetch: across Parallel branches that are Sequences, hoist
+ * identical entity selections at different flatten paths into one multi-path
+ * Fetch between the prefixes and suffixes of those sequences.
+ */
+function tryCrossBatchSequences(
+  parallelNodes: StitchPlanNode[],
+): StitchPlanNode | null {
+  if (parallelNodes.length < 2) {
+    return null;
+  }
+  const seqs = parallelNodes.map((n) => flattenSequenceNodes(n));
+  const allLocs = collectBatchLocs(seqs);
+  const byKey = new Map<string, BatchLoc[]>();
+  for (const loc of allLocs) {
+    const key = entityBatchKey(loc.fetch)!;
+    let list = byKey.get(key);
+    if (!list) {
+      list = [];
+      byKey.set(key, list);
+    }
+    list.push(loc);
+  }
+
+  let best: BatchLoc[] | null = null;
+  for (const locs of byKey.values()) {
+    // Prefer the latest loc per sequence so path prefixes (e.g. PRODUCTS
+    // price/weight before shippingEstimate @requires) stay in the prefix.
+    const latestBySeq = new Map<number, BatchLoc>();
+    for (const loc of locs) {
+      const prev = latestBySeq.get(loc.seqIdx);
+      if (
+        !prev ||
+        loc.pos > prev.pos ||
+        (loc.pos === prev.pos &&
+          (loc.parallelIdx ?? 0) > (prev.parallelIdx ?? 0))
+      ) {
+        latestBySeq.set(loc.seqIdx, loc);
+      }
+    }
+    const uniq = [...latestBySeq.values()];
+    if (uniq.length < 2) {
+      continue;
+    }
+    const paths = uniq.flatMap((l) => fetchFlattenPaths(l.fetch));
+    let nested = false;
+    for (let i = 0; i < paths.length && !nested; i++) {
+      for (let j = 0; j < paths.length; j++) {
+        if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+          nested = true;
+          break;
+        }
+      }
+    }
+    if (nested) {
+      continue;
+    }
+    if (!best || uniq.length > best.length) {
+      best = uniq;
+    }
+  }
+  if (!best) {
+    return null;
+  }
+
+  const batchPaths = best.flatMap((l) => fetchFlattenPaths(l.fetch));
+  const template = best[0]!.fetch;
+  const batchFetch: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
+    kind: 'Fetch',
+    subschema: template.subschema,
+    entityTypeName: template.entityTypeName,
+    selectionSet: template.selectionSet,
+    flattenPath: batchPaths[0],
+    flattenPaths: batchPaths,
+  };
+
+  const locBySeq = new Map(best.map((l) => [l.seqIdx, l]));
+  const prefixes: StitchPlanNode[] = [];
+  const suffixes: StitchPlanNode[] = [];
+  const untouched: StitchPlanNode[] = [];
+
+  for (let si = 0; si < seqs.length; si++) {
+    const loc = locBySeq.get(si);
+    const seq = seqs[si]!;
+    if (!loc) {
+      untouched.push(toSeqOrSingle(seq));
+      continue;
+    }
+    const { prefix, suffix } = splitSeqAroundLoc(seq, loc);
+    if (prefix.length) {
+      prefixes.push(toSeqOrSingle(prefix));
+    }
+    if (suffix.length) {
+      suffixes.push(toSeqOrSingle(suffix));
+    }
+  }
+
+  const batchChain: StitchPlanNode[] = [];
+  if (prefixes.length) {
+    batchChain.push(toParOrSingle(prefixes));
+  }
+  batchChain.push(batchFetch);
+  if (suffixes.length) {
+    batchChain.push(toParOrSingle(suffixes));
+  }
+  const batched = toSeqOrSingle(batchChain);
+  if (!untouched.length) {
+    return batched;
+  }
+  return { kind: 'Parallel', nodes: [...untouched, batched] };
+}
+
+function mergeMultiPathFetches(
+  fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
+): Extract<StitchPlanNode, { kind: 'Fetch' }> {
+  const paths = fetches.flatMap(fetchFlattenPaths);
+  const template = fetches[0]!;
+  return {
+    kind: 'Fetch',
+    subschema: template.subschema,
+    entityTypeName: template.entityTypeName,
+    selectionSet: template.selectionSet,
+    flattenPath: paths[0],
+    flattenPaths: paths,
+  };
 }
 
 /**
@@ -3105,27 +3370,64 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
     }
   }
 
-  // Drop exact-duplicate Fetches only. Merging different field sets at the same
-  // path breaks @requires-with-argument-conflict (separate hops need distinct
-  // representation keys for USD vs EUR price).
-  const selKey = (ss: SelectionSetNode) =>
-    ss.selections.map(selectionIdentity).join(',');
+  // Parallel: batch same entity+selection across different flatten paths into
+  // one multi-path Fetch (Hive BatchFetch). Different selections at the same
+  // path stay separate (@requires-with-argument-conflict).
   const coalesced: StitchPlanNode[] = [];
   if (kind === 'Parallel') {
-    const seen = new Set<string>();
+    const batchGroups = new Map<
+      string,
+      Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
+    >();
+    const rest: StitchPlanNode[] = [];
+    const seenExact = new Set<string>();
     for (const child of flat) {
-      if (child.kind === 'Fetch') {
-        const key = coalesceFetchKey(child);
-        if (key) {
-          const full = `${key}::${selKey(child.selectionSet)}`;
-          if (seen.has(full)) {
-            continue;
+      if (child.kind !== 'Fetch') {
+        rest.push(child);
+        continue;
+      }
+      const exact = coalesceFetchKey(child);
+      if (exact) {
+        const exactFull = `${exact}::${selectionSetKey(child.selectionSet)}`;
+        if (seenExact.has(exactFull)) {
+          continue;
+        }
+        seenExact.add(exactFull);
+      }
+      const bKey = entityBatchKey(child);
+      if (bKey) {
+        let list = batchGroups.get(bKey);
+        if (!list) {
+          list = [];
+          batchGroups.set(bKey, list);
+        }
+        list.push(child);
+      } else {
+        rest.push(child);
+      }
+    }
+    for (const group of batchGroups.values()) {
+      if (group.length === 1) {
+        coalesced.push(group[0]!);
+      } else {
+        const paths = group.flatMap(fetchFlattenPaths);
+        let nested = false;
+        for (let i = 0; i < paths.length && !nested; i++) {
+          for (let j = 0; j < paths.length; j++) {
+            if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+              nested = true;
+              break;
+            }
           }
-          seen.add(full);
+        }
+        if (nested) {
+          coalesced.push(...group);
+        } else {
+          coalesced.push(mergeMultiPathFetches(group));
         }
       }
-      coalesced.push(child);
     }
+    coalesced.push(...rest);
   } else {
     for (const child of flat) {
       const prev = coalesced[coalesced.length - 1];
@@ -3136,19 +3438,144 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
           a &&
           b &&
           a === b &&
-          selKey(prev.selectionSet) === selKey(child.selectionSet)
+          selectionSetKey(prev.selectionSet) ===
+            selectionSetKey(child.selectionSet)
         ) {
           continue;
         }
       }
       coalesced.push(child);
     }
+    const withinBatched = tryBatchWithinSequence(coalesced);
+    if (withinBatched) {
+      return optimizeStitchPlanNode({ kind: 'Sequence', nodes: withinBatched });
+    }
   }
 
   if (coalesced.length === 1) {
     return coalesced[0]!;
   }
+
+  if (kind === 'Parallel') {
+    const crossBatched = tryCrossBatchSequences(coalesced);
+    if (crossBatched) {
+      return optimizeStitchPlanNode(crossBatched);
+    }
+  }
+
   return { kind, nodes: coalesced };
+}
+
+/**
+ * Within one Sequence, merge identical entity selections at different paths
+ * into one multi-path Fetch placed at the latest occurrence (prefixes for all
+ * paths have already run by then).
+ */
+function tryBatchWithinSequence(
+  nodes: StitchPlanNode[],
+): StitchPlanNode[] | null {
+  const locs = collectBatchLocs([nodes]);
+  const byKey = new Map<string, BatchLoc[]>();
+  for (const loc of locs) {
+    const key = entityBatchKey(loc.fetch)!;
+    let list = byKey.get(key);
+    if (!list) {
+      list = [];
+      byKey.set(key, list);
+    }
+    list.push(loc);
+  }
+
+  let best: BatchLoc[] | null = null;
+  for (const group of byKey.values()) {
+    if (group.length < 2) {
+      continue;
+    }
+    const paths = group.flatMap((l) => fetchFlattenPaths(l.fetch));
+    const pathKeys = new Set(paths.map((p) => p.join('\0')));
+    if (pathKeys.size < 2) {
+      continue;
+    }
+    let nested = false;
+    for (let i = 0; i < paths.length && !nested; i++) {
+      for (let j = 0; j < paths.length; j++) {
+        if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+          nested = true;
+          break;
+        }
+      }
+    }
+    if (nested) {
+      continue;
+    }
+    if (!best || group.length > best.length) {
+      best = group;
+    }
+  }
+  if (!best) {
+    return null;
+  }
+
+  // Place batch at the latest loc; remove all group members from the sequence.
+  const sorted = [...best].sort(
+    (a, b) =>
+      a.pos - b.pos || (a.parallelIdx ?? 0) - (b.parallelIdx ?? 0),
+  );
+  const latest = sorted[sorted.length - 1]!;
+  const batchPaths = best.flatMap((l) => fetchFlattenPaths(l.fetch));
+  const template = latest.fetch;
+  const batchFetch: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
+    kind: 'Fetch',
+    subschema: template.subschema,
+    entityTypeName: template.entityTypeName,
+    selectionSet: template.selectionSet,
+    flattenPath: batchPaths[0],
+    flattenPaths: batchPaths,
+  };
+
+  // Rebuild sequence: walk positions, skip removed fetches, insert batch at latest.
+  const removeSet = new Set(best);
+  const out: StitchPlanNode[] = [];
+  for (let pos = 0; pos < nodes.length; pos++) {
+    const n = nodes[pos]!;
+    const locsAtPos = best.filter((l) => l.pos === pos);
+    if (!locsAtPos.length) {
+      out.push(n);
+      continue;
+    }
+    if (n.kind === 'Fetch') {
+      // Entire node is a batched fetch — skip; insert batch when we hit latest.
+      if (pos === latest.pos && latest.parallelIdx == null) {
+        out.push(batchFetch);
+      }
+      continue;
+    }
+    if (n.kind === 'Parallel') {
+      const removeIdx = new Set(
+        locsAtPos
+          .filter((l) => l.parallelIdx != null)
+          .map((l) => l.parallelIdx!),
+      );
+      const remaining = n.nodes.filter((_, i) => !removeIdx.has(i));
+      if (pos === latest.pos) {
+        // Insert batch after remaining siblings at this parallel slot.
+        if (remaining.length === 1) {
+          out.push(remaining[0]!);
+        } else if (remaining.length > 1) {
+          out.push({ kind: 'Parallel', nodes: remaining });
+        }
+        out.push(batchFetch);
+      } else if (remaining.length === 1) {
+        out.push(remaining[0]!);
+      } else if (remaining.length > 1) {
+        out.push({ kind: 'Parallel', nodes: remaining });
+      }
+      continue;
+    }
+    out.push(n);
+  }
+  void removeSet;
+  return out;
 }
 
 function buildCompletePlan(
