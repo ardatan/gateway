@@ -52,6 +52,63 @@ function getSubschemaExecutor(subschema: Subschema): Executor {
   return createDefaultExecutor(subschema.schema);
 }
 
+/**
+ * Computed-field isolation installs TransformCompositeFields that strip
+ * sibling fields (inStock vs shippingEstimate) onto separate Subschema clones.
+ * When a backbone Fetch unions fields from both clones, drop the strip
+ * transforms so the shared executor receives the full selection while keeping
+ * merge.fields for @requires. Leave transforms intact for single-clone hops
+ * (requires-circular / requires-with-argument must stay isolated).
+ */
+function subschemaForBackboneEntityHop(
+  subschema: Subschema,
+  entityTypeName: string,
+  selectionSet: SelectionSetNode,
+): Subschema {
+  const transforms = subschema.transforms;
+  if (!transforms?.length) {
+    return subschema;
+  }
+  const mergeFields = subschema.merge?.[entityTypeName]?.fields;
+  if (!mergeFields) {
+    return subschema;
+  }
+  // Only rewrite when the selection asks for a non-merge, non-typename field
+  // that isolation would strip (e.g. inStock alongside shippingEstimate).
+  let needsUnstripped = false;
+  for (const sel of selectionSet.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      continue;
+    }
+    const name = sel.name.value;
+    if (name === '__typename') {
+      continue;
+    }
+    if (mergeFields[name]) {
+      continue;
+    }
+    needsUnstripped = true;
+    break;
+  }
+  if (!needsUnstripped) {
+    return subschema;
+  }
+  const kept = transforms.filter(
+    (t) => (t as any)?.constructor?.name !== 'TransformCompositeFields',
+  );
+  if (kept.length === transforms.length) {
+    return subschema;
+  }
+  return Object.assign(
+    Object.create(Object.getPrototypeOf(subschema)),
+    subschema,
+    {
+      transforms: kept,
+      _transformedSchema: undefined,
+    },
+  ) as Subschema;
+}
+
 /** Stamp subschema symbols without Object.defineProperties. */
 function stampSubschema(
   object: Record<string, any>,
@@ -676,6 +733,11 @@ function executeFetchNode(
     },
   };
 
+  const hopSubschema = subschemaForBackboneEntityHop(
+    node.subschema,
+    node.entityTypeName,
+    node.selectionSet,
+  );
   const jobs: MaybePromise<any>[] = parents.map((parent) =>
     handleMaybePromise(
       () =>
@@ -683,7 +745,7 @@ function executeFetchNode(
           parent,
           ctx.contextValue,
           info,
-          node.subschema,
+          hopSubschema,
           node.selectionSet,
           undefined,
           type as any,

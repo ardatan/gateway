@@ -3077,6 +3077,861 @@ function entityBatchKey(
   return `${node.subschema.name ?? ''}|${node.entityTypeName}|${selectionSetKey(node.selectionSet)}`;
 }
 
+/** Same subgraph entity (selection/path ignored) — candidate for field union. */
+function entityTypeKey(
+  node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): string | null {
+  if (node.rootField || !node.entityTypeName) {
+    return null;
+  }
+  if (!fetchFlattenPaths(node).length) {
+    return null;
+  }
+  return `${node.subschema.name ?? ''}|${node.entityTypeName}`;
+}
+
+function fieldResponseKey(field: FieldNode): string {
+  return field.alias?.value ?? field.name.value;
+}
+
+function fieldArgsKey(field: FieldNode): string {
+  if (!field.arguments?.length) {
+    return '';
+  }
+  return JSON.stringify(field.arguments.map((a) => [a.name.value, a.value]));
+}
+
+function pathsHaveNesting(paths: PathSegment[][]): boolean {
+  for (let i = 0; i < paths.length; i++) {
+    for (let j = 0; j < paths.length; j++) {
+      if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function pathsEqual(a: PathSegment[], b: PathSegment[]): boolean {
+  return a.length === b.length && a.every((seg, i) => seg === b[i]);
+}
+
+/**
+ * Locate merge field config across computed-isolation Subschema clones that
+ * share a name but split `merge.fields` (e.g. shippingEstimate vs EUR).
+ */
+function findMergeFieldConfig(
+  stitchingInfo: StitchingInfo,
+  subschema: Subschema,
+  typeName: string,
+  fieldName: string,
+) {
+  const direct = subschema.merge?.[typeName]?.fields?.[fieldName];
+  if (direct?.selectionSet || direct?.computed) {
+    return direct;
+  }
+  for (const s of stitchingInfo.subschemaMap.values()) {
+    if (subschema.name && s.name !== subschema.name) {
+      continue;
+    }
+    const field = s.merge?.[typeName]?.fields?.[fieldName];
+    if (field?.selectionSet || field?.computed) {
+      return field;
+    }
+  }
+  return undefined;
+}
+
+/** @requires bridge field nodes for one client field on a merge target. */
+function requiresDepsForField(
+  stitchingInfo: StitchingInfo,
+  subschema: Subschema,
+  typeName: string,
+  fieldName: string,
+): FieldNode[] {
+  if (fieldName === '__typename') {
+    return [];
+  }
+  const mergeField = findMergeFieldConfig(
+    stitchingInfo,
+    subschema,
+    typeName,
+    fieldName,
+  );
+  if (!mergeField?.selectionSet && !mergeField?.computed) {
+    return [];
+  }
+  return stitchingInfo.fieldNodesByField?.[typeName]?.[fieldName] ?? [];
+}
+
+/**
+ * Collect @requires deps for every field in a Fetch selection. Used both for
+ * selection-union safety (arg conflicts) and wave dependency edges.
+ */
+function collectRequiresDeps(
+  stitchingInfo: StitchingInfo,
+  fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): FieldNode[] {
+  if (!fetch.entityTypeName) {
+    return [];
+  }
+  const deps: FieldNode[] = [];
+  for (const sel of fetch.selectionSet.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      continue;
+    }
+    deps.push(
+      ...requiresDepsForField(
+        stitchingInfo,
+        fetch.subschema,
+        fetch.entityTypeName,
+        sel.name.value,
+      ),
+    );
+  }
+  return deps;
+}
+
+
+function collectSelectedFieldNames(
+  selectionSet: SelectionSetNode,
+): Set<string> {
+  const names = new Set<string>();
+  for (const sel of selectionSet.selections) {
+    if (sel.kind === Kind.FIELD) {
+      names.add(sel.name.value);
+    }
+  }
+  return names;
+}
+
+/**
+ * True when two selections can share one _entities Fetch: no @requires key
+ * argument conflicts (requires-with-argument-conflict must stay split).
+ */
+function requiresArgsCompatible(
+  stitchingInfo: StitchingInfo,
+  a: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  b: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): boolean {
+  const byName = new Map<string, string>();
+  for (const dep of [
+    ...collectRequiresDeps(stitchingInfo, a),
+    ...collectRequiresDeps(stitchingInfo, b),
+  ]) {
+    const args = fieldArgsKey(dep);
+    const prev = byName.get(dep.name.value);
+    if (prev != null && prev !== args) {
+      return false;
+    }
+    byName.set(dep.name.value, args);
+  }
+  return true;
+}
+
+function selectionsCompatibleForUnion(
+  a: SelectionSetNode,
+  b: SelectionSetNode,
+): boolean {
+  const aFields = new Map<string, FieldNode>();
+  for (const sel of a.selections) {
+    if (sel.kind === Kind.FIELD) {
+      aFields.set(fieldResponseKey(sel), sel);
+    }
+  }
+  for (const sel of b.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      continue;
+    }
+    const key = fieldResponseKey(sel);
+    const prior = aFields.get(key);
+    if (!prior) {
+      continue;
+    }
+    if (
+      prior.name.value !== sel.name.value ||
+      fieldArgsKey(prior) !== fieldArgsKey(sel)
+    ) {
+      return false;
+    }
+    if (prior.selectionSet && sel.selectionSet) {
+      if (!selectionsCompatibleForUnion(prior.selectionSet, sel.selectionSet)) {
+        return false;
+      }
+    } else if (prior.selectionSet || sel.selectionSet) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function unionSelectionSets(
+  a: SelectionSetNode,
+  b: SelectionSetNode,
+): SelectionSetNode {
+  const byKey = new Map<string, SelectionNode>();
+  const add = (sel: SelectionNode) => {
+    if (sel.kind === Kind.FIELD) {
+      const key = `f:${fieldResponseKey(sel)}`;
+      const prior = byKey.get(key);
+      if (!prior || prior.kind !== Kind.FIELD) {
+        byKey.set(key, sel);
+        return;
+      }
+      if (prior.selectionSet && sel.selectionSet) {
+        byKey.set(key, {
+          ...prior,
+          selectionSet: unionSelectionSets(
+            prior.selectionSet,
+            sel.selectionSet,
+          ),
+        });
+      }
+      return;
+    }
+    byKey.set(selectionIdentity(sel), sel);
+  };
+  for (const sel of a.selections) {
+    add(sel);
+  }
+  for (const sel of b.selections) {
+    add(sel);
+  }
+  return { kind: Kind.SELECTION_SET, selections: [...byKey.values()] };
+}
+
+/**
+ * Merge entity Fetches on the same subgraph type into one multi-path Fetch
+ * with a unioned selection when @requires keys don't conflict.
+ */
+function tryUnionEntityFetches(
+  stitchingInfo: StitchingInfo,
+  fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
+): Extract<StitchPlanNode, { kind: 'Fetch' }> | null {
+  if (fetches.length < 2) {
+    return null;
+  }
+  const typeKey = entityTypeKey(fetches[0]!);
+  if (!typeKey || fetches.some((f) => entityTypeKey(f) !== typeKey)) {
+    return null;
+  }
+  const pathMap = new Map<string, PathSegment[]>();
+  for (const p of fetches.flatMap(fetchFlattenPaths)) {
+    pathMap.set(p.join('\0'), p);
+  }
+  const paths = [...pathMap.values()];
+  if (!paths.length || pathsHaveNesting(paths)) {
+    return null;
+  }
+  // Do not union different field sets across different flatten paths when any
+  // side has @requires — that would schedule shippingEstimate on deep paths
+  // before PRODUCTS weight is available (Hive keeps those waves separate).
+  const pathKeys = new Set(
+    fetches.map((f) =>
+      fetchFlattenPaths(f)
+        .map((p) => p.join('\0'))
+        .sort()
+        .join('/'),
+    ),
+  );
+  const requiresCounts = fetches.map(
+    (f) => collectRequiresDeps(stitchingInfo, f).length,
+  );
+  const fetchesWithRequires = requiresCounts.filter((n) => n > 0).length;
+  // At most one hop in the union may carry @requires fields. This allows
+  // inStock (no requires) ∪ shippingEstimate, but keeps requires-circular /
+  // requires-with-argument sibling computed fields in separate Fetches.
+  if (fetchesWithRequires > 1) {
+    return null;
+  }
+  if (pathKeys.size > 1 && fetchesWithRequires > 0) {
+    return null;
+  }
+  for (let i = 0; i < fetches.length; i++) {
+    for (let j = i + 1; j < fetches.length; j++) {
+      if (!requiresArgsCompatible(stitchingInfo, fetches[i]!, fetches[j]!)) {
+        return null;
+      }
+      if (
+        !selectionsCompatibleForUnion(
+          fetches[i]!.selectionSet,
+          fetches[j]!.selectionSet,
+        )
+      ) {
+        return null;
+      }
+    }
+  }
+  let selectionSet = fetches[0]!.selectionSet;
+  for (let i = 1; i < fetches.length; i++) {
+    selectionSet = unionSelectionSets(selectionSet, fetches[i]!.selectionSet);
+  }
+  // Reject unions where one selected field @requires another selected
+  // computed field (requires-circular: byExpert needs byNovice first).
+  const selected = collectSelectedFieldNames(selectionSet);
+  // Prefer the computed-isolation Subschema clone that owns @requires fields
+  // (shippingEstimate). The base INVENTORY clone has empty merge.fields and
+  // would omit price/weight from representations if used for the union.
+  let template = fetches[0]!;
+  for (let i = 0; i < fetches.length; i++) {
+    if (requiresCounts[i]! > 0) {
+      template = fetches[i]!;
+      break;
+    }
+  }
+  for (const name of selected) {
+    const deps = requiresDepsForField(
+      stitchingInfo,
+      template.subschema,
+      template.entityTypeName!,
+      name,
+    );
+    for (const dep of deps) {
+      if (dep.name.value === name || !selected.has(dep.name.value)) {
+        continue;
+      }
+      const depMerge = findMergeFieldConfig(
+        stitchingInfo,
+        template.subschema,
+        template.entityTypeName!,
+        dep.name.value,
+      );
+      if (depMerge?.selectionSet || depMerge?.computed) {
+        return null;
+      }
+    }
+  }
+  const subschema = resolveSubschemaForUnion(
+    stitchingInfo,
+    template,
+    selected,
+  );
+  return {
+    kind: 'Fetch',
+    subschema,
+    entityTypeName: template.entityTypeName,
+    selectionSet,
+    flattenPath: paths[0],
+    flattenPaths: paths,
+  };
+}
+
+/**
+ * Pick the Subschema clone whose merge.fields covers computed/@requires
+ * fields in the unioned selection (isolateComputedFieldsTransformer splits
+ * these onto a dedicated clone).
+ */
+function resolveSubschemaForUnion(
+  stitchingInfo: StitchingInfo,
+  template: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  selected: ReadonlySet<string>,
+): Subschema {
+  const typeName = template.entityTypeName!;
+  const direct = template.subschema.merge?.[typeName]?.fields;
+  for (const name of selected) {
+    const f = direct?.[name];
+    if (f?.selectionSet || f?.computed) {
+      return template.subschema;
+    }
+  }
+  for (const s of stitchingInfo.subschemaMap.values()) {
+    if (template.subschema.name && s.name !== template.subschema.name) {
+      continue;
+    }
+    const fields = s.merge?.[typeName]?.fields;
+    if (!fields) {
+      continue;
+    }
+    for (const name of selected) {
+      const f = fields[name];
+      if (f?.selectionSet || f?.computed) {
+        return s;
+      }
+    }
+  }
+  return template.subschema;
+}
+
+/**
+ * True when `selectionSet` nests fields matching `suffix` (path segments after
+ * an earlier flatten path). Entity hops only "produce" deeper paths when their
+ * selection actually returns those nested objects — hydrating inStock on
+ * Product does not create Product.reviews.author.
+ */
+function selectionProducesPathSuffix(
+  selectionSet: SelectionSetNode,
+  suffix: PathSegment[],
+): boolean {
+  if (!suffix.length) {
+    return true;
+  }
+  const head = suffix[0];
+  if (typeof head !== 'string') {
+    return selectionProducesPathSuffix(selectionSet, suffix.slice(1));
+  }
+  for (const sel of selectionSet.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      continue;
+    }
+    const key = sel.alias?.value ?? sel.name.value;
+    if (key !== head) {
+      continue;
+    }
+    if (suffix.length === 1) {
+      return true;
+    }
+    if (sel.selectionSet) {
+      return selectionProducesPathSuffix(sel.selectionSet, suffix.slice(1));
+    }
+  }
+  return false;
+}
+
+/** True when the selection names the first segment of `suffix` as a field. */
+function selectionTouchesPathSuffix(
+  selectionSet: SelectionSetNode,
+  suffix: PathSegment[],
+): boolean {
+  if (!suffix.length) {
+    return false;
+  }
+  const head = suffix[0];
+  if (typeof head !== 'string') {
+    return selectionTouchesPathSuffix(selectionSet, suffix.slice(1));
+  }
+  for (const sel of selectionSet.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      continue;
+    }
+    if ((sel.alias?.value ?? sel.name.value) === head) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Does `later` need `earlier` to complete first? Path production or @requires.
+ */
+function fetchDependsOn(
+  stitchingInfo: StitchingInfo,
+  later: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): boolean {
+  const laterPaths = fetchFlattenPaths(later);
+  const earlierPaths = fetchFlattenPaths(earlier);
+  if (earlier.rootField) {
+    const rk =
+      earlier.rootField.alias?.value ?? earlier.rootField.name.value;
+    // Root Fetch produces the top segment; also check nested selection under it.
+    for (const lp of laterPaths) {
+      if (lp[0] !== rk) {
+        continue;
+      }
+      if (lp.length === 1) {
+        return true;
+      }
+      if (
+        selectionProducesPathSuffix(earlier.selectionSet, lp.slice(1))
+      ) {
+        return true;
+      }
+    }
+  }
+
+  for (const lp of laterPaths) {
+    for (const ep of earlierPaths) {
+      if (!pathIsPrefix(ep, lp)) {
+        continue;
+      }
+      const suffix = lp.slice(ep.length);
+      if (selectionProducesPathSuffix(earlier.selectionSet, suffix)) {
+        return true;
+      }
+    }
+  }
+
+  const reqNames = new Set(
+    collectRequiresDeps(stitchingInfo, later).map((d) => d.name.value),
+  );
+  if (!reqNames.size) {
+    return false;
+  }
+  const provided = collectSelectedFieldNames(earlier.selectionSet);
+  let providesNeeded = false;
+  for (const n of reqNames) {
+    if (provided.has(n)) {
+      providesNeeded = true;
+      break;
+    }
+  }
+  if (!providesNeeded) {
+    return false;
+  }
+  // Requires edge only if paths relate (same / ancestor / root).
+  if (earlier.rootField) {
+    const rk =
+      earlier.rootField.alias?.value ?? earlier.rootField.name.value;
+    if (laterPaths.some((lp) => lp[0] === rk)) {
+      return true;
+    }
+  }
+  for (const lp of laterPaths) {
+    for (const ep of earlierPaths) {
+      // earlier must be at the same path or an ancestor path of later —
+      // a deeper Fetch cannot satisfy requires for a shallower one.
+      if (pathsEqual(lp, ep) || pathIsPrefix(ep, lp)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Absorb overlapping same-subgraph entity fields across two Fetches without
+ * sinking a @requires hop earlier than its providers. Non-requires fields
+ * (inStock) join the requires-bearing hop (shippingEstimate) at that hop's
+ * existing position — matching Hive's single inventory selection.
+ */
+function tryAbsorbFetches(
+  stitchingInfo: StitchingInfo,
+  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  later: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  intervening: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
+): {
+  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
+  later: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
+} | null {
+  if (entityTypeKey(earlier) !== entityTypeKey(later)) {
+    return null;
+  }
+  if (
+    selectionSetKey(earlier.selectionSet) ===
+    selectionSetKey(later.selectionSet)
+  ) {
+    return null;
+  }
+  const aPaths = fetchFlattenPaths(earlier);
+  const bPaths = fetchFlattenPaths(later);
+  const bKeys = new Set(bPaths.map((p) => p.join('\0')));
+  const common = aPaths.filter((p) => bKeys.has(p.join('\0')));
+  if (!common.length) {
+    return null;
+  }
+  const commonKeys = new Set(common.map((p) => p.join('\0')));
+  const aFullyInCommon = common.length === aPaths.length;
+  const bFullyInCommon = common.length === bPaths.length;
+  if (!aFullyInCommon && !bFullyInCommon) {
+    return null;
+  }
+
+  const aCommon: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
+    ...earlier,
+    flattenPath: common[0],
+    flattenPaths: common,
+  };
+  const bCommon: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
+    ...later,
+    flattenPath: common[0],
+    flattenPaths: common,
+  };
+  const united = tryUnionEntityFetches(stitchingInfo, [aCommon, bCommon]);
+  if (!united) {
+    return null;
+  }
+
+  const aReq = collectRequiresDeps(stitchingInfo, earlier).length > 0;
+  const bReq = collectRequiresDeps(stitchingInfo, later).length > 0;
+
+  // Only later carries @requires: merge into later so requires stay after any
+  // providers sitting between the two hops (deep PRODUCTS before inventory).
+  if (bReq && !aReq) {
+    if (!aFullyInCommon || !bFullyInCommon) {
+      return null;
+    }
+    // Do not drop `earlier` if a hop between still needs it (requires-circular:
+    // Post.author must stay before Author.yearsOfExperience before byNovice).
+    for (const mid of intervening) {
+      if (fetchDependsOn(stitchingInfo, mid, earlier)) {
+        return null;
+      }
+    }
+    return { earlier: null, later: united };
+  }
+
+  // Later has no @requires (or earlier already has them): merge into earlier.
+  // Refuse if later still needs an intervening provider.
+  for (const mid of intervening) {
+    if (fetchDependsOn(stitchingInfo, later, mid)) {
+      return null;
+    }
+  }
+  if (aFullyInCommon && bFullyInCommon) {
+    return { earlier: united, later: null };
+  }
+  if (aFullyInCommon && !bFullyInCommon) {
+    const bRest = bPaths.filter((p) => !commonKeys.has(p.join('\0')));
+    return {
+      earlier: united,
+      later: {
+        ...later,
+        flattenPath: bRest[0],
+        flattenPaths: bRest,
+      },
+    };
+  }
+  return null;
+}
+
+function collectEntityFetchOrders(
+  node: StitchPlanNode,
+  locs: Array<{
+    fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>;
+    order: number;
+  }>,
+  counter: { n: number },
+): void {
+  if (node.kind === 'Fetch') {
+    if (entityTypeKey(node)) {
+      locs.push({ fetch: node, order: counter.n });
+    }
+    counter.n++;
+    return;
+  }
+  if (node.kind === 'Island') {
+    if (node.continue) {
+      collectEntityFetchOrders(node.continue, locs, counter);
+    }
+    return;
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    for (const child of node.nodes) {
+      collectEntityFetchOrders(child, locs, counter);
+    }
+  }
+}
+
+function applyFetchOrderUpdates(
+  node: StitchPlanNode,
+  updates: Map<
+    number,
+    Extract<StitchPlanNode, { kind: 'Fetch' }> | null
+  >,
+  counter: { n: number },
+): StitchPlanNode | null {
+  if (node.kind === 'Fetch') {
+    const my = counter.n++;
+    if (!updates.has(my)) {
+      return node;
+    }
+    return updates.get(my) ?? null;
+  }
+  if (node.kind === 'Island') {
+    if (!node.continue) {
+      return node;
+    }
+    const cont = applyFetchOrderUpdates(node.continue, updates, counter);
+    if (!cont) {
+      return { ...node, continue: undefined };
+    }
+    return { ...node, continue: cont };
+  }
+  if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
+    return node;
+  }
+  const next: StitchPlanNode[] = [];
+  for (const child of node.nodes) {
+    const mapped = applyFetchOrderUpdates(child, updates, counter);
+    if (mapped) {
+      next.push(mapped);
+    }
+  }
+  if (!next.length) {
+    return null;
+  }
+  if (next.length === 1) {
+    return next[0]!;
+  }
+  return { kind: node.kind, nodes: next };
+}
+
+/**
+ * Hive-style same-path inventory coalesce: walk the whole plan and merge
+ * overlapping entity field sets without reordering requires past providers.
+ */
+function coalesceSamePathEntityFields(
+  root: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  let current = root;
+  for (let iter = 0; iter < 64; iter++) {
+    const locs: Array<{
+      fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>;
+      order: number;
+    }> = [];
+    collectEntityFetchOrders(current, locs, { n: 0 });
+    let absorbed:
+      | {
+          earlierOrder: number;
+          laterOrder: number;
+          earlier: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
+          later: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
+        }
+      | null = null;
+    outer: for (let i = 0; i < locs.length; i++) {
+      for (let j = i + 1; j < locs.length; j++) {
+        const a = locs[i]!;
+        const b = locs[j]!;
+        const intervening = locs
+          .slice(i + 1, j)
+          .map((l) => l.fetch);
+        const result = tryAbsorbFetches(
+          stitchingInfo,
+          a.fetch,
+          b.fetch,
+          intervening,
+        );
+        if (!result) {
+          continue;
+        }
+        absorbed = {
+          earlierOrder: a.order,
+          laterOrder: b.order,
+          earlier: result.earlier,
+          later: result.later,
+        };
+        break outer;
+      }
+    }
+    if (!absorbed) {
+      return current;
+    }
+    const updates = new Map<
+      number,
+      Extract<StitchPlanNode, { kind: 'Fetch' }> | null
+    >();
+    updates.set(absorbed.earlierOrder, absorbed.earlier);
+    updates.set(absorbed.laterOrder, absorbed.later);
+    current =
+      applyFetchOrderUpdates(current, updates, { n: 0 }) ?? current;
+  }
+  return current;
+}
+
+/**
+ * Pack consecutive independent entity Fetches into a Parallel wave (Hive
+ * products ∥ accounts). Stops before any depends-on edge.
+ */
+function packIndependentSequenceFetches(
+  nodes: StitchPlanNode[],
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode[] {
+  const out: StitchPlanNode[] = [];
+  let i = 0;
+  while (i < nodes.length) {
+    const n = nodes[i]!;
+    if (n.kind !== 'Fetch' || n.rootField || !entityTypeKey(n)) {
+      out.push(n);
+      i++;
+      continue;
+    }
+    const group: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [n];
+    let j = i + 1;
+    while (j < nodes.length) {
+      const m = nodes[j]!;
+      if (m.kind !== 'Fetch' || m.rootField || !entityTypeKey(m)) {
+        break;
+      }
+      const blocked = group.some((g) => {
+        if (
+          fetchDependsOn(stitchingInfo, m, g) ||
+          fetchDependsOn(stitchingInfo, g, m)
+        ) {
+          return true;
+        }
+        const eitherHasRequires =
+          collectRequiresDeps(stitchingInfo, g).length > 0 ||
+          collectRequiresDeps(stitchingInfo, m).length > 0;
+        for (const gp of fetchFlattenPaths(g)) {
+          for (const mp of fetchFlattenPaths(m)) {
+            if (pathsEqual(gp, mp)) {
+              return true;
+            }
+            if (!pathIsPrefix(gp, mp) && !pathIsPrefix(mp, gp)) {
+              continue;
+            }
+            // @requires hops stay strictly sequenced vs nested neighbors
+            // (requires-circular). Leaf entity hops may share a wave when
+            // paths nest (Hive accounts∥products).
+            if (eitherHasRequires) {
+              return true;
+            }
+            if (
+              pathIsPrefix(gp, mp) &&
+              selectionTouchesPathSuffix(
+                g.selectionSet,
+                mp.slice(gp.length),
+              )
+            ) {
+              return true;
+            }
+            if (
+              pathIsPrefix(mp, gp) &&
+              selectionTouchesPathSuffix(
+                m.selectionSet,
+                gp.slice(mp.length),
+              )
+            ) {
+              return true;
+            }
+          }
+        }
+        return false;
+      });
+      if (blocked) {
+        break;
+      }
+      group.push(m);
+      j++;
+    }
+    if (group.length > 1) {
+      out.push({ kind: 'Parallel', nodes: group });
+    } else {
+      out.push(group[0]!);
+    }
+    i = j;
+  }
+  return out;
+}
+
+function packIndependentWaves(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? {
+          ...node,
+          continue: packIndependentWaves(node.continue, stitchingInfo),
+        }
+      : node;
+  }
+  if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
+    return node;
+  }
+  const children = node.nodes.map((c) =>
+    packIndependentWaves(c, stitchingInfo),
+  );
+  if (node.kind === 'Parallel') {
+    return children.length === 1
+      ? children[0]!
+      : { kind: 'Parallel', nodes: children };
+  }
+  const packed = packIndependentSequenceFetches(children, stitchingInfo);
+  return toSeqOrSingle(packed);
+}
+
 function fetchFlattenPaths(
   node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
 ): PathSegment[][] {
@@ -3136,13 +3991,13 @@ function collectBatchLocs(seqs: StitchPlanNode[][]): BatchLoc[] {
     for (let pos = 0; pos < seq.length; pos++) {
       const n = seq[pos]!;
       if (n.kind === 'Fetch') {
-        if (entityBatchKey(n)) {
+        if (entityTypeKey(n) || entityBatchKey(n)) {
           locs.push({ seqIdx: si, pos, fetch: n });
         }
       } else if (n.kind === 'Parallel') {
         for (let pi = 0; pi < n.nodes.length; pi++) {
           const c = n.nodes[pi]!;
-          if (c.kind === 'Fetch' && entityBatchKey(c)) {
+          if (c.kind === 'Fetch' && (entityTypeKey(c) || entityBatchKey(c))) {
             locs.push({
               seqIdx: si,
               pos,
@@ -3324,10 +4179,16 @@ function mergeMultiPathFetches(
  *   fan-outs that must keep sameKey isolation)
  * - Drop exact-duplicate Fetches left by double nested planning
  */
-function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
+function optimizeStitchPlanNode(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
   if (node.kind === 'Island') {
     return node.continue
-      ? { ...node, continue: optimizeStitchPlanNode(node.continue) }
+      ? {
+          ...node,
+          continue: optimizeStitchPlanNode(node.continue, stitchingInfo),
+        }
       : node;
   }
   if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
@@ -3348,7 +4209,9 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
     return false;
   };
   const flat: StitchPlanNode[] = [];
-  for (const child of node.nodes.map(optimizeStitchPlanNode)) {
+  for (const child of node.nodes.map((c) =>
+    optimizeStitchPlanNode(c, stitchingInfo),
+  )) {
     // Do not flatten Parallel groups that contain root Fetches — shared-root
     // sameKey isolation (account vs chat) requires each alias's fan-out to stay
     // in its own Parallel unit.
@@ -3362,18 +4225,48 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
     }
   }
 
-  // Parallel: batch same entity+selection across different flatten paths into
-  // one multi-path Fetch (Hive BatchFetch). Different selections at the same
-  // path stay separate (@requires-with-argument-conflict).
+  // Parallel: same-path field union (inStock∥shippingEstimate), then multi-path
+  // BatchFetch for identical selections across flatten paths.
   const coalesced: StitchPlanNode[] = [];
   if (kind === 'Parallel') {
+    const byTypePath = new Map<
+      string,
+      Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
+    >();
+    const nonEntity: StitchPlanNode[] = [];
+    for (const child of flat) {
+      if (child.kind !== 'Fetch' || !entityTypeKey(child)) {
+        nonEntity.push(child);
+        continue;
+      }
+      const pk = fetchFlattenPaths(child)
+        .map((p) => p.join('\0'))
+        .sort()
+        .join('/');
+      const key = `${entityTypeKey(child)}::${pk}`;
+      let list = byTypePath.get(key);
+      if (!list) {
+        list = [];
+        byTypePath.set(key, list);
+      }
+      list.push(child);
+    }
+    const afterUnion: StitchPlanNode[] = [...nonEntity];
+    for (const group of byTypePath.values()) {
+      const united = tryUnionEntityFetches(stitchingInfo, group);
+      if (united) {
+        afterUnion.push(united);
+      } else {
+        afterUnion.push(...group);
+      }
+    }
     const batchGroups = new Map<
       string,
       Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
     >();
     const rest: StitchPlanNode[] = [];
     const seenExact = new Set<string>();
-    for (const child of flat) {
+    for (const child of afterUnion) {
       if (child.kind !== 'Fetch') {
         rest.push(child);
         continue;
@@ -3401,22 +4294,10 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
     for (const group of batchGroups.values()) {
       if (group.length === 1) {
         coalesced.push(group[0]!);
+      } else if (pathsHaveNesting(group.flatMap(fetchFlattenPaths))) {
+        coalesced.push(...group);
       } else {
-        const paths = group.flatMap(fetchFlattenPaths);
-        let nested = false;
-        for (let i = 0; i < paths.length && !nested; i++) {
-          for (let j = 0; j < paths.length; j++) {
-            if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
-              nested = true;
-              break;
-            }
-          }
-        }
-        if (nested) {
-          coalesced.push(...group);
-        } else {
-          coalesced.push(mergeMultiPathFetches(group));
-        }
+        coalesced.push(mergeMultiPathFetches(group));
       }
     }
     coalesced.push(...rest);
@@ -3435,13 +4316,31 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
         ) {
           continue;
         }
+        const united = tryUnionEntityFetches(stitchingInfo, [prev, child]);
+        if (united) {
+          coalesced[coalesced.length - 1] = united;
+          continue;
+        }
       }
       coalesced.push(child);
     }
-    const withinBatched = tryBatchWithinSequence(coalesced);
+    const pathCoalesced = coalesceSamePathEntityFields(
+      { kind: 'Sequence', nodes: coalesced },
+      stitchingInfo,
+    );
+    const seqNodes =
+      pathCoalesced.kind === 'Sequence' ? pathCoalesced.nodes : [pathCoalesced];
+    const withinBatched = tryBatchWithinSequence(seqNodes);
     if (withinBatched) {
-      return optimizeStitchPlanNode({ kind: 'Sequence', nodes: withinBatched });
+      return optimizeStitchPlanNode(
+        { kind: 'Sequence', nodes: withinBatched },
+        stitchingInfo,
+      );
     }
+    if (seqNodes.length === 1) {
+      return seqNodes[0]!;
+    }
+    return { kind: 'Sequence', nodes: seqNodes };
   }
 
   if (coalesced.length === 1) {
@@ -3451,7 +4350,7 @@ function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
   if (kind === 'Parallel') {
     const crossBatched = tryCrossBatchSequences(coalesced);
     if (crossBatched) {
-      return optimizeStitchPlanNode(crossBatched);
+      return optimizeStitchPlanNode(crossBatched, stitchingInfo);
     }
   }
 
@@ -3469,7 +4368,10 @@ function tryBatchWithinSequence(
   const locs = collectBatchLocs([nodes]);
   const byKey = new Map<string, BatchLoc[]>();
   for (const loc of locs) {
-    const key = entityBatchKey(loc.fetch)!;
+    const key = entityBatchKey(loc.fetch);
+    if (!key) {
+      continue;
+    }
     let list = byKey.get(key);
     if (!list) {
       list = [];
@@ -3488,16 +4390,7 @@ function tryBatchWithinSequence(
     if (pathKeys.size < 2) {
       continue;
     }
-    let nested = false;
-    for (let i = 0; i < paths.length && !nested; i++) {
-      for (let j = 0; j < paths.length; j++) {
-        if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
-          nested = true;
-          break;
-        }
-      }
-    }
-    if (nested) {
+    if (pathsHaveNesting(paths)) {
       continue;
     }
     if (!best || group.length > best.length) {
@@ -3515,14 +4408,19 @@ function tryBatchWithinSequence(
   );
   const latest = sorted[sorted.length - 1]!;
   const batchPaths = best.flatMap((l) => fetchFlattenPaths(l.fetch));
+  const pathMap = new Map<string, PathSegment[]>();
+  for (const p of batchPaths) {
+    pathMap.set(p.join('\0'), p);
+  }
+  const dedupedPaths = [...pathMap.values()];
   const template = latest.fetch;
   const batchFetch: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
     kind: 'Fetch',
     subschema: template.subschema,
     entityTypeName: template.entityTypeName,
     selectionSet: template.selectionSet,
-    flattenPath: batchPaths[0],
-    flattenPaths: batchPaths,
+    flattenPath: dedupedPaths[0],
+    flattenPaths: dedupedPaths,
   };
 
   // Rebuild sequence: walk positions, skip removed fetches, insert batch at latest.
@@ -3630,10 +4528,18 @@ function buildCompletePlan(
           nodes: rootNodes,
         };
 
+  const optimized = optimizeStitchPlanNode(rootRaw, stitchingInfo);
+  const coalesced = coalesceSamePathEntityFields(optimized, stitchingInfo);
   return {
     operation,
     fragments,
-    root: optimizeStitchPlanNode(rootRaw),
+    // Re-optimize to BatchFetch identical selections after field coalesce.
+    // Independent-wave packing is applied only after requires-safe coalesce
+    // and never nests a path under a sibling Fetch in the same Parallel.
+    root: packIndependentWaves(
+      optimizeStitchPlanNode(coalesced, stitchingInfo),
+      stitchingInfo,
+    ),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
   };
