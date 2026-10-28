@@ -10,12 +10,30 @@ import type {
 
 export type PathSegment = string | number;
 
+/** One alias inside a multi-type BatchFetch (Hive-style `_e0` / `_e1`). */
+export interface StitchBatchAlias {
+  /** Response key in the batched `_entities` document (`_e0`, …). */
+  alias: string;
+  entityTypeName: string;
+  selectionSet: SelectionSetNode;
+  flattenPaths: PathSegment[][];
+}
+
 /** Operation-level stitch plan node tree. */
 export type StitchPlanNode =
   | { kind: 'Sequence'; nodes: StitchPlanNode[] }
   | { kind: 'Parallel'; nodes: StitchPlanNode[] }
   | {
       kind: 'Fetch';
+      /** Stable id for barrier-free dataflow execute. */
+      id?: string;
+      /**
+       * When same-type multi-path Fetches were collapsed, all original ids
+       * that this hop satisfies for downstream dependsOn.
+       */
+      completesIds?: string[];
+      /** Fetch/BatchFetch ids that must complete first. */
+      dependsOn?: string[];
       /** Target subschema for this hop. */
       subschema: Subschema;
       /** Root field hops write into `data[responseKey]`. */
@@ -31,6 +49,19 @@ export type StitchPlanNode =
        * paths in one hop (one DataLoader/_entities wave).
        */
       flattenPaths?: PathSegment[][];
+    }
+  | {
+      kind: 'BatchFetch';
+      id?: string;
+      /**
+       * All Fetch ids collapsed into this batch — dataflow marks every id
+       * complete when the single HTTP call returns.
+       */
+      completesIds?: string[];
+      dependsOn?: string[];
+      subschema: Subschema;
+      /** Multi-type / multi-selection aliases → one subgraph HTTP call. */
+      aliases: StitchBatchAlias[];
     }
   | {
       kind: 'Island';

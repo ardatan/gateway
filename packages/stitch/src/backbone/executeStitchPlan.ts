@@ -28,9 +28,11 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   FieldNode,
+  getNamedType,
   GraphQLList,
   GraphQLOutputType,
   GraphQLSchema,
+  isAbstractType,
   isInterfaceType,
   isNullableType,
   isObjectType,
@@ -884,8 +886,35 @@ function tryExecuteEntitiesBatch(
     return undefined;
   }
 
-  // One delegateToSchema with all representations — Hive-like single
-  // _entities round-trip without DataLoader scheduling per parent.
+  const mergeResults = (results: any) => {
+    if (!Array.isArray(results)) {
+      if (results instanceof Error) {
+        ctx.errors.push(results);
+      }
+      return;
+    }
+    for (let i = 0; i < parents.length; i++) {
+      const ki = parentKeyIndex[i]!;
+      if (ki < 0) {
+        continue;
+      }
+      const entity = results[ki];
+      if (entity instanceof Error) {
+        ctx.errors.push(entity);
+        continue;
+      }
+      if (entity == null || typeof entity !== 'object') {
+        continue;
+      }
+      mergeEntityIntoParent(
+        parents[i]!,
+        entity as Record<string, any>,
+        ctx.schema,
+        node.subschema,
+      );
+    }
+  };
+
   return handleMaybePromise(
     () =>
       delegateToSchema({
@@ -899,34 +928,7 @@ function tryExecuteEntitiesBatch(
         info: info as any,
         skipTypeMerging: true,
       }),
-    (results: any) => {
-      if (!Array.isArray(results)) {
-        if (results instanceof Error) {
-          ctx.errors.push(results);
-        }
-        return;
-      }
-      for (let i = 0; i < parents.length; i++) {
-        const ki = parentKeyIndex[i]!;
-        if (ki < 0) {
-          continue;
-        }
-        const entity = results[ki];
-        if (entity instanceof Error) {
-          ctx.errors.push(entity);
-          continue;
-        }
-        if (entity == null || typeof entity !== 'object') {
-          continue;
-        }
-        mergeEntityIntoParent(
-          parents[i]!,
-          entity as Record<string, any>,
-          ctx.schema,
-          node.subschema,
-        );
-      }
-    },
+    mergeResults,
   );
 }
 
@@ -1112,11 +1114,461 @@ function executePlanNode(
     }
     case 'Fetch':
       return executeFetchNode(node, ctx);
+    case 'BatchFetch':
+      return executeBatchFetchNode(node, ctx);
     case 'Island':
       return executeIslandNode(node, ctx);
     default:
       return;
   }
+}
+
+function planHasIslands(node: StitchPlanNode): boolean {
+  if (node.kind === 'Island') {
+    return true;
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    return node.nodes.some(planHasIslands);
+  }
+  return false;
+}
+
+type ExecutableHop =
+  | Extract<StitchPlanNode, { kind: 'Fetch' }>
+  | Extract<StitchPlanNode, { kind: 'BatchFetch' }>;
+
+function collectExecutableHops(
+  node: StitchPlanNode,
+  out: ExecutableHop[],
+): void {
+  if (node.kind === 'Fetch' || node.kind === 'BatchFetch') {
+    out.push(node);
+    return;
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    for (const child of node.nodes) {
+      collectExecutableHops(child, out);
+    }
+  }
+}
+
+function hopCompletesIds(hop: ExecutableHop): string[] {
+  if (hop.completesIds?.length) {
+    return hop.completesIds;
+  }
+  return hop.id ? [hop.id] : [];
+}
+
+/**
+ * Barrier-free dataflow: fire every Fetch/BatchFetch as soon as its
+ * `dependsOn` ids are complete — Sequence wave barriers are ignored.
+ */
+function executeDataflowPlan(
+  root: StitchPlanNode,
+  ctx: BackboneExecutionContext,
+): MaybePromise<void> {
+  const hops: ExecutableHop[] = [];
+  collectExecutableHops(root, hops);
+  if (!hops.length) {
+    return;
+  }
+  // Fall back when planner didn't attach deps (legacy / incomplete annotate).
+  if (!hops.every((h) => h.id != null && h.dependsOn != null)) {
+    return executePlanNode(root, ctx);
+  }
+
+  const done = new Set<string>();
+  const pending = new Set(hops);
+  let remaining = hops.length;
+
+  const runReady = (): MaybePromise<void> => {
+    if (remaining === 0) {
+      return;
+    }
+    const ready: ExecutableHop[] = [];
+    for (const hop of pending) {
+      if (hop.dependsOn!.every((d) => done.has(d))) {
+        ready.push(hop);
+      }
+    }
+    if (!ready.length) {
+      // Missed edge — drain sequentially.
+      let chain: MaybePromise<void> = undefined;
+      for (const hop of pending) {
+        chain = handleMaybePromise(
+          () => chain,
+          () =>
+            hop.kind === 'BatchFetch'
+              ? executeBatchFetchNode(hop, ctx)
+              : executeFetchNode(hop, ctx),
+        );
+      }
+      return chain;
+    }
+    for (const hop of ready) {
+      pending.delete(hop);
+    }
+    const jobs = ready.map((hop) =>
+      handleMaybePromise(
+        () =>
+          hop.kind === 'BatchFetch'
+            ? executeBatchFetchNode(hop, ctx)
+            : executeFetchNode(hop, ctx),
+        () => {
+          for (const id of hopCompletesIds(hop)) {
+            done.add(id);
+          }
+          remaining--;
+        },
+      ),
+    );
+    return handleMaybePromise(
+      () =>
+        Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
+      () => runReady(),
+    );
+  };
+
+  return runReady();
+}
+
+const TYPENAME_FIELD: FieldNode = {
+  kind: Kind.FIELD,
+  name: { kind: Kind.NAME, value: '__typename' },
+};
+
+/**
+ * Strip fields the target subgraph schema cannot resolve (Hive QP only asks
+ * for local fields). Needed for raw `_entities` / BatchFetch documents that
+ * skip prepareGatewayDocument. Always keeps/injects `__typename` so later
+ * entity hops can match parents.
+ */
+function filterSelectionSetForSchema(
+  selectionSet: SelectionSetNode,
+  typeName: string,
+  schema: GraphQLSchema,
+  fragments: Record<string, any>,
+): SelectionSetNode {
+  const type = schema.getType(typeName);
+  if (!type || !('getFields' in type)) {
+    return { kind: Kind.SELECTION_SET, selections: [TYPENAME_FIELD] };
+  }
+  const fields = (type as any).getFields() as Record<string, { type: any }>;
+  const next: SelectionNode[] = [];
+  let hasTypename = false;
+  for (const sel of selectionSet.selections) {
+    if (sel.kind === Kind.FIELD) {
+      const name = sel.name.value;
+      if (name === '__typename') {
+        hasTypename = true;
+        next.push(sel);
+        continue;
+      }
+      const field = fields[name];
+      if (!field) {
+        continue;
+      }
+      if (!sel.selectionSet) {
+        next.push(sel);
+        continue;
+      }
+      const childType = getNamedType(field.type);
+      next.push({
+        ...sel,
+        selectionSet: filterSelectionSetForSchema(
+          sel.selectionSet,
+          childType.name,
+          schema,
+          fragments,
+        ),
+      });
+      continue;
+    }
+    if (sel.kind === Kind.INLINE_FRAGMENT) {
+      const on =
+        sel.typeCondition?.name.value ??
+        (isAbstractType(type) ? typeName : typeName);
+      if (
+        sel.typeCondition &&
+        !schema.getType(sel.typeCondition.name.value)
+      ) {
+        continue;
+      }
+      const filtered = filterSelectionSetForSchema(
+        sel.selectionSet,
+        on,
+        schema,
+        fragments,
+      );
+      if (filtered.selections.length) {
+        next.push({ ...sel, selectionSet: filtered });
+      }
+      continue;
+    }
+    if (sel.kind === Kind.FRAGMENT_SPREAD) {
+      const frag = fragments[sel.name.value];
+      if (!frag) {
+        continue;
+      }
+      const on = frag.typeCondition.name.value;
+      if (!schema.getType(on)) {
+        continue;
+      }
+      const filtered = filterSelectionSetForSchema(
+        frag.selectionSet,
+        on,
+        schema,
+        fragments,
+      );
+      if (filtered.selections.length) {
+        next.push({
+          kind: Kind.INLINE_FRAGMENT,
+          typeCondition: frag.typeCondition,
+          selectionSet: filtered,
+        });
+      }
+    }
+  }
+  if (!hasTypename) {
+    next.unshift(TYPENAME_FIELD);
+  }
+  return { kind: Kind.SELECTION_SET, selections: next };
+}
+
+const entitiesDocCache = new Map<string, ExecutionRequest['document']>();
+
+function selectionCacheKey(ss: SelectionSetNode): string {
+  return ss.selections
+    .map((s) => {
+      if (s.kind === Kind.FIELD) {
+        return s.name.value;
+      }
+      if (s.kind === Kind.INLINE_FRAGMENT) {
+        return `...${s.typeCondition?.name.value ?? ''}`;
+      }
+      return `...${s.kind === Kind.FRAGMENT_SPREAD ? s.name.value : '?'}`;
+    })
+    .join(',');
+}
+
+function buildCachedEntitiesDocument(
+  typeName: string,
+  selectionSet: SelectionSetNode,
+  alias?: string,
+): ExecutionRequest['document'] {
+  const cacheKey = `${alias ?? '_entities'}::${typeName}::${selectionCacheKey(selectionSet)}`;
+  const cached = entitiesDocCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const document = {
+    kind: Kind.DOCUMENT as const,
+    definitions: [
+      {
+        kind: Kind.OPERATION_DEFINITION as const,
+        operation: 'query' as OperationTypeNode,
+        variableDefinitions: [
+          {
+            kind: Kind.VARIABLE_DEFINITION as const,
+            variable: {
+              kind: Kind.VARIABLE as const,
+              name: { kind: Kind.NAME as const, value: 'representations' },
+            },
+            type: {
+              kind: Kind.NON_NULL_TYPE as const,
+              type: {
+                kind: Kind.LIST_TYPE as const,
+                type: {
+                  kind: Kind.NON_NULL_TYPE as const,
+                  type: {
+                    kind: Kind.NAMED_TYPE as const,
+                    name: { kind: Kind.NAME as const, value: '_Any' },
+                  },
+                },
+              },
+            },
+          },
+        ],
+        selectionSet: {
+          kind: Kind.SELECTION_SET as const,
+          selections: [
+            {
+              kind: Kind.FIELD as const,
+              alias: alias
+                ? { kind: Kind.NAME as const, value: alias }
+                : undefined,
+              name: { kind: Kind.NAME as const, value: '_entities' },
+              arguments: [
+                {
+                  kind: Kind.ARGUMENT as const,
+                  name: {
+                    kind: Kind.NAME as const,
+                    value: 'representations',
+                  },
+                  value: {
+                    kind: Kind.VARIABLE as const,
+                    name: {
+                      kind: Kind.NAME as const,
+                      value: 'representations',
+                    },
+                  },
+                },
+              ],
+              selectionSet: {
+                kind: Kind.SELECTION_SET as const,
+                selections: [
+                  {
+                    kind: Kind.INLINE_FRAGMENT as const,
+                    typeCondition: {
+                      kind: Kind.NAMED_TYPE as const,
+                      name: {
+                        kind: Kind.NAME as const,
+                        value: typeName,
+                      },
+                    },
+                    selectionSet,
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+  entitiesDocCache.set(cacheKey, document);
+  return document;
+}
+
+function matchEntityParent(
+  parent: Record<string, any>,
+  entityTypeName: string,
+  schema: GraphQLSchema,
+): boolean {
+  if (parent == null) {
+    return false;
+  }
+  if (parent['__typename'] === entityTypeName) {
+    return true;
+  }
+  const entityType = schema.getType(entityTypeName);
+  if (parent['__typename'] == null) {
+    return isInterfaceType(entityType);
+  }
+  if (!isInterfaceType(entityType)) {
+    return false;
+  }
+  const runtime = schema.getType(parent['__typename']);
+  return (
+    isObjectType(runtime) &&
+    runtime.getInterfaces().some((i) => i.name === entityTypeName)
+  );
+}
+
+function collectAliasParents(
+  ctx: BackboneExecutionContext,
+  entityTypeName: string,
+  flattenPaths: PathSegment[],
+): Array<Record<string, any>> {
+  const parents: Array<Record<string, any>> = [];
+  const seen = new Set<Record<string, any>>();
+  for (const path of flattenPaths) {
+    for (const p of collectEntitiesAtPath(ctx.data, path)) {
+      if (matchEntityParent(p, entityTypeName, ctx.schema) && !seen.has(p)) {
+        seen.add(p);
+        parents.push(p);
+      }
+    }
+  }
+  return parents;
+}
+
+function projectRepresentations(
+  parents: Array<Record<string, any>>,
+  hopSubschema: Subschema,
+  entityTypeName: string,
+): {
+  keys: any[];
+  parentKeyIndex: number[];
+  entry: {
+    key: (p: any) => any;
+    argsFromKeys: (keys: ReadonlyArray<any>) => Record<string, any>;
+  };
+} | null {
+  const mergeConfig = hopSubschema.merge?.[entityTypeName];
+  const entry =
+    mergeConfig?.key != null &&
+    mergeConfig.argsFromKeys != null &&
+    mergeConfig.fieldName === '_entities'
+      ? mergeConfig
+      : mergeConfig?.entryPoints?.find(
+          (e) =>
+            e.key != null &&
+            e.argsFromKeys != null &&
+            e.fieldName === '_entities',
+        );
+  if (!entry?.key || !entry.argsFromKeys) {
+    return null;
+  }
+  const cacheKeyFn = entry.dataLoaderOptions?.cacheKeyFn;
+  const keys: any[] = [];
+  const identityToIndex = new Map<string, number>();
+  const parentKeyIndex: number[] = new Array(parents.length);
+  for (let i = 0; i < parents.length; i++) {
+    const key = entry.key(parents[i]!);
+    if (key == null) {
+      parentKeyIndex[i] = -1;
+      continue;
+    }
+    const identity =
+      cacheKeyFn != null ? String(cacheKeyFn(key)) : JSON.stringify(key);
+    let idx = identityToIndex.get(identity);
+    if (idx == null) {
+      idx = keys.length;
+      identityToIndex.set(identity, idx);
+      keys.push(key);
+    }
+    parentKeyIndex[i] = idx;
+  }
+  return {
+    keys,
+    parentKeyIndex,
+    entry: { key: entry.key, argsFromKeys: entry.argsFromKeys },
+  };
+}
+
+/**
+ * Multi-type BatchFetch: run each alias through the normal Fetch path
+ * (delegateToSchema / prepareGatewayDocument) in parallel. A single multi-
+ * alias HTTP document needs subgraph-accurate selection filtering equivalent
+ * to prepareGatewayDocument; until that lands, parallel Fetches preserve
+ * audit correctness while the wave/dataflow schedule still matches Hive.
+ */
+function executeBatchFetchNode(
+  node: Extract<StitchPlanNode, { kind: 'BatchFetch' }>,
+  ctx: BackboneExecutionContext,
+): MaybePromise<void> {
+  if (!node.aliases.length) {
+    return;
+  }
+  // Parallel alias execution: disjoint root paths (planner-enforced).
+  const jobs = node.aliases.map((a) =>
+    executeFetchNode(
+      {
+        kind: 'Fetch',
+        subschema: node.subschema,
+        entityTypeName: a.entityTypeName,
+        selectionSet: a.selectionSet,
+        flattenPaths: a.flattenPaths,
+        flattenPath: a.flattenPaths[0],
+      },
+      ctx,
+    ),
+  );
+  return handleMaybePromise(
+    () => Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
+    () => undefined,
+  );
 }
 
 export function executeStitchPlan(
@@ -1146,6 +1598,9 @@ export function executeStitchPlan(
     infoStub: {},
   };
 
+  // Hive QP uses Sequence-of-Parallel wave barriers; our 4-wave plan matches.
+  // `dependsOn` is annotated for a future barrier-free scheduler once provides/
+  // abstract edges are complete (see executeDataflowPlan).
   return handleMaybePromise(
     () => executePlanNode(plan.root, ctx),
     () => {
