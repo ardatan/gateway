@@ -14,10 +14,15 @@ import {
   FieldNode,
   FragmentDefinitionNode,
   getNamedType,
+  GraphQLInterfaceType,
   GraphQLObjectType,
   GraphQLSchema,
+  GraphQLUnionType,
   isAbstractType,
+  isInterfaceType,
+  isLeafType,
   isObjectType,
+  isUnionType,
   Kind,
   OperationDefinitionNode,
   SelectionNode,
@@ -77,6 +82,51 @@ function ensureTypename(selectionSet: SelectionSetNode): SelectionSetNode {
   ]);
 }
 
+/** True when `owner` exposes the interface but not its concrete implementers. */
+function isInterfaceObjectOwner(
+  owner: Subschema,
+  returnType: GraphQLInterfaceType | GraphQLUnionType,
+  schema: GraphQLSchema,
+): boolean {
+  if (owner.transformedSchema.getType(returnType.name) == null) {
+    return false;
+  }
+  if (!isInterfaceType(returnType) && !isUnionType(returnType)) {
+    return false;
+  }
+  return schema
+    .getPossibleTypes(returnType)
+    .some((concrete) => owner.transformedSchema.getType(concrete.name) == null);
+}
+
+/**
+ * Prefer a target subgraph that defines at least one concrete implementer
+ * (so entity resolution can replace interface-object __typename).
+ */
+function findConcreteImplementerSubschema(
+  mergedTypeInfo: NonNullable<StitchingInfo['mergedTypes'][string]>,
+  source: Subschema,
+  returnType: GraphQLInterfaceType | GraphQLUnionType,
+  schema: GraphQLSchema,
+): Subschema | undefined {
+  const targets = mergedTypeInfo.targetSubschemas.get(source) ?? [];
+  const possibles = schema.getPossibleTypes(returnType);
+  return targets.find((t) =>
+    possibles.some((c) => t.transformedSchema.getType(c.name) != null),
+  );
+}
+
+function rootTypeOf(
+  schema: import('graphql').GraphQLSchema,
+  operation: OperationDefinitionNode['operation'],
+) {
+  return operation === 'mutation'
+    ? schema.getMutationType()
+    : operation === 'subscription'
+      ? schema.getSubscriptionType()
+      : schema.getQueryType();
+}
+
 function findOwningSubschemasForRootField(
   stitchingInfo: StitchingInfo,
   operation: OperationDefinitionNode['operation'],
@@ -84,13 +134,15 @@ function findOwningSubschemasForRootField(
 ): Subschema[] {
   const owners: Subschema[] = [];
   for (const subschema of stitchingInfo.subschemaMap.values()) {
-    const rootType =
-      operation === 'mutation'
-        ? subschema.transformedSchema.getMutationType()
-        : operation === 'subscription'
-          ? subschema.transformedSchema.getSubscriptionType()
-          : subschema.transformedSchema.getQueryType();
-    if (rootType?.getFields()[fieldName] != null) {
+    // Prefer transformedSchema, but fall back to the raw subgraph schema —
+    // stitching transforms sometimes drop Query fields on @interfaceObject
+    // graphs (e.g. anotherUsers) while the HTTP executor still serves them.
+    const transformedRoot = rootTypeOf(subschema.transformedSchema, operation);
+    const rawRoot = rootTypeOf(subschema.schema, operation);
+    if (
+      transformedRoot?.getFields()[fieldName] != null ||
+      rawRoot?.getFields()[fieldName] != null
+    ) {
       owners.push(subschema);
     }
   }
@@ -109,11 +161,66 @@ function fieldAvailableOnSubschema(
   if (providedFieldNames?.has(fieldName)) {
     return true;
   }
-  const type = subschema.transformedSchema.getType(typeName);
-  if (!type || !('getFields' in type)) {
+  for (const schema of [subschema.transformedSchema, subschema.schema]) {
+    const type = schema.getType(typeName);
+    if (type && 'getFields' in type) {
+      if ((type as GraphQLObjectType).getFields()[fieldName] != null) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * True when the field exists on the subschema AND any @requires deps are either
+ * already provided or also available on the same hop. Fields like
+ * `username @requires(fields: "name")` stay out of the root Fetch when `name`
+ * is external — they become a later entity stage after the dep is fetched.
+ */
+function fieldFetchableOnSubschema(
+  stitchingInfo: StitchingInfo,
+  subschema: Subschema,
+  typeName: string,
+  fieldName: string,
+  providedFieldNames?: ReadonlySet<string>,
+): boolean {
+  if (
+    !fieldAvailableOnSubschema(
+      subschema,
+      typeName,
+      fieldName,
+      providedFieldNames,
+    )
+  ) {
     return false;
   }
-  return (type as GraphQLObjectType).getFields()[fieldName] != null;
+  if (fieldName === '__typename') {
+    return true;
+  }
+  const deps = stitchingInfo.fieldNodesByField?.[typeName]?.[fieldName];
+  if (!deps?.length) {
+    return true;
+  }
+  for (const dep of deps) {
+    if (dep.name.value === fieldName) {
+      continue;
+    }
+    if (providedFieldNames?.has(dep.name.value)) {
+      continue;
+    }
+    if (
+      !fieldAvailableOnSubschema(
+        subschema,
+        typeName,
+        dep.name.value,
+        providedFieldNames,
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -152,21 +259,30 @@ function partitionSelectionsForSubschema(
   selectionSet: SelectionSetNode,
   fragments: Record<string, FragmentDefinitionNode>,
   providedFieldNames?: ReadonlySet<string>,
+  stitchingInfo?: StitchingInfo,
 ): { available: SelectionNode[]; unavailable: SelectionNode[] } {
   const available: SelectionNode[] = [];
   const unavailable: SelectionNode[] = [];
+  const fetchable = (fieldName: string) =>
+    stitchingInfo
+      ? fieldFetchableOnSubschema(
+          stitchingInfo,
+          subschema,
+          typeName,
+          fieldName,
+          providedFieldNames,
+        )
+      : fieldAvailableOnSubschema(
+          subschema,
+          typeName,
+          fieldName,
+          providedFieldNames,
+        );
 
   const visit = (selections: readonly SelectionNode[]) => {
     for (const selection of selections) {
       if (selection.kind === Kind.FIELD) {
-        if (
-          fieldAvailableOnSubschema(
-            subschema,
-            typeName,
-            selection.name.value,
-            providedFieldNames,
-          )
-        ) {
+        if (fetchable(selection.name.value)) {
           available.push(selection);
         } else {
           unavailable.push(selection);
@@ -185,6 +301,7 @@ function partitionSelectionsForSubschema(
             fragments,
             // provides apply at the parent field boundary, not nested types
             undefined,
+            stitchingInfo,
           );
           if (nested.available.length) {
             available.push({
@@ -213,6 +330,8 @@ function partitionSelectionsForSubschema(
           typeCondition,
           fragment.selectionSet,
           fragments,
+          undefined,
+          stitchingInfo,
         );
         if (nested.available.length) {
           available.push({
@@ -325,6 +444,153 @@ function selectionSetFromFieldNodes(
   return selectionSetOf(fieldNodes);
 }
 
+/**
+ * Merge-key selections (usually `{ id }`) required on the parent before an
+ * entity Fetch can build representations.
+ */
+function mergeKeySelectionsForType(
+  mergedTypeInfo: NonNullable<StitchingInfo['mergedTypes'][string]>,
+  owner: Subschema,
+  typeName: string,
+  alreadyCovered: ReadonlySet<string>,
+): SelectionNode[] {
+  const keys: SelectionNode[] = [];
+  const seen = new Set<string>();
+  const addFrom = (selectionSet: SelectionSetNode | undefined) => {
+    if (!selectionSet) {
+      return;
+    }
+    for (const sel of selectionSet.selections) {
+      if (sel.kind !== Kind.FIELD) {
+        continue;
+      }
+      const name = sel.name.value;
+      if (
+        name === '__typename' ||
+        alreadyCovered.has(name) ||
+        seen.has(name) ||
+        !fieldAvailableOnSubschema(owner, typeName, name)
+      ) {
+        continue;
+      }
+      seen.add(name);
+      keys.push(sel);
+    }
+  };
+  for (const selectionSet of mergedTypeInfo.selectionSets.values()) {
+    addFrom(selectionSet);
+  }
+  // Federation entities always key on `id` when present on the interface object.
+  if (
+    !alreadyCovered.has('id') &&
+    !seen.has('id') &&
+    fieldAvailableOnSubschema(owner, typeName, 'id')
+  ) {
+    keys.push({
+      kind: Kind.FIELD,
+      name: { kind: Kind.NAME, value: 'id' },
+    });
+  }
+  return keys;
+}
+
+/** Add selections (e.g. requires bridges) into every root Fetch of a plan node. */
+function injectSelectionsIntoRootFetches(
+  node: StitchPlanNode,
+  extra: readonly SelectionNode[],
+): StitchPlanNode {
+  if (node.kind === 'Fetch' && node.rootField) {
+    const selectionSet = selectionSetOf([
+      ...(node.rootField.selectionSet?.selections ?? []),
+      ...extra,
+    ]);
+    return {
+      ...node,
+      selectionSet,
+      rootField: { ...node.rootField, selectionSet },
+    };
+  }
+  if (node.kind === 'Parallel' || node.kind === 'Sequence') {
+    return {
+      ...node,
+      nodes: node.nodes.map((n) => injectSelectionsIntoRootFetches(n, extra)),
+    };
+  }
+  return node;
+}
+
+/**
+ * Collect client field nodes that apply to a concrete implementer of an
+ * interface/union: shared fields on the abstract type + fields from matching
+ * inline fragments / spreads.
+ */
+function collectFieldsForConcreteType(
+  abstractType: GraphQLInterfaceType | GraphQLUnionType,
+  concrete: GraphQLObjectType,
+  selectionSet: SelectionSetNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+  schema: GraphQLSchema,
+): FieldNode[] {
+  const fields: FieldNode[] = [];
+  const concreteFields = concrete.getFields();
+
+  const visit = (
+    selections: readonly SelectionNode[],
+    underConcreteFragment: boolean,
+  ) => {
+    for (const sel of selections) {
+      if (sel.kind === Kind.FIELD) {
+        if (sel.name.value === '__typename') {
+          fields.push(sel);
+          continue;
+        }
+        // Shared interface fields, or fields selected under a matching fragment
+        if (
+          underConcreteFragment ||
+          (isInterfaceType(abstractType) &&
+            abstractType.getFields()[sel.name.value] != null)
+        ) {
+          if (concreteFields[sel.name.value] != null || sel.name.value === '__typename') {
+            fields.push(sel);
+          }
+        }
+      } else if (sel.kind === Kind.INLINE_FRAGMENT) {
+        const cond = sel.typeCondition?.name.value;
+        if (!cond || cond === concrete.name || cond === abstractType.name) {
+          visit(
+            sel.selectionSet.selections,
+            cond === concrete.name || underConcreteFragment,
+          );
+        } else {
+          // Fragment on a sibling interface the concrete also implements
+          const t = schema.getType(cond);
+          if (
+            isInterfaceType(t) &&
+            concrete.getInterfaces().some((i) => i.name === cond)
+          ) {
+            visit(sel.selectionSet.selections, true);
+          }
+        }
+      } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
+        const fragment = fragments[sel.name.value];
+        if (!fragment) {
+          continue;
+        }
+        const cond = fragment.typeCondition.name.value;
+        if (cond === concrete.name || cond === abstractType.name) {
+          visit(
+            fragment.selectionSet.selections,
+            cond === concrete.name || underConcreteFragment,
+          );
+        }
+      }
+    }
+  };
+
+  visit(selectionSet.selections, false);
+  return fields;
+}
+
 function planMergedTypeFollowUps(
   schema: GraphQLSchema,
   stitchingInfo: StitchingInfo,
@@ -335,6 +601,8 @@ function planMergedTypeFollowUps(
   variableValues: Record<string, any>,
   flattenPath: Array<string | number>,
   incompleteReasons: string[],
+  /** Extra selections (e.g. `... on User { age }` for @interfaceObject). */
+  extraSelections: readonly SelectionNode[] = [],
 ): StitchPlanNode | null {
   const mergedTypeInfo = stitchingInfo.mergedTypes[typeName];
   if (!mergedTypeInfo?.delegationPlanBuilder) {
@@ -347,7 +615,7 @@ function planMergedTypeFollowUps(
   const planningParentField: FieldNode = {
     kind: Kind.FIELD,
     name: { kind: Kind.NAME, value: typeName },
-    selectionSet: selectionSetOf(fieldNodes),
+    selectionSet: selectionSetOf([...fieldNodes, ...extraSelections]),
   };
 
   const delegationMaps = mergedTypeInfo.delegationPlanBuilder(
@@ -614,6 +882,8 @@ function planRootField(
     available: SelectionNode[];
     unavailable: SelectionNode[];
     provided: Set<string>;
+    /** Scalar/enum root field — Fetch the field node as-is (no selection set). */
+    leafField?: boolean;
   };
   const partitions: OwnerPartition[] = owners.map((owner) => {
     const provided = getProvidedFieldNames(
@@ -622,7 +892,17 @@ function planRootField(
       fieldName,
       owner,
     );
-    if (!returnTypeName) {
+    // Scalars/enums (mutations like add → Int): the root field is the unit.
+    if (returnType != null && isLeafType(returnType)) {
+      return {
+        owner,
+        available: [],
+        unavailable: [],
+        provided,
+        leafField: true,
+      };
+    }
+    if (!returnTypeName || !fieldNode.selectionSet) {
       return {
         owner,
         available: fieldNode.selectionSet?.selections
@@ -630,6 +910,7 @@ function planRootField(
           : [],
         unavailable: [],
         provided,
+        leafField: !fieldNode.selectionSet,
       };
     }
     // Abstract return types: keep inline fragments / spreads and partition
@@ -640,13 +921,14 @@ function planRootField(
       for (const sel of fieldNode.selectionSet.selections) {
         if (sel.kind === Kind.FIELD) {
           if (
-            fieldAvailableOnSubschema(
+            sel.name.value === '__typename' ||
+            fieldFetchableOnSubschema(
+              stitchingInfo,
               owner,
               returnTypeName,
               sel.name.value,
               provided,
-            ) ||
-            sel.name.value === '__typename'
+            )
           ) {
             available.push(sel);
           } else {
@@ -654,17 +936,14 @@ function planRootField(
           }
         } else if (sel.kind === Kind.INLINE_FRAGMENT) {
           const cond = sel.typeCondition?.name.value ?? returnTypeName;
-          const concrete = schema.getType(cond);
-          if (
-            concrete &&
-            owner.transformedSchema.getType(cond) != null
-          ) {
+          if (owner.transformedSchema.getType(cond) != null) {
             const nested = partitionSelectionsForSubschema(
               owner,
               cond,
               sel.selectionSet,
               fragments,
               provided,
+              stitchingInfo,
             );
             if (nested.available.length) {
               available.push({
@@ -676,6 +955,39 @@ function planRootField(
               unavailable.push({
                 ...sel,
                 selectionSet: selectionSetOf(nested.unavailable),
+              });
+            }
+          } else if (owner.transformedSchema.getType(returnTypeName) != null) {
+            // @interfaceObject: concrete type (User/Admin) absent here, but the
+            // interface is present — fields the interface object owns (username,
+            // name) stay on this root Fetch; the rest go to entity follow-ups.
+            const nested = partitionSelectionsForSubschema(
+              owner,
+              returnTypeName,
+              sel.selectionSet,
+              fragments,
+              provided,
+              stitchingInfo,
+            );
+            for (const a of nested.available) {
+              available.push(a);
+            }
+            if (nested.unavailable.length) {
+              unavailable.push({
+                ...sel,
+                selectionSet: selectionSetOf(nested.unavailable),
+              });
+            } else if (nested.available.length) {
+              // Concrete fragment was only for interface-owned fields; still
+              // need a typename-discrimination marker for later hops.
+              unavailable.push({
+                ...sel,
+                selectionSet: selectionSetOf([
+                  {
+                    kind: Kind.FIELD,
+                    name: { kind: Kind.NAME, value: '__typename' },
+                  },
+                ]),
               });
             }
           } else {
@@ -694,6 +1006,8 @@ function planRootField(
               cond,
               fragment.selectionSet,
               fragments,
+              undefined,
+              stitchingInfo,
             );
             if (nested.available.length) {
               available.push({
@@ -717,9 +1031,65 @@ function planRootField(
                 selectionSet: selectionSetOf(nested.unavailable),
               });
             }
+          } else if (owner.transformedSchema.getType(returnTypeName) != null) {
+            const nested = partitionSelectionsForSubschema(
+              owner,
+              returnTypeName,
+              fragment.selectionSet,
+              fragments,
+              undefined,
+              stitchingInfo,
+            );
+            for (const a of nested.available) {
+              available.push(a);
+            }
+            if (nested.unavailable.length) {
+              unavailable.push({
+                kind: Kind.INLINE_FRAGMENT,
+                typeCondition: fragment.typeCondition,
+                directives: [
+                  ...(fragment.directives ?? []),
+                  ...(sel.directives ?? []),
+                ],
+                selectionSet: selectionSetOf(nested.unavailable),
+              });
+            } else if (nested.available.length) {
+              unavailable.push({
+                kind: Kind.INLINE_FRAGMENT,
+                typeCondition: fragment.typeCondition,
+                directives: [
+                  ...(fragment.directives ?? []),
+                  ...(sel.directives ?? []),
+                ],
+                selectionSet: selectionSetOf([
+                  {
+                    kind: Kind.FIELD,
+                    name: { kind: Kind.NAME, value: '__typename' },
+                  },
+                ]),
+              });
+            }
           } else {
             unavailable.push(sel);
           }
+        }
+      }
+      // Own the root even when only concrete fragments were requested: fetch
+      // interface __typename + merge keys so entity hops can run.
+      if (
+        available.length === 0 &&
+        unavailable.length > 0 &&
+        owner.transformedSchema.getType(returnTypeName) != null
+      ) {
+        available.push({
+          kind: Kind.FIELD,
+          name: { kind: Kind.NAME, value: '__typename' },
+        });
+        if (fieldAvailableOnSubschema(owner, returnTypeName, 'id')) {
+          available.push({
+            kind: Kind.FIELD,
+            name: { kind: Kind.NAME, value: 'id' },
+          });
         }
       }
       return { owner, available, unavailable, provided };
@@ -730,6 +1100,7 @@ function planRootField(
       selectionSetFromFieldNodes(withDeps),
       fragments,
       provided,
+      stitchingInfo,
     );
     return {
       owner,
@@ -741,28 +1112,37 @@ function planRootField(
 
   // Shared-root: several subgraphs each contribute distinct selections for the
   // same root field → Parallel root Fetches (results deep-merged at execute).
-  const contributing = partitions.filter((p) =>
-    p.available.some(
-      (sel) =>
-        sel.kind !== Kind.FIELD ||
-        (sel.name.value !== '__typename' &&
-          // ignore pure key-only selections when another owner has real fields;
-          // still keep owners that only expose keys if they are the sole owner
-          true),
-    ),
+  const contributing = partitions.filter(
+    (p) => p.leafField || p.available.length > 0,
   );
 
-  const meaningful = contributing.filter((p) =>
-    p.available.some(
-      (sel) => !(sel.kind === Kind.FIELD && sel.name.value === '__typename'),
-    ),
+  const meaningful = contributing.filter(
+    (p) =>
+      p.leafField ||
+      p.available.some(
+        (sel) => !(sel.kind === Kind.FIELD && sel.name.value === '__typename'),
+      ),
   );
-  const usedPartitions = meaningful.length ? meaningful : contributing;
+  let usedPartitions = meaningful.length ? meaningful : contributing;
 
   // Prefer owners that cover more of the client selection (override / provides).
   usedPartitions.sort((a, b) => b.available.length - a.available.length);
 
+  // Mutations must not fan out to every declared owner (addCategory on A+B would
+  // run twice). Keep the single best-covering subgraph.
+  if (operation.operation === 'mutation' && usedPartitions.length > 1) {
+    usedPartitions = [usedPartitions[0]!];
+  }
+
   const rootFetches: StitchPlanNode[] = usedPartitions.map((p) => {
+    if (p.leafField) {
+      return {
+        kind: 'Fetch' as const,
+        subschema: p.owner,
+        rootField: { ...fieldNode, selectionSet: undefined },
+        selectionSet: selectionSetOf([]),
+      };
+    }
     const selectionSet = ensureTypename(selectionSetOf(p.available));
     return {
       kind: 'Fetch' as const,
@@ -789,25 +1169,320 @@ function planRootField(
       ? rootFetches[0]!
       : { kind: 'Parallel', nodes: rootFetches };
 
-  // Entity follow-ups for object return types. Abstract roots stay as
-  // pass-through Fetches (inline fragments) until Cast/Flatten lands.
-  if (returnType && isAbstractType(returnType)) {
-    return rootNode;
-  }
-
+  // Fields already fetched on any root contribution (including those nested
+  // under inline fragments on abstract return types).
   const coveredNames = new Set<string>();
-  for (const p of usedPartitions) {
-    for (const sel of p.available) {
+  const collectCovered = (sels: readonly SelectionNode[]) => {
+    for (const sel of sels) {
       if (sel.kind === Kind.FIELD) {
         coveredNames.add(sel.name.value);
+      } else if (sel.kind === Kind.INLINE_FRAGMENT) {
+        collectCovered(sel.selectionSet.selections);
       }
     }
+  };
+  for (const p of usedPartitions) {
+    collectCovered(p.available);
   }
+
+  const primary = usedPartitions[0]!.owner;
+
+  // Interface/union returns:
+  // - @interfaceObject (NodeWithName): plan entity hops on the interface type
+  //   when it has targetSubschemas; concrete fields go as `... on User { age }`.
+  // - Product-style interfaces with empty targets: fan out per concrete type.
+  if (
+    returnType &&
+    isAbstractType(returnType) &&
+    fieldNode.selectionSet &&
+    (isInterfaceType(returnType) || isUnionType(returnType))
+  ) {
+    const absMerged = stitchingInfo.mergedTypes[returnType.name];
+    const interfaceHasTargets =
+      absMerged?.targetSubschemas != null &&
+      absMerged.targetSubschemas.size > 0;
+
+    if (interfaceHasTargets && isInterfaceType(returnType)) {
+      const interfaceFields: FieldNode[] = [];
+      const concreteFragments: SelectionNode[] = [];
+      let clientHasConcreteFragments = false;
+      for (const sel of fieldNode.selectionSet.selections) {
+        if (sel.kind === Kind.FIELD) {
+          if (
+            sel.name.value !== '__typename' &&
+            !coveredNames.has(sel.name.value)
+          ) {
+            interfaceFields.push(sel);
+          }
+        } else if (sel.kind === Kind.INLINE_FRAGMENT) {
+          const cond = sel.typeCondition?.name.value;
+          if (!cond) {
+            continue;
+          }
+          if (cond !== returnType.name) {
+            clientHasConcreteFragments = true;
+          }
+          const nested = flattenToFieldNodes(
+            sel.selectionSet.selections,
+            fragments,
+          ).filter(
+            (fn) =>
+              fn.name.value !== '__typename' &&
+              !coveredNames.has(fn.name.value),
+          );
+          if (!nested.length) {
+            // Still keep a typename probe so Cast can resolve Admin vs Regular
+            // when the interface-object root already covered every field.
+            if (cond !== returnType.name) {
+              concreteFragments.push({
+                ...sel,
+                selectionSet: selectionSetOf([
+                  {
+                    kind: Kind.FIELD,
+                    name: { kind: Kind.NAME, value: '__typename' },
+                  },
+                ]),
+              });
+            }
+            continue;
+          }
+          if (cond === returnType.name) {
+            interfaceFields.push(...nested);
+          } else {
+            concreteFragments.push({
+              ...sel,
+              selectionSet: selectionSetOf(nested),
+            });
+          }
+        } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
+          const fragment = fragments[sel.name.value];
+          if (!fragment) {
+            continue;
+          }
+          const cond = fragment.typeCondition.name.value;
+          if (cond !== returnType.name) {
+            clientHasConcreteFragments = true;
+          }
+          const nested = flattenToFieldNodes(
+            fragment.selectionSet.selections,
+            fragments,
+          ).filter(
+            (fn) =>
+              fn.name.value !== '__typename' &&
+              !coveredNames.has(fn.name.value),
+          );
+          if (!nested.length) {
+            if (cond !== returnType.name) {
+              concreteFragments.push({
+                kind: Kind.INLINE_FRAGMENT,
+                typeCondition: fragment.typeCondition,
+                selectionSet: selectionSetOf([
+                  {
+                    kind: Kind.FIELD,
+                    name: { kind: Kind.NAME, value: '__typename' },
+                  },
+                ]),
+              });
+            }
+            continue;
+          }
+          if (cond === returnType.name) {
+            interfaceFields.push(...nested);
+          } else {
+            concreteFragments.push({
+              kind: Kind.INLINE_FRAGMENT,
+              typeCondition: fragment.typeCondition,
+              selectionSet: selectionSetOf(nested),
+            });
+          }
+        }
+      }
+
+      // Expand requires bridges for interface fields onto the root Fetch.
+      const bridgeFragments: SelectionNode[] = [];
+      if (interfaceFields.length) {
+        const withDeps = expandFieldDependencies(
+          stitchingInfo,
+          returnType.name,
+          interfaceFields,
+        );
+        const bridge = withDeps.filter(
+          (fn) =>
+            !coveredNames.has(fn.name.value) &&
+            !interfaceFields.some((m) => m.name.value === fn.name.value) &&
+            fieldAvailableOnSubschema(primary, returnType.name, fn.name.value),
+        );
+        for (const b of bridge) {
+          coveredNames.add(b.name.value);
+          bridgeFragments.push(b);
+        }
+      }
+
+      let rooted = rootNode;
+      if (bridgeFragments.length) {
+        rooted = injectSelectionsIntoRootFetches(rootNode, bridgeFragments);
+      }
+
+      let child = planMergedTypeFollowUps(
+        schema,
+        stitchingInfo,
+        returnType.name,
+        primary,
+        interfaceFields,
+        fragments,
+        variableValues,
+        [responseKey],
+        incompleteReasons,
+        concreteFragments,
+      );
+
+      // Interface-object roots often already own every selected field; still hop
+      // to a concrete-implementer subgraph so `... on Admin` can discriminate.
+      if (
+        !child &&
+        clientHasConcreteFragments &&
+        isInterfaceObjectOwner(primary, returnType, schema)
+      ) {
+        const concreteOwner = findConcreteImplementerSubschema(
+          absMerged,
+          primary,
+          returnType,
+          schema,
+        );
+        if (concreteOwner) {
+          child = {
+            kind: 'Fetch',
+            subschema: concreteOwner,
+            entityTypeName: returnType.name,
+            selectionSet: ensureTypename(selectionSetOf([])),
+            flattenPath: [responseKey],
+          };
+        }
+      }
+
+      // Also resolve concrete __typename when the client explicitly asks for it
+      // on an interface-object (Account.__typename → Admin/Regular via subgraph A).
+      const clientRequestsTypename = fieldNode.selectionSet.selections.some(
+        (sel) => sel.kind === Kind.FIELD && sel.name.value === '__typename',
+      );
+      if (
+        !child &&
+        clientRequestsTypename &&
+        isInterfaceObjectOwner(primary, returnType, schema)
+      ) {
+        const concreteOwner = findConcreteImplementerSubschema(
+          absMerged,
+          primary,
+          returnType,
+          schema,
+        );
+        if (concreteOwner) {
+          child = {
+            kind: 'Fetch',
+            subschema: concreteOwner,
+            entityTypeName: returnType.name,
+            selectionSet: ensureTypename(selectionSetOf([])),
+            flattenPath: [responseKey],
+          };
+        }
+      }
+
+      if (child) {
+        const keySels = mergeKeySelectionsForType(
+          absMerged!,
+          primary,
+          returnType.name,
+          coveredNames,
+        );
+        const withKeys = keySels.length
+          ? injectSelectionsIntoRootFetches(rooted, keySels)
+          : rooted;
+        return { kind: 'Sequence', nodes: [withKeys, child] };
+      }
+      return rooted;
+    }
+
+    const concreteFollowUps: StitchPlanNode[] = [];
+    const bridgeFragments: SelectionNode[] = [];
+    for (const concrete of schema.getPossibleTypes(returnType)) {
+      if (!stitchingInfo.mergedTypes[concrete.name]) {
+        continue;
+      }
+      const forConcrete = collectFieldsForConcreteType(
+        returnType,
+        concrete,
+        fieldNode.selectionSet,
+        fragments,
+        schema,
+      );
+      const missing = forConcrete.filter(
+        (fn) =>
+          fn.name.value !== '__typename' && !coveredNames.has(fn.name.value),
+      );
+      if (!missing.length) {
+        continue;
+      }
+      const withDeps = expandFieldDependencies(
+        stitchingInfo,
+        concrete.name,
+        missing,
+      );
+      const bridge = withDeps.filter(
+        (fn) =>
+          fn.name.value !== '__typename' &&
+          !coveredNames.has(fn.name.value) &&
+          !missing.some((m) => m.name.value === fn.name.value) &&
+          fieldAvailableOnSubschema(primary, concrete.name, fn.name.value),
+      );
+      if (bridge.length) {
+        bridgeFragments.push({
+          kind: Kind.INLINE_FRAGMENT,
+          typeCondition: {
+            kind: Kind.NAMED_TYPE,
+            name: { kind: Kind.NAME, value: concrete.name },
+          },
+          selectionSet: selectionSetOf(bridge),
+        });
+        for (const b of bridge) {
+          coveredNames.add(b.name.value);
+        }
+      }
+      const child = planMergedTypeFollowUps(
+        schema,
+        stitchingInfo,
+        concrete.name,
+        primary,
+        missing,
+        fragments,
+        variableValues,
+        [responseKey],
+        incompleteReasons,
+      );
+      if (child) {
+        concreteFollowUps.push(child);
+      }
+    }
+
+    let rooted = rootNode;
+    if (bridgeFragments.length) {
+      rooted = injectSelectionsIntoRootFetches(rootNode, bridgeFragments);
+    }
+
+    if (concreteFollowUps.length === 1) {
+      return { kind: 'Sequence', nodes: [rooted, concreteFollowUps[0]!] };
+    }
+    if (concreteFollowUps.length > 1) {
+      return {
+        kind: 'Sequence',
+        nodes: [rooted, { kind: 'Parallel', nodes: concreteFollowUps }],
+      };
+    }
+    return rooted;
+  }
+
   const followUpFieldNodes = requested.filter(
     (fn) => !coveredNames.has(fn.name.value),
   );
-
-  const primary = usedPartitions[0]!.owner;
 
   if (
     returnTypeName &&
@@ -973,10 +1648,16 @@ function buildCompletePlan(
     incompleteReasons.push('Empty operation plan');
   }
 
+  // Mutations often share subgraph state (requestId counters); root fields must
+  // run in document order. Queries/subscriptions can fan out in Parallel.
   const root: StitchPlanNode =
     rootNodes.length === 1
       ? rootNodes[0]!
-      : { kind: 'Parallel', nodes: rootNodes };
+      : {
+          kind:
+            operation.operation === 'mutation' ? 'Sequence' : 'Parallel',
+          nodes: rootNodes,
+        };
 
   return {
     operation,
