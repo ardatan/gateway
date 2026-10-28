@@ -39,7 +39,6 @@
   },
   "dependencies": {
     "@graphql-tools/batch-delegate": "workspace:^",
-    "@graphql-tools/batch-execute": "workspace:^",
     "@graphql-tools/delegate": "workspace:^",
     "@graphql-tools/executor": "^2.0.1",
     "@graphql-tools/merge": "^9.2.4",
