@@ -493,7 +493,6 @@ export const handleFederationSupergraph = function ({
   const localFields = collectLocalFieldsFromResolvers(additionalResolvers);
   const executor = createBackboneExecutor(executableUnifiedGraph, {
     localFields,
-    hasDelegationPlanHooks: Boolean(onDelegationPlanHooks?.length),
   });
 
   return {
