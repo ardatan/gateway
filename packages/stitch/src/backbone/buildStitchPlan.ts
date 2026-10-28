@@ -1486,6 +1486,14 @@ function planMergedTypeFollowUps(
     }
   }
 
+  // Avoid planning the same nested entity path twice — once from a delegation
+  // map selection (deep reviews tree) and again from the original fieldNodes.
+  const plannedNestedKeys = new Set<string>();
+  const nestedKey = (
+    hopType: string,
+    path: Array<string | number>,
+  ): string => `${hopType}::${path.join('\0')}`;
+
   const appendNestedForFields = (
     fields: readonly FieldNode[],
     /**
@@ -1539,6 +1547,10 @@ function planMergedTypeFollowUps(
           if (!stitchingInfo.mergedTypes[concrete.name]) {
             continue;
           }
+          const key = nestedKey(concrete.name, childPath);
+          if (plannedNestedKeys.has(key)) {
+            continue;
+          }
           const forConcrete = collectFieldsForConcreteType(
             namedReturn,
             concrete,
@@ -1567,6 +1579,7 @@ function planMergedTypeFollowUps(
             }
           }
           if (childPlan) {
+            plannedNestedKeys.add(key);
             nestedFollowUps.push(childPlan);
           }
         }
@@ -1580,6 +1593,10 @@ function planMergedTypeFollowUps(
 
       const childTypeName = namedReturn.name;
       if (!stitchingInfo.mergedTypes[childTypeName]) {
+        continue;
+      }
+      const key = nestedKey(childTypeName, childPath);
+      if (plannedNestedKeys.has(key)) {
         continue;
       }
       const nestedFieldNodes = flattenToFieldNodes(
@@ -1604,6 +1621,7 @@ function planMergedTypeFollowUps(
         }
       }
       if (childPlan) {
+        plannedNestedKeys.add(key);
         stages.push(childPlan);
       }
     }
@@ -3012,6 +3030,127 @@ export function buildStitchPlan(
   );
 }
 
+/** Stable identity for coalescing sibling/adjacent Fetches. */
+function coalesceFetchKey(
+  node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): string | null {
+  const sub = node.subschema.name ?? '';
+  if (node.entityTypeName && node.flattenPath) {
+    return `e:${sub}:${node.entityTypeName}:${node.flattenPath.join('\0')}`;
+  }
+  if (node.rootField) {
+    const rk = node.rootField.alias?.value ?? node.rootField.name.value;
+    return `r:${sub}:${rk}`;
+  }
+  return null;
+}
+
+function selectionIdentity(sel: SelectionNode): string {
+  if (sel.kind === Kind.FIELD) {
+    const args = sel.arguments?.length
+      ? JSON.stringify(sel.arguments.map((a) => [a.name.value, a.value]))
+      : '';
+    return `f:${sel.alias?.value ?? ''}:${sel.name.value}:${args}`;
+  }
+  if (sel.kind === Kind.INLINE_FRAGMENT) {
+    return `i:${sel.typeCondition?.name.value ?? ''}`;
+  }
+  if (sel.kind === Kind.FRAGMENT_SPREAD) {
+    return `s:${sel.name.value}`;
+  }
+  return '?';
+}
+
+/**
+ * Plan cleanup:
+ * - Flatten nested Sequence/Parallel of the same kind (except Parallel root
+ *   fan-outs that must keep sameKey isolation)
+ * - Drop exact-duplicate Fetches left by double nested planning
+ */
+function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? { ...node, continue: optimizeStitchPlanNode(node.continue) }
+      : node;
+  }
+  if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
+    return node;
+  }
+
+  const kind = node.kind;
+  const hasRootFetch = (n: StitchPlanNode): boolean => {
+    if (n.kind === 'Fetch') {
+      return Boolean(n.rootField);
+    }
+    if (n.kind === 'Parallel' || n.kind === 'Sequence') {
+      return n.nodes.some(hasRootFetch);
+    }
+    if (n.kind === 'Island') {
+      return true;
+    }
+    return false;
+  };
+  const flat: StitchPlanNode[] = [];
+  for (const child of node.nodes.map(optimizeStitchPlanNode)) {
+    // Do not flatten Parallel groups that contain root Fetches — shared-root
+    // sameKey isolation (account vs chat) requires each alias's fan-out to stay
+    // in its own Parallel unit.
+    if (
+      child.kind === kind &&
+      !(kind === 'Parallel' && hasRootFetch(child))
+    ) {
+      flat.push(...child.nodes);
+    } else {
+      flat.push(child);
+    }
+  }
+
+  // Drop exact-duplicate Fetches only. Merging different field sets at the same
+  // path breaks @requires-with-argument-conflict (separate hops need distinct
+  // representation keys for USD vs EUR price).
+  const selKey = (ss: SelectionSetNode) =>
+    ss.selections.map(selectionIdentity).join(',');
+  const coalesced: StitchPlanNode[] = [];
+  if (kind === 'Parallel') {
+    const seen = new Set<string>();
+    for (const child of flat) {
+      if (child.kind === 'Fetch') {
+        const key = coalesceFetchKey(child);
+        if (key) {
+          const full = `${key}::${selKey(child.selectionSet)}`;
+          if (seen.has(full)) {
+            continue;
+          }
+          seen.add(full);
+        }
+      }
+      coalesced.push(child);
+    }
+  } else {
+    for (const child of flat) {
+      const prev = coalesced[coalesced.length - 1];
+      if (child.kind === 'Fetch' && prev?.kind === 'Fetch') {
+        const a = coalesceFetchKey(prev);
+        const b = coalesceFetchKey(child);
+        if (
+          a &&
+          b &&
+          a === b &&
+          selKey(prev.selectionSet) === selKey(child.selectionSet)
+        ) {
+          continue;
+        }
+      }
+      coalesced.push(child);
+    }
+  }
+
+  if (coalesced.length === 1) {
+    return coalesced[0]!;
+  }
+  return { kind, nodes: coalesced };
+}
+
 function buildCompletePlan(
   schema: GraphQLSchema,
   stitchingInfo: StitchingInfo,
@@ -3063,7 +3202,7 @@ function buildCompletePlan(
 
   // Mutations often share subgraph state (requestId counters); root fields must
   // run in document order. Queries/subscriptions can fan out in Parallel.
-  const root: StitchPlanNode =
+  const rootRaw: StitchPlanNode =
     rootNodes.length === 1
       ? rootNodes[0]!
       : {
@@ -3075,7 +3214,7 @@ function buildCompletePlan(
   return {
     operation,
     fragments,
-    root,
+    root: optimizeStitchPlanNode(rootRaw),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
   };
