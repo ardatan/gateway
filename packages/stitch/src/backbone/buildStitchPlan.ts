@@ -282,18 +282,104 @@ function partitionSelectionsForSubschema(
   const visit = (selections: readonly SelectionNode[]) => {
     for (const selection of selections) {
       if (selection.kind === Kind.FIELD) {
-        if (fetchable(selection.name.value)) {
-          available.push(selection);
-        } else {
+        if (!fetchable(selection.name.value)) {
           unavailable.push(selection);
+          continue;
+        }
+        if (!selection.selectionSet) {
+          available.push(selection);
+          continue;
+        }
+        // Recurse into nested selections so union/interface fragments for
+        // types absent from this subgraph are stripped (Movie on graph A).
+        const parentGqlType =
+          subschema.transformedSchema.getType(typeName) ??
+          subschema.schema.getType(typeName);
+        const fieldType =
+          parentGqlType && 'getFields' in parentGqlType
+            ? (parentGqlType as GraphQLObjectType)
+            : undefined;
+        const nestedReturn = fieldType?.getFields()?.[selection.name.value]
+          ? getNamedType(
+              fieldType.getFields()[selection.name.value]!.type,
+            )
+          : undefined;
+        const nestedTypeName = nestedReturn?.name ?? typeName;
+        // @provides on this field (e.g. products.categories → name) apply to
+        // the nested type's partition, not the parent type's.
+        const nestedProvided =
+          stitchingInfo != null
+            ? getProvidedFieldNames(
+                stitchingInfo,
+                typeName,
+                selection.name.value,
+                subschema,
+              )
+            : undefined;
+        const nested = partitionSelectionsForSubschema(
+          subschema,
+          nestedTypeName,
+          selection.selectionSet,
+          fragments,
+          nestedProvided?.size ? nestedProvided : undefined,
+          stitchingInfo,
+        );
+        if (nested.available.length) {
+          available.push({
+            ...selection,
+            selectionSet: selectionSetOf(nested.available),
+          });
+        } else if (nested.unavailable.length) {
+          // Field exists here but no nested selection applies (e.g. aMedia
+          // with only `... on Movie` on graph A) — keep a stub so the key
+          // still appears as {} in the response.
+          available.push({
+            ...selection,
+            selectionSet: selectionSetOf([
+              {
+                kind: Kind.FIELD,
+                name: { kind: Kind.NAME, value: '__typename' },
+              },
+            ]),
+          });
         }
       } else if (selection.kind === Kind.INLINE_FRAGMENT) {
         const typeCondition =
           selection.typeCondition?.name.value ?? typeName;
+        // Must check the type exists on this subgraph — __typename is always
+        // "available" and must not be used as a proxy for type presence.
+        const condType =
+          subschema.transformedSchema.getType(typeCondition) ??
+          subschema.schema.getType(typeCondition);
+        const parentType =
+          subschema.transformedSchema.getType(typeName) ??
+          subschema.schema.getType(typeName);
+        let typeOnSubschema =
+          typeCondition === typeName || condType != null;
+        // Object parents cannot host fragments on a different object type
+        // (book: Book cannot take `... on Song`).
         if (
-          typeCondition === typeName ||
-          fieldAvailableOnSubschema(subschema, typeCondition, '__typename')
+          typeOnSubschema &&
+          isObjectType(parentType) &&
+          typeCondition !== typeName
         ) {
+          if (isObjectType(condType) && condType.name !== parentType.name) {
+            typeOnSubschema = false;
+          } else if (
+            isInterfaceType(condType) &&
+            !parentType
+              .getInterfaces()
+              .some((i) => i.name === condType.name)
+          ) {
+            typeOnSubschema = false;
+          } else if (
+            isUnionType(condType) &&
+            !condType.getTypes().some((t) => t.name === parentType.name)
+          ) {
+            typeOnSubschema = false;
+          }
+        }
+        if (typeOnSubschema) {
           const nested = partitionSelectionsForSubschema(
             subschema,
             typeCondition,
@@ -987,9 +1073,12 @@ function planRootField(
       const unavailable: SelectionNode[] = [];
       for (const sel of fieldNode.selectionSet.selections) {
         if (sel.kind === Kind.FIELD) {
+          if (sel.name.value === '__typename') {
+            available.push(sel);
+            continue;
+          }
           if (
-            sel.name.value === '__typename' ||
-            fieldFetchableOnSubschema(
+            !fieldFetchableOnSubschema(
               stitchingInfo,
               owner,
               returnTypeName,
@@ -997,9 +1086,58 @@ function planRootField(
               provided,
             )
           ) {
-            available.push(sel);
-          } else {
             unavailable.push(sel);
+            continue;
+          }
+          if (!sel.selectionSet) {
+            available.push(sel);
+            continue;
+          }
+          // Same recursive strip as partitionSelectionsForSubschema — do not
+          // keep nested `... on Cat { age }` when age is foreign to this graph.
+          const nestedProvided = getProvidedFieldNames(
+            stitchingInfo,
+            returnTypeName,
+            sel.name.value,
+            owner,
+          );
+          const fieldDef = (
+            owner.transformedSchema.getType(returnTypeName) ??
+            owner.schema.getType(returnTypeName)
+          ) as GraphQLObjectType | undefined;
+          const nestedReturn = fieldDef?.getFields()?.[sel.name.value]
+            ? getNamedType(fieldDef.getFields()[sel.name.value]!.type)
+            : undefined;
+          const nested = partitionSelectionsForSubschema(
+            owner,
+            nestedReturn?.name ?? returnTypeName,
+            sel.selectionSet,
+            fragments,
+            nestedProvided.size ? nestedProvided : provided,
+            stitchingInfo,
+          );
+          if (nested.available.length) {
+            available.push({
+              ...sel,
+              // __typename enables later Cat/Dog Cast filtering on list items.
+              selectionSet: ensureTypename(selectionSetOf(nested.available)),
+            });
+          } else if (nested.unavailable.length) {
+            available.push({
+              ...sel,
+              selectionSet: selectionSetOf([
+                {
+                  kind: Kind.FIELD,
+                  name: { kind: Kind.NAME, value: '__typename' },
+                },
+              ]),
+            });
+          }
+          if (nested.unavailable.length && nested.available.length) {
+            unavailable.push({
+              ...sel,
+              selectionSet: selectionSetOf(nested.unavailable),
+            });
           }
         } else if (sel.kind === Kind.INLINE_FRAGMENT) {
           const cond = sel.typeCondition?.name.value ?? returnTypeName;
@@ -1254,6 +1392,86 @@ function planRootField(
 
   const primary = usedPartitions[0]!.owner;
 
+  // Partial root fields (animals { id name } fetched, but `... on Cat { age }`
+  // still unavailable): plan nested entity hops for the unavailable remainder
+  // without re-fetching the already-covered field.
+  const partialUnavailableFollowUps: StitchPlanNode[] = [];
+  if (returnType && fieldNode.selectionSet) {
+    for (const p of usedPartitions) {
+      const availNames = new Set(
+        p.available
+          .filter((s) => s.kind === Kind.FIELD)
+          .map((s) => (s as FieldNode).name.value),
+      );
+      for (const sel of p.unavailable ?? []) {
+        if (sel.kind !== Kind.FIELD || !sel.selectionSet) {
+          continue;
+        }
+        if (!availNames.has(sel.name.value)) {
+          continue;
+        }
+        const parentFields =
+          isObjectType(returnType) || isInterfaceType(returnType)
+            ? returnType.getFields()
+            : undefined;
+        const field = parentFields?.[sel.name.value];
+        if (!field) {
+          continue;
+        }
+        const namedReturn = getNamedType(field.type);
+        if (!isAbstractType(namedReturn) && !isObjectType(namedReturn)) {
+          continue;
+        }
+        const responseKey = sel.alias?.value ?? sel.name.value;
+        if (isAbstractType(namedReturn)) {
+          for (const concrete of schema.getPossibleTypes(namedReturn)) {
+            if (!stitchingInfo.mergedTypes[concrete.name]) {
+              continue;
+            }
+            const forConcrete = collectFieldsForConcreteType(
+              namedReturn,
+              concrete,
+              sel.selectionSet,
+              fragments,
+              schema,
+            );
+            if (!forConcrete.length) {
+              continue;
+            }
+            const child = planMergedTypeFollowUps(
+              schema,
+              stitchingInfo,
+              concrete.name,
+              p.owner,
+              forConcrete,
+              fragments,
+              variableValues,
+              [
+                fieldNode.alias?.value ?? fieldNode.name.value,
+                responseKey,
+              ],
+              incompleteReasons,
+            );
+            if (child) {
+              partialUnavailableFollowUps.push(child);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const withPartialFollowUps = (node: StitchPlanNode): StitchPlanNode => {
+    if (!partialUnavailableFollowUps.length) {
+      return node;
+    }
+    const extra =
+      partialUnavailableFollowUps.length === 1
+        ? partialUnavailableFollowUps[0]!
+        : { kind: 'Parallel' as const, nodes: partialUnavailableFollowUps };
+    return { kind: 'Sequence', nodes: [node, extra] };
+  };
+
   // Interface/union returns:
   // - @interfaceObject (NodeWithName): plan entity hops on the interface type
   //   when it has targetSubschemas; concrete fields go as `... on User { age }`.
@@ -1464,9 +1682,12 @@ function planRootField(
         const withKeys = keySels.length
           ? injectSelectionsIntoRootFetches(rooted, keySels)
           : rooted;
-        return { kind: 'Sequence', nodes: [withKeys, child] };
+        return withPartialFollowUps({
+          kind: 'Sequence',
+          nodes: [withKeys, child],
+        });
       }
-      return rooted;
+      return withPartialFollowUps(rooted);
     }
 
     const concreteFollowUps: StitchPlanNode[] = [];
@@ -1535,15 +1756,18 @@ function planRootField(
     }
 
     if (concreteFollowUps.length === 1) {
-      return { kind: 'Sequence', nodes: [rooted, concreteFollowUps[0]!] };
+      return withPartialFollowUps({
+        kind: 'Sequence',
+        nodes: [rooted, concreteFollowUps[0]!],
+      });
     }
     if (concreteFollowUps.length > 1) {
-      return {
+      return withPartialFollowUps({
         kind: 'Sequence',
         nodes: [rooted, { kind: 'Parallel', nodes: concreteFollowUps }],
-      };
+      });
     }
-    return rooted;
+    return withPartialFollowUps(rooted);
   }
 
   const followUpFieldNodes = requested.filter(
@@ -1567,11 +1791,14 @@ function planRootField(
       incompleteReasons,
     );
     if (followUp) {
-      return { kind: 'Sequence', nodes: [rootNode, followUp] };
+      return withPartialFollowUps({
+        kind: 'Sequence',
+        nodes: [rootNode, followUp],
+      });
     }
   }
 
-  return rootNode;
+  return withPartialFollowUps(rootNode);
 }
 
 export function buildStitchPlan(

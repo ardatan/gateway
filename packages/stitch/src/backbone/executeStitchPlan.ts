@@ -26,12 +26,15 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   FieldNode,
+  getNamedType,
   GraphQLSchema,
   isInterfaceType,
+  isNullableType,
   isObjectType,
   Kind,
   OperationTypeNode,
   SelectionNode,
+  SelectionSetNode,
   VariableDefinitionNode,
   visit,
 } from 'graphql';
@@ -180,14 +183,122 @@ function filterVariableDefinitions(
   return filtered.length ? filtered : undefined;
 }
 
+/**
+ * When sibling inline fragments select the same field with conflicting
+ * nullability (User.id: ID! vs Admin.id: ID), rewrite with `_nullable_` /
+ * `_nonNullable_` aliases — same as finalizeGatewayRequest.
+ */
+function rewriteNullabilityConflicts(
+  selectionSet: SelectionSetNode,
+  schema: GraphQLSchema,
+): SelectionSetNode {
+  const seenNonNullable = new Set<string>();
+  const seenNullable = new Set<string>();
+  const selections = selectionSet.selections.map((sel) => {
+    if (sel.kind !== Kind.INLINE_FRAGMENT || !sel.typeCondition) {
+      if (sel.kind === Kind.FIELD && sel.selectionSet) {
+        return {
+          ...sel,
+          selectionSet: rewriteNullabilityConflicts(sel.selectionSet, schema),
+        };
+      }
+      return sel;
+    }
+    const type = schema.getType(sel.typeCondition.name.value);
+    if (!type || !('getFields' in type) || !sel.selectionSet) {
+      return sel;
+    }
+    const fields = (type as import('graphql').GraphQLObjectType).getFields();
+    const nextSels = sel.selectionSet.selections.map((sub) => {
+      if (sub.kind !== Kind.FIELD || sub.alias) {
+        if (sub.kind === Kind.FIELD && sub.selectionSet) {
+          return {
+            ...sub,
+            selectionSet: rewriteNullabilityConflicts(sub.selectionSet, schema),
+          };
+        }
+        return sub;
+      }
+      const field = fields[sub.name.value];
+      if (!field) {
+        return sub;
+      }
+      const nullable = isNullableType(field.type);
+      if (nullable) {
+        seenNullable.add(sub.name.value);
+      } else {
+        seenNonNullable.add(sub.name.value);
+      }
+      if (
+        seenNullable.has(sub.name.value) &&
+        seenNonNullable.has(sub.name.value)
+      ) {
+        return {
+          ...sub,
+          alias: {
+            kind: Kind.NAME as const,
+            value: nullable
+              ? `_nullable_${sub.name.value}`
+              : `_nonNullable_${sub.name.value}`,
+          },
+          selectionSet: sub.selectionSet
+            ? rewriteNullabilityConflicts(sub.selectionSet, schema)
+            : undefined,
+        };
+      }
+      return sub.selectionSet
+        ? {
+            ...sub,
+            selectionSet: rewriteNullabilityConflicts(sub.selectionSet, schema),
+          }
+        : sub;
+    });
+    return {
+      ...sel,
+      selectionSet: { ...sel.selectionSet, selections: nextSels },
+    };
+  });
+  return { ...selectionSet, selections };
+}
+
+/** Map `_nullable_id` / `_nonNullable_id` response keys back to `id`. */
+function unwrapNullabilityAliases(value: any): any {
+  if (value == null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(unwrapNullabilityAliases);
+  }
+  const out: Record<string, any> = {};
+  for (const [key, v] of Object.entries(value)) {
+    const unwrapped = key.startsWith('_nullable_')
+      ? key.slice('_nullable_'.length)
+      : key.startsWith('_nonNullable_')
+        ? key.slice('_nonNullable_'.length)
+        : key;
+    out[unwrapped] = unwrapNullabilityAliases(v);
+  }
+  return out;
+}
+
 function buildRootDocument(
   operationName: string | undefined,
   operationType: OperationTypeNode,
   fieldNode: FieldNode,
   variableDefinitions: StitchPlan['operation']['variableDefinitions'],
   variableValues: Record<string, any>,
+  targetSchema?: GraphQLSchema,
 ) {
-  const cleaned = stripSkipInclude(fieldNode) as FieldNode;
+  let cleaned = stripSkipInclude(fieldNode) as FieldNode;
+  if (targetSchema && cleaned.selectionSet) {
+    cleaned = {
+      ...cleaned,
+      selectionSet: rewriteNullabilityConflicts(
+        cleaned.selectionSet,
+        targetSchema,
+      ),
+    };
+  }
   const usedVars = collectUsedVariableNames(cleaned);
   const filteredDefs = filterVariableDefinitions(variableDefinitions, usedVars);
   const filteredVars: Record<string, any> = {};
@@ -266,6 +377,7 @@ function executeFetchNode(
       node.rootField,
       ctx.operation.variableDefinitions,
       ctx.variableValues,
+      node.subschema.schema,
     );
     const responseKey =
       node.rootField.alias?.value ?? node.rootField.name.value;
@@ -287,7 +399,7 @@ function executeFetchNode(
         }
         if (result.data && responseKey in result.data) {
           const annotated = annotateValue(
-            result.data[responseKey],
+            unwrapNullabilityAliases(result.data[responseKey]),
             result.errors ?? [],
             node.subschema,
           );
@@ -327,8 +439,13 @@ function executeFetchNode(
     if (p == null) {
       return false;
     }
-    if (p.__typename == null || p.__typename === node.entityTypeName) {
+    if (p.__typename === node.entityTypeName) {
       return true;
+    }
+    // Typeless parents: only valid for @interfaceObject interface hops.
+    // Concrete Cast (Cat vs Dog) must not claim every typeless list item.
+    if (p.__typename == null) {
+      return isInterfaceType(entityType);
     }
     if (!isInterfaceType(entityType)) {
       return false;
@@ -566,15 +683,21 @@ function executePlanNode(
         const responseKey =
           rootFetches[0]!.rootField!.alias?.value ??
           rootFetches[0]!.rootField!.name.value;
+        // Isolate per-fetch errors: provides / union intersection often hit a
+        // subgraph that intentionally errors while another returns the data.
         const jobs = rootFetches.map((child) => {
+          const childErrors: any[] = [];
           const childCtx: BackboneExecutionContext = {
             ...ctx,
             data: {},
-            errors: ctx.errors,
+            errors: childErrors,
           };
           return handleMaybePromise(
             () => executeFetchNode(child, childCtx),
-            () => childCtx.data[responseKey],
+            () => ({
+              data: childCtx.data[responseKey],
+              errors: childErrors,
+            }),
           );
         });
         return handleMaybePromise(
@@ -582,13 +705,23 @@ function executePlanNode(
             Promise.all(
               jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j))),
             ),
-          (parts: any[]) => {
+          (parts: Array<{ data: any; errors: any[] }>) => {
             let merged: any = undefined;
+            let anyData = false;
             for (const part of parts) {
-              merged = mergeRootValues(merged, part);
+              if (part.data !== undefined) {
+                anyData = true;
+                merged = mergeRootValues(merged, part.data);
+              }
             }
             if (merged !== undefined) {
               ctx.data[responseKey] = merged;
+            }
+            // Promote sibling errors only when every fetch failed to return data.
+            if (!anyData) {
+              for (const part of parts) {
+                ctx.errors.push(...part.errors);
+              }
             }
           },
         );
