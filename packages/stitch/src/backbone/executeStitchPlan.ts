@@ -29,11 +29,9 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   FieldNode,
-  getNamedType,
   GraphQLList,
   GraphQLOutputType,
   GraphQLSchema,
-  isAbstractType,
   isInterfaceType,
   isNullableType,
   isObjectType,
@@ -259,70 +257,9 @@ function resolveMergedTypename(
 }
 
 /**
- * In-place merge of entity hop fields into an existing parent. Only walks
- * keys from `source` (unlike mergeDeep over the full parent tree). Nested
- * objects keep prior-hop siblings; fresh subgraph payloads are annotated.
- */
-function mergeInto(
-  target: any,
-  source: any,
-  schema: GraphQLSchema,
-  subschema: Subschema,
-): any {
-  if (source === undefined) {
-    return target;
-  }
-  if (source == null || typeof source !== 'object') {
-    return source;
-  }
-  if (Array.isArray(source)) {
-    if (Array.isArray(target) && target.length === source.length) {
-      for (let i = 0; i < source.length; i++) {
-        target[i] = mergeInto(target[i], source[i], schema, subschema);
-      }
-      return target;
-    }
-    return annotateValue(source, [], subschema);
-  }
-  if (target == null || typeof target !== 'object' || Array.isArray(target)) {
-    return annotateValue(source, [], subschema);
-  }
-
-  const priorTypename = target['__typename'] as string | undefined;
-  for (const key of Object.keys(source)) {
-    if (
-      key === '__proto__' ||
-      key === 'constructor' ||
-      key === 'prototype' ||
-      key === '__typename'
-    ) {
-      continue;
-    }
-    const incoming = source[key];
-    if (
-      Object.prototype.hasOwnProperty.call(target, key) &&
-      incoming !== undefined
-    ) {
-      target[key] = mergeInto(target[key], incoming, schema, subschema);
-    } else if (incoming != null && typeof incoming === 'object') {
-      target[key] = annotateValue(incoming, [], subschema);
-    } else {
-      target[key] = incoming;
-    }
-  }
-  target['__typename'] = resolveMergedTypename(
-    priorTypename,
-    source['__typename'] as string | undefined,
-    schema,
-  );
-  stampSubschema(target, subschema);
-  return target;
-}
-
-/**
- * Light entity merge: deep-merge only hop fields onto the parent in place.
- * Leaf-only payloads (inStock, shippingEstimate, username…) use Object.assign
- * like Hive's mergeFlattenEntities — avoids walking nested keys per entity.
+ * Light entity merge — Hive `mergeFlattenEntities`:
+ * `Object.assign(target, mergeDeep([target, entity]))` for nested payloads;
+ * leaf-only hops skip mergeDeep and assign fields directly.
  */
 function mergeEntityIntoParent(
   parent: Record<string, any>,
@@ -341,30 +278,49 @@ function mergeEntityIntoParent(
       break;
     }
   }
+  const priorTypename = parent['__typename'] as string | undefined;
+  const resultTypename = resolverResult['__typename'] as string | undefined;
   if (!hasNested) {
-    const priorTypename = parent['__typename'] as string | undefined;
     for (const key in resolverResult) {
       if (
         key === '__proto__' ||
         key === 'constructor' ||
-        key === 'prototype'
+        key === 'prototype' ||
+        key === '__typename'
       ) {
-        continue;
-      }
-      if (key === '__typename') {
         continue;
       }
       parent[key] = resolverResult[key];
     }
     parent['__typename'] = resolveMergedTypename(
       priorTypename,
-      resolverResult['__typename'] as string | undefined,
+      resultTypename,
       schema,
     );
     stampSubschema(parent, subschema);
     return;
   }
-  mergeInto(parent, resolverResult, schema, subschema);
+  // Nested: Hive Object.assign + mergeDeep, then stamp symbols (mergeDeep
+  // copies enumerable props only).
+  const merged = mergeDeep([parent, resolverResult], false, true, true);
+  Object.assign(parent, merged);
+  parent['__typename'] = resolveMergedTypename(
+    priorTypename,
+    resultTypename,
+    schema,
+  );
+  stampSubschema(parent, subschema);
+  // Annotate fresh nested objects from the hop so later entity hops can find
+  // OBJECT_SUBSCHEMA_SYMBOL on children.
+  for (const key in resolverResult) {
+    if (key === '__typename') {
+      continue;
+    }
+    const v = parent[key];
+    if (v != null && typeof v === 'object') {
+      annotateValue(v, [], subschema);
+    }
+  }
 }
 
 /**
@@ -991,6 +947,33 @@ function tryExecuteEntitiesBatch(
     }
   };
 
+  // Prebuilt plan document → skip Transformer / prepareGatewayDocument.
+  if (node.document) {
+    const args = entry.argsFromKeys!(keys) as Record<string, any>;
+    const executor = getSubschemaExecutor(
+      hopSubschema,
+      ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
+    );
+    return handleMaybePromise(
+      () =>
+        executor({
+          document: node.document!,
+          variables: args,
+          context: ctx.contextValue,
+          rootValue: ctx.rootValue,
+          operationType: 'query' as OperationTypeNode,
+          signal: ctx.signal,
+          subgraphName: hopSubschema.name,
+        } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
+      (result: ExecutionResult) => {
+        if (result.errors?.length) {
+          ctx.errors.push(...result.errors);
+        }
+        mergeResults(result.data?.['_entities']);
+      },
+    );
+  }
+
   return handleMaybePromise(
     () =>
       delegateToSchema({
@@ -1298,214 +1281,6 @@ function executeDataflowPlan(
   return runReady();
 }
 
-const TYPENAME_FIELD: FieldNode = {
-  kind: Kind.FIELD,
-  name: { kind: Kind.NAME, value: '__typename' },
-};
-
-/**
- * Strip fields the target subgraph schema cannot resolve (Hive QP only asks
- * for local fields). Needed for raw `_entities` / BatchFetch documents that
- * skip prepareGatewayDocument. Always keeps/injects `__typename` so later
- * entity hops can match parents.
- */
-function filterSelectionSetForSchema(
-  selectionSet: SelectionSetNode,
-  typeName: string,
-  schema: GraphQLSchema,
-  fragments: Record<string, any>,
-): SelectionSetNode {
-  const type = schema.getType(typeName);
-  if (!type || !('getFields' in type)) {
-    return { kind: Kind.SELECTION_SET, selections: [TYPENAME_FIELD] };
-  }
-  const fields = (type as any).getFields() as Record<string, { type: any }>;
-  const next: SelectionNode[] = [];
-  let hasTypename = false;
-  for (const sel of selectionSet.selections) {
-    if (sel.kind === Kind.FIELD) {
-      const name = sel.name.value;
-      if (name === '__typename') {
-        hasTypename = true;
-        next.push(sel);
-        continue;
-      }
-      const field = fields[name];
-      if (!field) {
-        continue;
-      }
-      if (!sel.selectionSet) {
-        next.push(sel);
-        continue;
-      }
-      const childType = getNamedType(field.type);
-      next.push({
-        ...sel,
-        selectionSet: filterSelectionSetForSchema(
-          sel.selectionSet,
-          childType.name,
-          schema,
-          fragments,
-        ),
-      });
-      continue;
-    }
-    if (sel.kind === Kind.INLINE_FRAGMENT) {
-      const on =
-        sel.typeCondition?.name.value ??
-        (isAbstractType(type) ? typeName : typeName);
-      if (
-        sel.typeCondition &&
-        !schema.getType(sel.typeCondition.name.value)
-      ) {
-        continue;
-      }
-      const filtered = filterSelectionSetForSchema(
-        sel.selectionSet,
-        on,
-        schema,
-        fragments,
-      );
-      if (filtered.selections.length) {
-        next.push({ ...sel, selectionSet: filtered });
-      }
-      continue;
-    }
-    if (sel.kind === Kind.FRAGMENT_SPREAD) {
-      const frag = fragments[sel.name.value];
-      if (!frag) {
-        continue;
-      }
-      const on = frag.typeCondition.name.value;
-      if (!schema.getType(on)) {
-        continue;
-      }
-      const filtered = filterSelectionSetForSchema(
-        frag.selectionSet,
-        on,
-        schema,
-        fragments,
-      );
-      if (filtered.selections.length) {
-        next.push({
-          kind: Kind.INLINE_FRAGMENT,
-          typeCondition: frag.typeCondition,
-          selectionSet: filtered,
-        });
-      }
-    }
-  }
-  if (!hasTypename) {
-    next.unshift(TYPENAME_FIELD);
-  }
-  return { kind: Kind.SELECTION_SET, selections: next };
-}
-
-const entitiesDocCache = new Map<string, ExecutionRequest['document']>();
-
-function selectionCacheKey(ss: SelectionSetNode): string {
-  return ss.selections
-    .map((s) => {
-      if (s.kind === Kind.FIELD) {
-        return s.name.value;
-      }
-      if (s.kind === Kind.INLINE_FRAGMENT) {
-        return `...${s.typeCondition?.name.value ?? ''}`;
-      }
-      return `...${s.kind === Kind.FRAGMENT_SPREAD ? s.name.value : '?'}`;
-    })
-    .join(',');
-}
-
-function buildCachedEntitiesDocument(
-  typeName: string,
-  selectionSet: SelectionSetNode,
-  alias?: string,
-): ExecutionRequest['document'] {
-  const cacheKey = `${alias ?? '_entities'}::${typeName}::${selectionCacheKey(selectionSet)}`;
-  const cached = entitiesDocCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-  const document = {
-    kind: Kind.DOCUMENT as const,
-    definitions: [
-      {
-        kind: Kind.OPERATION_DEFINITION as const,
-        operation: 'query' as OperationTypeNode,
-        variableDefinitions: [
-          {
-            kind: Kind.VARIABLE_DEFINITION as const,
-            variable: {
-              kind: Kind.VARIABLE as const,
-              name: { kind: Kind.NAME as const, value: 'representations' },
-            },
-            type: {
-              kind: Kind.NON_NULL_TYPE as const,
-              type: {
-                kind: Kind.LIST_TYPE as const,
-                type: {
-                  kind: Kind.NON_NULL_TYPE as const,
-                  type: {
-                    kind: Kind.NAMED_TYPE as const,
-                    name: { kind: Kind.NAME as const, value: '_Any' },
-                  },
-                },
-              },
-            },
-          },
-        ],
-        selectionSet: {
-          kind: Kind.SELECTION_SET as const,
-          selections: [
-            {
-              kind: Kind.FIELD as const,
-              alias: alias
-                ? { kind: Kind.NAME as const, value: alias }
-                : undefined,
-              name: { kind: Kind.NAME as const, value: '_entities' },
-              arguments: [
-                {
-                  kind: Kind.ARGUMENT as const,
-                  name: {
-                    kind: Kind.NAME as const,
-                    value: 'representations',
-                  },
-                  value: {
-                    kind: Kind.VARIABLE as const,
-                    name: {
-                      kind: Kind.NAME as const,
-                      value: 'representations',
-                    },
-                  },
-                },
-              ],
-              selectionSet: {
-                kind: Kind.SELECTION_SET as const,
-                selections: [
-                  {
-                    kind: Kind.INLINE_FRAGMENT as const,
-                    typeCondition: {
-                      kind: Kind.NAMED_TYPE as const,
-                      name: {
-                        kind: Kind.NAME as const,
-                        value: typeName,
-                      },
-                    },
-                    selectionSet,
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      },
-    ],
-  };
-  entitiesDocCache.set(cacheKey, document);
-  return document;
-}
-
 function matchEntityParent(
   parent: Record<string, any>,
   entityTypeName: string,
@@ -1534,7 +1309,7 @@ function matchEntityParent(
 function collectAliasParents(
   ctx: BackboneExecutionContext,
   entityTypeName: string,
-  flattenPaths: PathSegment[],
+  flattenPaths: PathSegment[][],
 ): Array<Record<string, any>> {
   const parents: Array<Record<string, any>> = [];
   const seen = new Set<Record<string, any>>();
@@ -1603,12 +1378,17 @@ function projectRepresentations(
   };
 }
 
+type BatchAliasPrep = {
+  alias: string;
+  parents: Array<Record<string, any>>;
+  parentKeyIndex: number[];
+};
+
 /**
- * Multi-type BatchFetch: run each alias through the normal Fetch path
- * (delegateToSchema / prepareGatewayDocument) in parallel. A single multi-
- * alias HTTP document needs subgraph-accurate selection filtering equivalent
- * to prepareGatewayDocument; until that lands, parallel Fetches preserve
- * audit correctness while the wave/dataflow schedule still matches Hive.
+ * Multi-type BatchFetch — Hive model: one prebuilt multi-alias `_entities`
+ * document (`_e0`/`_e1`…), one subgraph HTTP round-trip, then per-alias merge.
+ * Falls back to parallel Fetches when the plan has no document or an alias
+ * lacks `_entities` merge config.
  */
 function executeBatchFetchNode(
   node: Extract<StitchPlanNode, { kind: 'BatchFetch' }>,
@@ -1617,7 +1397,124 @@ function executeBatchFetchNode(
   if (!node.aliases.length) {
     return;
   }
-  // Parallel alias execution: disjoint root paths (planner-enforced).
+
+  if (node.document) {
+    const prepared: BatchAliasPrep[] = [];
+    const variables: Record<string, any> = Object.create(null);
+    let anyKeys = false;
+    let canRawBatch = true;
+
+    for (let i = 0; i < node.aliases.length; i++) {
+      const a = node.aliases[i]!;
+      const varName = a.representationsVariable ?? `__batch_reps_${i}`;
+      const parents = collectAliasParents(
+        ctx,
+        a.entityTypeName,
+        a.flattenPaths,
+      );
+      if (!parents.length) {
+        // Hive always sends `[]` for empty aliases so required vars stay valid.
+        variables[varName] = [];
+        continue;
+      }
+      const hopSubschema = subschemaForBackboneEntityHop(
+        node.subschema,
+        a.entityTypeName,
+        a.selectionSet,
+      );
+      const projected = projectRepresentations(
+        parents,
+        hopSubschema,
+        a.entityTypeName,
+      );
+      if (!projected) {
+        canRawBatch = false;
+        break;
+      }
+      variables[varName] = projected.keys;
+      if (projected.keys.length) {
+        anyKeys = true;
+      }
+      prepared.push({
+        alias: a.alias,
+        parents,
+        parentKeyIndex: projected.parentKeyIndex,
+      });
+    }
+
+    if (canRawBatch) {
+      if (!anyKeys) {
+        return;
+      }
+      const executor = getSubschemaExecutor(
+        node.subschema,
+        ctx.contextValue ?? BATCH_EXECUTOR_CONTEXT,
+      );
+      return handleMaybePromise(
+        () =>
+          executor({
+            document: node.document!,
+            variables,
+            context: ctx.contextValue,
+            rootValue: ctx.rootValue,
+            operationType: 'query' as OperationTypeNode,
+            signal: ctx.signal,
+            subgraphName: node.subschema.name,
+          } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
+        (result: ExecutionResult) => {
+          if (result.errors?.length) {
+            ctx.errors.push(...result.errors);
+          }
+          const data = result.data;
+          if (!data || typeof data !== 'object') {
+            return;
+          }
+          for (const prep of prepared) {
+            const entities = (data as Record<string, any>)[prep.alias];
+            if (!Array.isArray(entities)) {
+              continue;
+            }
+            for (let i = 0; i < prep.parents.length; i++) {
+              const ki = prep.parentKeyIndex[i]!;
+              if (ki < 0) {
+                continue;
+              }
+              const entity = entities[ki];
+              if (entity instanceof Error) {
+                ctx.errors.push(entity);
+                continue;
+              }
+              if (entity == null || typeof entity !== 'object') {
+                continue;
+              }
+              mergeEntityIntoParent(
+                prep.parents[i]!,
+                entity as Record<string, any>,
+                ctx.schema,
+                node.subschema,
+              );
+            }
+          }
+        },
+        (err) => {
+          ctx.errors.push(
+            createGraphQLError(
+              err instanceof Error ? err.message : String(err),
+              {
+                originalError: err instanceof Error ? err : undefined,
+                extensions: {
+                  code: 'DOWNSTREAM_SERVICE_ERROR',
+                  serviceName: node.subschema.name,
+                },
+              },
+            ),
+          );
+        },
+      );
+    }
+  }
+
+  // Fallback: parallel per-alias Fetch (delegate / Transformer path).
   const jobs = node.aliases.map((a) =>
     executeFetchNode(
       {
@@ -1661,20 +1558,22 @@ export function executeStitchPlan(
     infoStub: {},
   };
 
-  // Hive QP uses Sequence-of-Parallel wave barriers; our 4-wave plan matches.
-  // `dependsOn` is annotated for a future barrier-free scheduler once provides/
-  // abstract edges are complete (see executeDataflowPlan).
-  return handleMaybePromise(
-    () => executePlanNode(plan.root, ctx),
-    () => {
-      const result: ExecutionResult = {};
-      if (Object.keys(ctx.data).length) {
-        result.data = ctx.data;
-      }
-      if (ctx.errors.length) {
-        result.errors = ctx.errors as any;
-      }
-      return result;
-    },
-  );
+  // Sequence-safe dependsOn (fetchDependsOn + Sequence barriers) lets the
+  // dataflow scheduler fire hops as soon as deps complete — same waves as
+  // the Sequence/Parallel tree, without unsafe early @provides fires.
+  // Islands keep the recursive tree path (local resolver + continue).
+  const run =
+    planHasIslands(plan.root) || plan.incomplete
+      ? () => executePlanNode(plan.root, ctx)
+      : () => executeDataflowPlan(plan.root, ctx);
+  return handleMaybePromise(run, () => {
+    const result: ExecutionResult = {};
+    if (Object.keys(ctx.data).length) {
+      result.data = ctx.data;
+    }
+    if (ctx.errors.length) {
+      result.errors = ctx.errors as any;
+    }
+    return result;
+  });
 }
