@@ -230,6 +230,25 @@ function projectInterfaceObjectValue(
             applyField(nested);
           }
         }
+      } else if (!value.__typename && cond) {
+        // Subgraph omitted __typename; still project concrete-fragment fields
+        // that are present on the value (union intersection / provides cases).
+        const concrete = schema.getType(cond);
+        if (
+          isObjectType(concrete) &&
+          isAbstractType(abstractType) &&
+          schema.isSubType(abstractType, concrete)
+        ) {
+          for (const nested of sel.selectionSet.selections) {
+            if (nested.kind !== Kind.FIELD) {
+              continue;
+            }
+            const key = nested.alias?.value ?? nested.name.value;
+            if (key in value || nested.name.value in value) {
+              applyField(nested);
+            }
+          }
+        }
       }
       // Concrete fragment with interface-object __typename: omit (no match).
     } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
@@ -242,6 +261,23 @@ function projectInterfaceObjectValue(
         for (const nested of fragment.selectionSet.selections) {
           if (nested.kind === Kind.FIELD) {
             applyField(nested);
+          }
+        }
+      } else if (!value.__typename) {
+        const concrete = schema.getType(cond);
+        if (
+          isObjectType(concrete) &&
+          isAbstractType(abstractType) &&
+          schema.isSubType(abstractType, concrete)
+        ) {
+          for (const nested of fragment.selectionSet.selections) {
+            if (nested.kind !== Kind.FIELD) {
+              continue;
+            }
+            const key = nested.alias?.value ?? nested.name.value;
+            if (key in value || nested.name.value in value) {
+              applyField(nested);
+            }
           }
         }
       }
