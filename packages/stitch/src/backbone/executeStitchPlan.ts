@@ -1,13 +1,14 @@
 import {
-  annotateExternalObject,
   createDefaultExecutor,
+  FIELD_SUBSCHEMA_MAP_SYMBOL,
   mergeFields,
   OBJECT_SUBSCHEMA_SYMBOL,
   Subschema,
+  UNPATHED_ERRORS_SYMBOL,
   type StitchingInfo,
 } from '@graphql-tools/delegate';
-// FIELD_SUBSCHEMA_MAP is set by annotateExternalObject; nested stubs from a
-// Fetch often lack OBJECT_SUBSCHEMA_SYMBOL until we stamp the fetching subschema.
+// Annotation uses Symbol keys (JSON-invisible) via direct assign — cheaper than
+// annotateExternalObject's Object.defineProperties on large entity lists.
 import { getFragmentsFromDocument } from '@graphql-tools/executor';
 import {
   createGraphQLError,
@@ -51,8 +52,28 @@ function getSubschemaExecutor(subschema: Subschema): Executor {
   return createDefaultExecutor(subschema.schema);
 }
 
+/** Stamp subschema symbols without Object.defineProperties. */
+function stampSubschema(
+  object: Record<string, any>,
+  subschema: Subschema,
+  errors?: readonly any[],
+): void {
+  (object as any)[OBJECT_SUBSCHEMA_SYMBOL] = subschema;
+  if ((object as any)[FIELD_SUBSCHEMA_MAP_SYMBOL] == null) {
+    // Per-object map: mergeFields writes responseKey → subschema entries.
+    (object as any)[FIELD_SUBSCHEMA_MAP_SYMBOL] = Object.create(null);
+  }
+  if ((object as any)[UNPATHED_ERRORS_SYMBOL] == null) {
+    (object as any)[UNPATHED_ERRORS_SYMBOL] = errors?.length
+      ? [...errors]
+      : [];
+  } else if (errors?.length) {
+    (object as any)[UNPATHED_ERRORS_SYMBOL] = [...errors];
+  }
+}
+
 /**
- * Deep-annotate a root Fetch payload once so nested objects carry
+ * Deep-annotate a Fetch payload once so nested objects carry
  * OBJECT_SUBSCHEMA_SYMBOL for later entity hops.
  */
 function annotateValue(
@@ -66,28 +87,14 @@ function annotateValue(
   if (Array.isArray(value)) {
     return value.map((item) => annotateValue(item, errors, subschema));
   }
-  const annotated = annotateExternalObject(
-    value,
-    errors as any[],
-    subschema,
-    {},
-  );
-  for (const key of Object.keys(annotated)) {
-    const child = annotated[key];
+  stampSubschema(value, subschema, errors);
+  for (const key of Object.keys(value)) {
+    const child = value[key];
     if (child != null && typeof child === 'object') {
-      annotated[key] = annotateValue(child, [], subschema);
+      annotateValue(child, [], subschema);
     }
   }
-  return annotated;
-}
-
-/** Stamp subschema on one object without recursing. */
-function stampSubschema(object: Record<string, any>, subschema: Subschema): void {
-  if ((object as any)[OBJECT_SUBSCHEMA_SYMBOL] == null) {
-    annotateExternalObject(object, [], subschema, {});
-  } else {
-    (object as any)[OBJECT_SUBSCHEMA_SYMBOL] = subschema;
-  }
+  return value;
 }
 
 /**
@@ -219,7 +226,15 @@ function mergeRootValues(existing: any, incoming: any): any {
       (existing as any)[OBJECT_SUBSCHEMA_SYMBOL] ??
       (incoming as any)[OBJECT_SUBSCHEMA_SYMBOL];
     if (sourceSub && merged && typeof merged === 'object') {
-      return annotateExternalObject(merged, [], sourceSub, {});
+      stampSubschema(merged, sourceSub);
+      const leftMap = (existing as any)[FIELD_SUBSCHEMA_MAP_SYMBOL];
+      const rightMap = (incoming as any)[FIELD_SUBSCHEMA_MAP_SYMBOL];
+      if (leftMap || rightMap) {
+        (merged as any)[FIELD_SUBSCHEMA_MAP_SYMBOL] = {
+          ...rightMap,
+          ...leftMap,
+        };
+      }
     }
     return merged;
   }
