@@ -112,9 +112,13 @@ describe('stitching backbone', () => {
     const operation = document.definitions[0] as any;
     const plan = buildStitchPlan(schema, operation, {}, { id: '1' });
     expect(plan.incompleteReasons).toEqual([]);
-    expect(plan.root.kind === 'Sequence' || plan.root.kind === 'Fetch').toBe(
-      true,
-    );
+    // Shared root `userById` on both subschemas → Parallel root Fetches, or a
+    // Sequence of root + entity when only one owner is chosen first.
+    expect(
+      plan.root.kind === 'Sequence' ||
+        plan.root.kind === 'Fetch' ||
+        plan.root.kind === 'Parallel',
+    ).toBe(true);
   });
 
   it('executes a merged query via the backbone executor', async () => {

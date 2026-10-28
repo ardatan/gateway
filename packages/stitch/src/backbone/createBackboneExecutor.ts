@@ -31,12 +31,16 @@ function isIntrospectionOperation(request: ExecutionRequest): boolean {
 }
 
 /**
- * Operation-level stitching executor.
+ * Stitching backbone executor.
  *
- * Always builds/caches an operation plan (warming delegation memoization).
- * When `preferPlannedExecute` is true (or omitted and the plan is complete),
- * runs Fetch/Parallel/Sequence/Island execution with client projection.
- * Otherwise uses GraphQL.js schema execute for full federation correctness.
+ * Every request:
+ * 1. Builds (or reuses a cached) operation-level plan — this warms
+ *    delegation-plan memoization even when we later fall back.
+ * 2. If the plan is complete → execute Fetch/Parallel/Sequence/Island and
+ *    project to the client selection.
+ * 3. If incomplete (abstracts, @skip/@include until Condition nodes exist,
+ *    hooks, subscriptions, …) → GraphQL.js schema execute on the stitched
+ *    schema (same correctness as classic stitching).
  */
 export function createBackboneExecutor(
   schema: GraphQLSchema,
@@ -72,13 +76,28 @@ export function createBackboneExecutor(
       byName = new Map();
       planCache.set(request.document, byName);
     }
-    const plan = buildStitchPlan(
-      schema,
-      operation,
-      fragments,
-      request.variables ?? {},
-      options,
-    );
+    let plan: StitchPlan;
+    try {
+      plan = buildStitchPlan(
+        schema,
+        operation,
+        fragments,
+        request.variables ?? {},
+        options,
+      );
+    } catch (err) {
+      // Directive evaluation during planning can throw (e.g. @include with an
+      // omitted defaulted variable). Treat as incomplete → schema execute.
+      plan = {
+        operation,
+        fragments,
+        root: { kind: 'Parallel', nodes: [] },
+        incomplete: true,
+        incompleteReasons: [
+          err instanceof Error ? err.message : 'Plan build failed',
+        ],
+      };
+    }
     byName.set(cacheKey, plan);
     return plan;
   }
@@ -88,19 +107,14 @@ export function createBackboneExecutor(
       return schemaExecutor(request);
     }
 
-    // Always build/warm the plan (memoize delegation builders).
     const plan = getCachedPlan(request);
 
-    // Explicit false → never use planned execute (gateway default until audit
-    // parity). Explicit true → always try planned. Undefined → planned only
-    // when the plan is complete.
+    // preferPlannedExecute: true  → always try planned (tests)
+    // preferPlannedExecute: false → never planned (escape hatch)
+    // undefined (gateway default) → planned when complete
     const prefer = options.preferPlannedExecute;
     const usePlanned =
-      prefer === true
-        ? true
-        : prefer === false
-          ? false
-          : !plan.incomplete;
+      prefer === true ? true : prefer === false ? false : !plan.incomplete;
 
     if (!usePlanned) {
       return schemaExecutor(request);

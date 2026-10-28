@@ -10,6 +10,7 @@ import type {
 import {
   getNamedType,
   isAbstractType,
+  isLeafType,
   isObjectType,
   Kind,
 } from 'graphql';
@@ -81,6 +82,15 @@ function projectValue(
     );
   }
   if (typeof value !== 'object') {
+    // Enum intersection / @inaccessible values: serialize through the gateway
+    // leaf type so unknown/removed enum values become null (GraphQL.js parity).
+    if (runtimeType && isLeafType(runtimeType)) {
+      try {
+        return runtimeType.serialize(value);
+      } catch {
+        return null;
+      }
+    }
     return value;
   }
 
