@@ -1175,16 +1175,6 @@ function executePlanNode(
   }
 }
 
-function planHasIslands(node: StitchPlanNode): boolean {
-  if (node.kind === 'Island') {
-    return true;
-  }
-  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
-    return node.nodes.some(planHasIslands);
-  }
-  return false;
-}
-
 type ExecutableHop =
   | Extract<StitchPlanNode, { kind: 'Fetch' }>
   | Extract<StitchPlanNode, { kind: 'BatchFetch' }>;
