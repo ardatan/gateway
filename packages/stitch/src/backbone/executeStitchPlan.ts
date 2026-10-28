@@ -1,5 +1,6 @@
 import {
   createDefaultExecutor,
+  delegateToSchema,
   FIELD_SUBSCHEMA_MAP_SYMBOL,
   mergeFields,
   OBJECT_SUBSCHEMA_SYMBOL,
@@ -27,6 +28,8 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   FieldNode,
+  GraphQLList,
+  GraphQLOutputType,
   GraphQLSchema,
   isInterfaceType,
   isNullableType,
@@ -242,6 +245,8 @@ function mergeInto(
 
 /**
  * Light entity merge: deep-merge only hop fields onto the parent in place.
+ * Leaf-only payloads (inStock, shippingEstimate, username…) use Object.assign
+ * like Hive's mergeFlattenEntities — avoids walking nested keys per entity.
  */
 function mergeEntityIntoParent(
   parent: Record<string, any>,
@@ -249,6 +254,40 @@ function mergeEntityIntoParent(
   schema: GraphQLSchema,
   subschema: Subschema,
 ): void {
+  let hasNested = false;
+  for (const key in resolverResult) {
+    if (key === '__typename') {
+      continue;
+    }
+    const v = resolverResult[key];
+    if (v != null && typeof v === 'object') {
+      hasNested = true;
+      break;
+    }
+  }
+  if (!hasNested) {
+    const priorTypename = parent['__typename'] as string | undefined;
+    for (const key in resolverResult) {
+      if (
+        key === '__proto__' ||
+        key === 'constructor' ||
+        key === 'prototype'
+      ) {
+        continue;
+      }
+      if (key === '__typename') {
+        continue;
+      }
+      parent[key] = resolverResult[key];
+    }
+    parent['__typename'] = resolveMergedTypename(
+      priorTypename,
+      resolverResult['__typename'] as string | undefined,
+      schema,
+    );
+    stampSubschema(parent, subschema);
+    return;
+  }
   mergeInto(parent, resolverResult, schema, subschema);
 }
 
@@ -738,6 +777,21 @@ function executeFetchNode(
     node.entityTypeName,
     node.selectionSet,
   );
+
+  // Hive-style: one batched _entities hop for all parents (single
+  // batchDelegateToSchema / DataLoader batch instead of N resolver entries).
+  const batched = tryExecuteEntitiesBatch(
+    node,
+    parents,
+    hopSubschema,
+    ctx,
+    info,
+    type as GraphQLOutputType,
+  );
+  if (batched !== undefined) {
+    return batched;
+  }
+
   const jobs: MaybePromise<any>[] = parents.map((parent) =>
     handleMaybePromise(
       () =>
@@ -772,6 +826,107 @@ function executeFetchNode(
   return handleMaybePromise(
     () => Promise.all(jobs.map((j) => (isPromise(j) ? j : Promise.resolve(j)))),
     () => undefined,
+  );
+}
+
+/**
+ * Federation entity hop like Hive: project keys once, one batchDelegate
+ * (_entities) for all parents, index-merge. Falls back when merge config
+ * is not argsFromKeys/_entities shaped.
+ */
+function tryExecuteEntitiesBatch(
+  node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  parents: Array<Record<string, any>>,
+  hopSubschema: Subschema,
+  ctx: BackboneExecutionContext,
+  info: Record<string, any>,
+  type: GraphQLOutputType,
+): MaybePromise<void> | undefined {
+  const typeName = node.entityTypeName!;
+  const mergeConfig = hopSubschema.merge?.[typeName];
+  const entry =
+    mergeConfig?.key != null &&
+    mergeConfig.argsFromKeys != null &&
+    mergeConfig.fieldName === '_entities'
+      ? mergeConfig
+      : mergeConfig?.entryPoints?.find(
+          (e) =>
+            e.key != null &&
+            e.argsFromKeys != null &&
+            e.fieldName === '_entities',
+        );
+  if (!entry?.key || !entry.argsFromKeys) {
+    return undefined;
+  }
+
+  const keyFn = entry.key;
+  const cacheKeyFn = entry.dataLoaderOptions?.cacheKeyFn;
+  const keys: any[] = [];
+  const identityToIndex = new Map<string, number>();
+  const parentKeyIndex: number[] = new Array(parents.length);
+  for (let i = 0; i < parents.length; i++) {
+    const key = keyFn(parents[i]!);
+    if (key == null) {
+      parentKeyIndex[i] = -1;
+      continue;
+    }
+    const identity =
+      cacheKeyFn != null ? String(cacheKeyFn(key)) : JSON.stringify(key);
+    let idx = identityToIndex.get(identity);
+    if (idx == null) {
+      idx = keys.length;
+      identityToIndex.set(identity, idx);
+      keys.push(key);
+    }
+    parentKeyIndex[i] = idx;
+  }
+  if (!keys.length) {
+    return undefined;
+  }
+
+  // One delegateToSchema with all representations — Hive-like single
+  // _entities round-trip without DataLoader scheduling per parent.
+  return handleMaybePromise(
+    () =>
+      delegateToSchema({
+        schema: hopSubschema,
+        operation: 'query',
+        fieldName: '_entities',
+        returnType: new GraphQLList(type),
+        args: entry.argsFromKeys!(keys),
+        selectionSet: node.selectionSet,
+        context: ctx.contextValue,
+        info: info as any,
+        skipTypeMerging: true,
+      }),
+    (results: any) => {
+      if (!Array.isArray(results)) {
+        if (results instanceof Error) {
+          ctx.errors.push(results);
+        }
+        return;
+      }
+      for (let i = 0; i < parents.length; i++) {
+        const ki = parentKeyIndex[i]!;
+        if (ki < 0) {
+          continue;
+        }
+        const entity = results[ki];
+        if (entity instanceof Error) {
+          ctx.errors.push(entity);
+          continue;
+        }
+        if (entity == null || typeof entity !== 'object') {
+          continue;
+        }
+        mergeEntityIntoParent(
+          parents[i]!,
+          entity as Record<string, any>,
+          ctx.schema,
+          node.subschema,
+        );
+      }
+    },
   );
 }
 

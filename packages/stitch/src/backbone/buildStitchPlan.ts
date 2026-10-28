@@ -3552,12 +3552,17 @@ function fetchDependsOn(
   }
 
   const reqNames = new Set(
-    collectRequiresDeps(stitchingInfo, later).map((d) => d.name.value),
+    collectRequiresDeps(stitchingInfo, later)
+      .map((d) => d.name.value)
+      // __typename is ubiquitous and must not create false depends edges
+      // (inventory@topProducts ∥ reviews@topProducts).
+      .filter((n) => n !== '__typename'),
   );
   if (!reqNames.size) {
     return false;
   }
   const provided = collectSelectedFieldNames(earlier.selectionSet);
+  provided.delete('__typename');
   let providesNeeded = false;
   for (const n of reqNames) {
     if (provided.has(n)) {
@@ -3924,12 +3929,221 @@ function packIndependentWaves(
     packIndependentWaves(c, stitchingInfo),
   );
   if (node.kind === 'Parallel') {
+    if (children.length === 1) {
+      return children[0]!;
+    }
+    return hoistParallelSequenceHeads(
+      { kind: 'Parallel', nodes: children },
+      stitchingInfo,
+    );
+  }
+  const packed = packIndependentSequenceFetches(children, stitchingInfo);
+  return compressPeeledWaves(
+    flattenPlanSequences(toSeqOrSingle(packed)),
+    stitchingInfo,
+  );
+}
+
+function collectHeadFetches(
+  node: StitchPlanNode,
+): Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> | null {
+  if (node.kind === 'Fetch') {
+    return [node];
+  }
+  if (node.kind === 'Parallel') {
+    const out: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+    for (const c of node.nodes) {
+      if (c.kind !== 'Fetch') {
+        return null;
+      }
+      out.push(c);
+    }
+    return out;
+  }
+  return null;
+}
+
+function flattenPlanSequences(node: StitchPlanNode): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? { ...node, continue: flattenPlanSequences(node.continue) }
+      : node;
+  }
+  if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
+    return node;
+  }
+  const children = node.nodes.map(flattenPlanSequences);
+  if (node.kind === 'Parallel') {
     return children.length === 1
       ? children[0]!
       : { kind: 'Parallel', nodes: children };
   }
-  const packed = packIndependentSequenceFetches(children, stitchingInfo);
-  return toSeqOrSingle(packed);
+  const flat: StitchPlanNode[] = [];
+  for (const c of children) {
+    if (c.kind === 'Sequence') {
+      flat.push(...c.nodes);
+    } else {
+      flat.push(c);
+    }
+  }
+  return toSeqOrSingle(flat);
+}
+
+/**
+ * Hive-style wave peel: Parallel(Sequence(a,…), Sequence(b,…)) →
+ * Sequence(Parallel(a,b), rests) when heads are independent.
+ */
+function hoistParallelSequenceHeads(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind !== 'Parallel' || node.nodes.length < 2) {
+    return node.kind === 'Parallel' && node.nodes.length === 1
+      ? node.nodes[0]!
+      : node;
+  }
+
+  type Peel = { head: StitchPlanNode; rest: StitchPlanNode | null };
+  const peels: Array<Peel | null> = node.nodes.map((child) => {
+    if (child.kind === 'Sequence' && child.nodes.length > 0) {
+      return {
+        head: child.nodes[0]!,
+        rest:
+          child.nodes.length > 1
+            ? toSeqOrSingle(child.nodes.slice(1))
+            : null,
+      };
+    }
+    if (child.kind === 'Fetch' || child.kind === 'Parallel') {
+      return { head: child, rest: null };
+    }
+    return null;
+  });
+  if (peels.some((p) => p == null)) {
+    return node;
+  }
+  if (!peels.some((p) => p!.rest != null)) {
+    return node;
+  }
+
+  const heads = peels.map((p) => p!.head);
+  const headFetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+  for (const h of heads) {
+    const fetches = collectHeadFetches(h);
+    if (!fetches) {
+      return node;
+    }
+    headFetches.push(...fetches);
+  }
+  for (let i = 0; i < headFetches.length; i++) {
+    for (let j = i + 1; j < headFetches.length; j++) {
+      if (
+        fetchDependsOn(stitchingInfo, headFetches[i]!, headFetches[j]!) ||
+        fetchDependsOn(stitchingInfo, headFetches[j]!, headFetches[i]!)
+      ) {
+        return node;
+      }
+    }
+  }
+
+  const rests = peels
+    .map((p) => p!.rest)
+    .filter((r): r is StitchPlanNode => r != null);
+  const next: StitchPlanNode[] = [{ kind: 'Parallel', nodes: heads }];
+  if (rests.length === 1) {
+    next.push(rests[0]!);
+  } else if (rests.length > 1) {
+    next.push(
+      hoistParallelSequenceHeads(
+        { kind: 'Parallel', nodes: rests },
+        stitchingInfo,
+      ),
+    );
+  }
+  return flattenPlanSequences(toSeqOrSingle(next));
+}
+
+/**
+ * After peeling roots/reviews, pack
+ *   …, P_user, I_user, Parallel(accounts, products_deep), I_deep
+ * into
+ *   …, Parallel(P_user, accounts, products_deep), Batch/Parallel(I_user, I_deep)
+ * so the critical path matches Hive's ~4 waves.
+ */
+function compressPeeledWaves(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind !== 'Sequence' || node.nodes.length < 4) {
+    return node;
+  }
+  const nodes = [...node.nodes];
+  // Look for: Fetch(PRODUCTS), Fetch(INV), Parallel(...), Fetch(INV)
+  for (let i = 0; i + 3 < nodes.length; i++) {
+    const pUser = nodes[i]!;
+    const iUser = nodes[i + 1]!;
+    const mid = nodes[i + 2]!;
+    const iDeep = nodes[i + 3]!;
+    if (
+      pUser.kind !== 'Fetch' ||
+      iUser.kind !== 'Fetch' ||
+      mid.kind !== 'Parallel' ||
+      iDeep.kind !== 'Fetch'
+    ) {
+      continue;
+    }
+    if (
+      !entityTypeKey(pUser) ||
+      !entityTypeKey(iUser) ||
+      !entityTypeKey(iDeep)
+    ) {
+      continue;
+    }
+    if (entityTypeKey(iUser) !== entityTypeKey(iDeep)) {
+      continue;
+    }
+    // I_user must not need anything in mid; I_deep may need mid.
+    const midFetches = collectHeadFetches(mid) ?? [];
+    if (
+      midFetches.some(
+        (m) =>
+          fetchDependsOn(stitchingInfo, iUser, m) ||
+          fetchDependsOn(stitchingInfo, m, iUser),
+      )
+    ) {
+      continue;
+    }
+    const blockedP = midFetches.some(
+      (m) =>
+        fetchDependsOn(stitchingInfo, pUser, m) ||
+        fetchDependsOn(stitchingInfo, m, pUser),
+    );
+    if (blockedP) {
+      continue;
+    }
+
+    const invWave: StitchPlanNode =
+      selectionSetKey(iUser.selectionSet) ===
+      selectionSetKey(iDeep.selectionSet)
+        ? mergeMultiPathFetches([iUser, iDeep])
+        : { kind: 'Parallel', nodes: [iUser, iDeep] };
+
+    const productWave: StitchPlanNode = {
+      kind: 'Parallel',
+      nodes: [pUser, ...mid.nodes],
+    };
+    const rebuilt = [
+      ...nodes.slice(0, i),
+      productWave,
+      invWave,
+      ...nodes.slice(i + 4),
+    ];
+    return compressPeeledWaves(
+      toSeqOrSingle(rebuilt),
+      stitchingInfo,
+    );
+  }
+  return node;
 }
 
 function fetchFlattenPaths(
