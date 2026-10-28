@@ -3552,12 +3552,17 @@ function fetchDependsOn(
   }
 
   const reqNames = new Set(
-    collectRequiresDeps(stitchingInfo, later).map((d) => d.name.value),
+    collectRequiresDeps(stitchingInfo, later)
+      .map((d) => d.name.value)
+      // __typename is on every entity hop and must not create false edges
+      // (inventory@topProducts ∥ reviews@topProducts).
+      .filter((n) => n !== '__typename'),
   );
   if (!reqNames.size) {
     return false;
   }
   const provided = collectSelectedFieldNames(earlier.selectionSet);
+  provided.delete('__typename');
   let providesNeeded = false;
   for (const n of reqNames) {
     if (provided.has(n)) {
@@ -3924,12 +3929,140 @@ function packIndependentWaves(
     packIndependentWaves(c, stitchingInfo),
   );
   if (node.kind === 'Parallel') {
+    const hoisted = hoistParallelSequenceHeads(
+      { kind: 'Parallel', nodes: children },
+      stitchingInfo,
+    );
+    return hoisted;
+  }
+  const packed = packIndependentSequenceFetches(children, stitchingInfo);
+  return toSeqOrSingle(packed);
+}
+
+function collectHeadFetches(
+  node: StitchPlanNode,
+): Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> | null {
+  if (node.kind === 'Fetch') {
+    return [node];
+  }
+  if (node.kind === 'Parallel') {
+    const out: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+    for (const c of node.nodes) {
+      if (c.kind !== 'Fetch') {
+        return null;
+      }
+      out.push(c);
+    }
+    return out;
+  }
+  return null;
+}
+
+/**
+ * Hive-style wave peel: Parallel(Sequence(a,…), Sequence(b,…)) becomes
+ * Sequence(Parallel(a,b), Parallel(rest…)) when heads are independent.
+ * Also peels a Sequence head beside a Parallel/Fetch sibling (reviews∥inventory).
+ */
+function hoistParallelSequenceHeads(
+  node: StitchPlanNode,
+  stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  if (node.kind !== 'Parallel' || node.nodes.length < 2) {
+    return node.kind === 'Parallel' && node.nodes.length === 1
+      ? node.nodes[0]!
+      : node;
+  }
+
+  type Peel = {
+    head: StitchPlanNode;
+    rest: StitchPlanNode | null;
+  };
+  const peels: Array<Peel | null> = node.nodes.map((child) => {
+    if (child.kind === 'Sequence' && child.nodes.length > 0) {
+      return {
+        head: child.nodes[0]!,
+        rest:
+          child.nodes.length > 1
+            ? toSeqOrSingle(child.nodes.slice(1))
+            : null,
+      };
+    }
+    // Whole Parallel/Fetch is a head with no rest (already a wave unit).
+    if (child.kind === 'Fetch' || child.kind === 'Parallel') {
+      return { head: child, rest: null };
+    }
+    return null;
+  });
+  if (peels.some((p) => p == null)) {
+    return node;
+  }
+  const hasRest = peels.some((p) => p!.rest != null);
+  if (!hasRest) {
+    return node;
+  }
+
+  const heads = peels.map((p) => p!.head);
+  const headFetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
+  for (const h of heads) {
+    const fetches = collectHeadFetches(h);
+    if (!fetches) {
+      return node;
+    }
+    headFetches.push(...fetches);
+  }
+  for (let i = 0; i < headFetches.length; i++) {
+    for (let j = i + 1; j < headFetches.length; j++) {
+      if (
+        fetchDependsOn(stitchingInfo, headFetches[i]!, headFetches[j]!) ||
+        fetchDependsOn(stitchingInfo, headFetches[j]!, headFetches[i]!)
+      ) {
+        return node;
+      }
+    }
+  }
+
+  const rests = peels
+    .map((p) => p!.rest)
+    .filter((r): r is StitchPlanNode => r != null);
+  const next: StitchPlanNode[] = [{ kind: 'Parallel', nodes: heads }];
+  if (rests.length === 1) {
+    next.push(rests[0]!);
+  } else if (rests.length > 1) {
+    next.push(
+      hoistParallelSequenceHeads(
+        { kind: 'Parallel', nodes: rests },
+        stitchingInfo,
+      ),
+    );
+  }
+  return flattenPlanSequences(toSeqOrSingle(next));
+}
+
+/** Collapse nested Sequence nodes so wave peels don't add extra await layers. */
+function flattenPlanSequences(node: StitchPlanNode): StitchPlanNode {
+  if (node.kind === 'Island') {
+    return node.continue
+      ? { ...node, continue: flattenPlanSequences(node.continue) }
+      : node;
+  }
+  if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
+    return node;
+  }
+  const children = node.nodes.map(flattenPlanSequences);
+  if (node.kind === 'Parallel') {
     return children.length === 1
       ? children[0]!
       : { kind: 'Parallel', nodes: children };
   }
-  const packed = packIndependentSequenceFetches(children, stitchingInfo);
-  return toSeqOrSingle(packed);
+  const flat: StitchPlanNode[] = [];
+  for (const c of children) {
+    if (c.kind === 'Sequence') {
+      flat.push(...c.nodes);
+    } else {
+      flat.push(c);
+    }
+  }
+  return toSeqOrSingle(flat);
 }
 
 function fetchFlattenPaths(
