@@ -654,9 +654,17 @@ function planMergedTypeFollowUps(
     }
   }
 
-  const appendNestedForFields = (fields: readonly FieldNode[]) => {
+  const appendNestedForFields = (
+    fields: readonly FieldNode[],
+    /**
+     * Subgraph that produced these field values (delegation map target). When
+     * set, it is the first source for nested entity planning so fields like
+     * Product.sku are not treated as already-local on PRODUCTS.
+     */
+    producedBy?: Subschema,
+  ) => {
     const parentType = schema.getType(typeName);
-    if (!isObjectType(parentType)) {
+    if (!isObjectType(parentType) && !isInterfaceType(parentType)) {
       return;
     }
     const uniqueOwner = mergedTypeInfo.uniqueFields;
@@ -664,7 +672,9 @@ function planMergedTypeFollowUps(
       if (!fieldNode.selectionSet || fieldNode.name.value === '__typename') {
         continue;
       }
-      const field = parentType.getFields()[fieldNode.name.value];
+      const field = (parentType as GraphQLObjectType).getFields()[
+        fieldNode.name.value
+      ];
       if (!field) {
         continue;
       }
@@ -673,6 +683,69 @@ function planMergedTypeFollowUps(
         continue;
       }
       const responseKey = fieldNode.alias?.value ?? fieldNode.name.value;
+      const childPath = [...flattenPath, responseKey];
+      const preferred = uniqueOwner[fieldNode.name.value];
+      const sourcesToTry: Subschema[] = [];
+      const pushUnique = (s: Subschema | undefined) => {
+        if (s && !sourcesToTry.includes(s)) {
+          sourcesToTry.push(s);
+        }
+      };
+      // 1) Subgraph that actually returned this parent/field data
+      pushUnique(producedBy);
+      // 2) Field's unique owner (reviews → REVIEWS)
+      pushUnique(preferred);
+      // 3) Other known sources from this merge plan
+      for (const s of nestedSourceCandidates) {
+        pushUnique(s);
+      }
+
+      // Nested abstract (Review.product → Product): fan out Book/Magazine hops.
+      if (isAbstractType(namedReturn) && fieldNode.selectionSet) {
+        const nestedFollowUps: StitchPlanNode[] = [];
+        for (const concrete of schema.getPossibleTypes(namedReturn)) {
+          if (!stitchingInfo.mergedTypes[concrete.name]) {
+            continue;
+          }
+          const forConcrete = collectFieldsForConcreteType(
+            namedReturn,
+            concrete,
+            fieldNode.selectionSet,
+            fragments,
+            schema,
+          );
+          if (!forConcrete.length) {
+            continue;
+          }
+          let childPlan: StitchPlanNode | null = null;
+          for (const candidate of sourcesToTry) {
+            childPlan = planMergedTypeFollowUps(
+              schema,
+              stitchingInfo,
+              concrete.name,
+              candidate,
+              forConcrete,
+              fragments,
+              variableValues,
+              childPath,
+              incompleteReasons,
+            );
+            if (childPlan) {
+              break;
+            }
+          }
+          if (childPlan) {
+            nestedFollowUps.push(childPlan);
+          }
+        }
+        if (nestedFollowUps.length === 1) {
+          stages.push(nestedFollowUps[0]!);
+        } else if (nestedFollowUps.length > 1) {
+          stages.push({ kind: 'Parallel', nodes: nestedFollowUps });
+        }
+        continue;
+      }
+
       const childTypeName = namedReturn.name;
       if (!stitchingInfo.mergedTypes[childTypeName]) {
         continue;
@@ -681,13 +754,6 @@ function planMergedTypeFollowUps(
         fieldNode.selectionSet.selections,
         fragments,
       );
-      const preferred = uniqueOwner[fieldNode.name.value];
-      const sourcesToTry = preferred
-        ? [
-            preferred,
-            ...nestedSourceCandidates.filter((s) => s !== preferred),
-          ]
-        : nestedSourceCandidates;
       let childPlan: StitchPlanNode | null = null;
       for (const candidate of sourcesToTry) {
         childPlan = planMergedTypeFollowUps(
@@ -698,7 +764,7 @@ function planMergedTypeFollowUps(
           nestedFieldNodes,
           fragments,
           variableValues,
-          [...flattenPath, responseKey],
+          childPath,
           incompleteReasons,
         );
         if (childPlan) {
@@ -715,9 +781,10 @@ function planMergedTypeFollowUps(
   // after Post fetches `_comments: comments { authorId }`) — must run before the
   // leftover client-field hop that depends on those keys.
   for (const delegationMap of delegationMaps) {
-    for (const [, selectionSet] of delegationMap) {
+    for (const [target, selectionSet] of delegationMap) {
       appendNestedForFields(
         flattenToFieldNodes(selectionSet.selections, fragments),
+        target,
       );
     }
   }
@@ -1443,9 +1510,8 @@ function planRootField(
           },
           selectionSet: selectionSetOf(bridge),
         });
-        for (const b of bridge) {
-          coveredNames.add(b.name.value);
-        }
+        // Do not add type-conditioned bridge fields to the shared coveredNames
+        // set — Book.dimensions must not suppress Magazine.dimensions.
       }
       const child = planMergedTypeFollowUps(
         schema,
