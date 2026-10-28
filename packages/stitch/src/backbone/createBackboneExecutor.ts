@@ -8,7 +8,10 @@ import {
 } from '@graphql-tools/utils';
 import { handleMaybePromise } from '@whatwg-node/promise-helpers';
 import { GraphQLSchema, Kind } from 'graphql';
-import { buildStitchPlan } from './buildStitchPlan.js';
+import {
+  buildStitchPlan,
+  coerceOperationVariables,
+} from './buildStitchPlan.js';
 import { executeStitchPlan } from './executeStitchPlan.js';
 import { projectDataToOperation } from './projectResult.js';
 import type { BackboneExecutorOptions, StitchPlan } from './types.js';
@@ -28,6 +31,39 @@ function isIntrospectionOperation(request: ExecutionRequest): boolean {
     }
   }
   return false;
+}
+
+function operationHasSkipOrIncludeFast(
+  operation: import('graphql').OperationDefinitionNode,
+): boolean {
+  const stack = [...operation.selectionSet.selections];
+  while (stack.length) {
+    const sel = stack.pop()!;
+    if (
+      'directives' in sel &&
+      sel.directives?.some(
+        (d) => d.name.value === 'skip' || d.name.value === 'include',
+      )
+    ) {
+      return true;
+    }
+    if (
+      (sel.kind === Kind.FIELD || sel.kind === Kind.INLINE_FRAGMENT) &&
+      sel.selectionSet
+    ) {
+      stack.push(...sel.selectionSet.selections);
+    }
+  }
+  return false;
+}
+
+function stableStringify(value: Record<string, any>): string {
+  const keys = Object.keys(value).sort();
+  const sorted: Record<string, any> = {};
+  for (const k of keys) {
+    sorted[k] = value[k];
+  }
+  return JSON.stringify(sorted);
 }
 
 /**
@@ -65,7 +101,16 @@ export function createBackboneExecutor(
       };
     }
     const fragments = getFragmentsFromDocument(request.document);
-    const cacheKey = operation.name?.value ?? null;
+    const coerced = coerceOperationVariables(
+      operation,
+      request.variables ?? {},
+    );
+    // Include coerced variables in the cache key when @skip/@include are present
+    // so directive evaluation stays consistent with the planned selection.
+    const hasSkipInclude = operationHasSkipOrIncludeFast(operation);
+    const cacheKey =
+      (operation.name?.value ?? '') +
+      (hasSkipInclude ? `::${stableStringify(coerced)}` : '');
     let byName = planCache.get(request.document);
     if (byName) {
       const cached = byName.get(cacheKey);
@@ -82,12 +127,11 @@ export function createBackboneExecutor(
         schema,
         operation,
         fragments,
-        request.variables ?? {},
+        coerced,
         options,
       );
     } catch (err) {
-      // Directive evaluation during planning can throw (e.g. @include with an
-      // omitted defaulted variable). Treat as incomplete → schema execute.
+      // Directive evaluation during planning can throw; fall back to schema.
       plan = {
         operation,
         fragments,
@@ -108,6 +152,15 @@ export function createBackboneExecutor(
     }
 
     const plan = getCachedPlan(request);
+    const operation = getOperationASTFromRequest(request) ?? plan.operation;
+    const coerced = coerceOperationVariables(
+      operation,
+      request.variables ?? {},
+    );
+    const requestWithCoercedVars: ExecutionRequest = {
+      ...request,
+      variables: coerced,
+    };
 
     // preferPlannedExecute: true  → always try planned (tests)
     // preferPlannedExecute: false → never planned (escape hatch)
@@ -117,32 +170,31 @@ export function createBackboneExecutor(
       prefer === true ? true : prefer === false ? false : !plan.incomplete;
 
     if (!usePlanned) {
-      return schemaExecutor(request);
+      return schemaExecutor(requestWithCoercedVars);
     }
 
     return handleMaybePromise(
-      () => executeStitchPlan(schema, plan, request),
+      () => executeStitchPlan(schema, plan, requestWithCoercedVars),
       (result: ExecutionResult) => {
-        const operation = getOperationASTFromRequest(request) ?? plan.operation;
         const projected: ExecutionResult = {
           ...result,
           data: projectDataToOperation(
             schema,
             operation,
             plan.fragments,
-            request.variables ?? {},
+            coerced,
             result.data as any,
           ) as any,
         };
 
         if (projected.errors?.length && fallbackToSchemaExecute) {
-          return schemaExecutor(request);
+          return schemaExecutor(requestWithCoercedVars);
         }
         return projected;
       },
       (err) => {
         if (fallbackToSchemaExecute) {
-          return schemaExecutor(request);
+          return schemaExecutor(requestWithCoercedVars);
         }
         throw err;
       },
