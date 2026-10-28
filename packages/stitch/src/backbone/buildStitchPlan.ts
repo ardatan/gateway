@@ -2,7 +2,10 @@ import type {
   StitchingInfo,
   Subschema,
 } from '@graphql-tools/delegate';
-import { getVariableValues } from '@graphql-tools/delegate';
+import {
+  getVariableValues,
+  leftOverByDelegationPlan,
+} from '@graphql-tools/delegate';
 import {
   collectFields,
   getDefinedRootType,
@@ -131,76 +134,6 @@ function fieldAvailableOnSubschema(
  * Top-level field names covered by `@provides` on a parent field for a
  * given subschema (e.g. Query.products → categories on CATEGORY).
  */
-/**
- * True when a field is backed by `@requires` / fieldSelectionSets — those need
- * leftover multi-stage resolution the planned executor does not cover yet.
- */
-function fieldHasRequiresDependency(
-  stitchingInfo: StitchingInfo,
-  typeName: string,
-  fieldName: string,
-): boolean {
-  const merged = stitchingInfo.mergedTypes[typeName];
-  if (!merged?.fieldSelectionSets?.size) {
-    return false;
-  }
-  for (const [, map] of merged.fieldSelectionSets) {
-    if (map?.[fieldName] != null) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function selectionHasRequiresDependency(
-  stitchingInfo: StitchingInfo,
-  typeName: string,
-  fieldNodes: FieldNode[],
-  fragments: Record<string, FragmentDefinitionNode>,
-  schema: GraphQLSchema,
-  seen = new Set<string>(),
-): boolean {
-  const parentType = schema.getType(typeName);
-  if (!isObjectType(parentType) && !isAbstractType(parentType)) {
-    return false;
-  }
-  for (const fieldNode of fieldNodes) {
-    const fieldName = fieldNode.name.value;
-    if (fieldName === '__typename') {
-      continue;
-    }
-    if (fieldHasRequiresDependency(stitchingInfo, typeName, fieldName)) {
-      return true;
-    }
-    if (!fieldNode.selectionSet || !isObjectType(parentType)) {
-      continue;
-    }
-    const field = parentType.getFields()[fieldName];
-    if (!field) {
-      continue;
-    }
-    const named = getNamedType(field.type);
-    const key = `${named.name}:${fieldName}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    if (
-      selectionHasRequiresDependency(
-        stitchingInfo,
-        named.name,
-        flattenToFieldNodes(fieldNode.selectionSet.selections, fragments),
-        fragments,
-        schema,
-        seen,
-      )
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function getProvidedFieldNames(
   stitchingInfo: StitchingInfo,
   parentTypeName: string,
@@ -354,6 +287,18 @@ function flattenToFieldNodes(
  * `prepareGatewayDocument` does via `fieldNodesByField` — e.g. requesting
  * `nickname` also pulls `email` so the next entity hop has its key.
  */
+/** Stable identity for a field node including alias + arguments (requires keys). */
+function fieldNodeKey(field: FieldNode): string {
+  const alias = field.alias?.value;
+  const name = field.name.value;
+  const args = field.arguments?.length
+    ? JSON.stringify(
+        field.arguments.map((a) => [a.name.value, a.value]),
+      )
+    : '';
+  return `${alias ?? ''}:${name}:${args}`;
+}
+
 function expandFieldDependencies(
   stitchingInfo: StitchingInfo,
   typeName: string,
@@ -365,7 +310,7 @@ function expandFieldDependencies(
   }
 
   const result: FieldNode[] = [...fieldNodes];
-  const seen = new Set(fieldNodes.map((f) => f.name.value));
+  const seen = new Set(fieldNodes.map(fieldNodeKey));
   const queue = [...fieldNodes];
 
   while (queue.length) {
@@ -375,10 +320,11 @@ function expandFieldDependencies(
       continue;
     }
     for (const dep of deps) {
-      if (seen.has(dep.name.value)) {
+      const key = fieldNodeKey(dep);
+      if (seen.has(key)) {
         continue;
       }
-      seen.add(dep.name.value);
+      seen.add(key);
       result.push(dep);
       queue.push(dep);
     }
@@ -445,11 +391,6 @@ function planMergedTypeFollowUps(
     }
   }
 
-  // Nested selections on fields that were fetched may themselves need merges.
-  // Run even when this type had no entity hops (e.g. Review fields live on the
-  // source, but Review.product.inStock still needs an Inventory fetch).
-  // Candidate sources: the parent source plus every target we just fetched from
-  // (the child object typically arrives stamped with one of those subschemas).
   const nestedSourceCandidates: Subschema[] = [sourceSubschema];
   for (const delegationMap of delegationMaps) {
     for (const [target] of delegationMap) {
@@ -458,60 +399,136 @@ function planMergedTypeFollowUps(
       }
     }
   }
-  const uniqueOwner = mergedTypeInfo.uniqueFields;
-  for (const fieldNode of fieldNodes) {
-    if (!fieldNode.selectionSet || fieldNode.name.value === '__typename') {
-      continue;
-    }
+
+  const appendNestedForFields = (fields: readonly FieldNode[]) => {
     const parentType = schema.getType(typeName);
     if (!isObjectType(parentType)) {
-      continue;
+      return;
     }
-    const field = parentType.getFields()[fieldNode.name.value];
-    if (!field) {
-      continue;
-    }
-    const namedReturn = getNamedType(field.type);
-    if (!isObjectType(namedReturn) && !isAbstractType(namedReturn)) {
-      continue;
-    }
-    const responseKey = fieldNode.alias?.value ?? fieldNode.name.value;
-    const childTypeName = namedReturn.name;
-    if (!stitchingInfo.mergedTypes[childTypeName]) {
-      continue;
-    }
-    const nestedFieldNodes = flattenToFieldNodes(
-      fieldNode.selectionSet.selections,
-      fragments,
-    );
-    const preferred = uniqueOwner[fieldNode.name.value];
-    const sourcesToTry = preferred
-      ? [
-          preferred,
-          ...nestedSourceCandidates.filter((s) => s !== preferred),
-        ]
-      : nestedSourceCandidates;
-    let childPlan: StitchPlanNode | null = null;
-    for (const candidate of sourcesToTry) {
-      childPlan = planMergedTypeFollowUps(
-        schema,
-        stitchingInfo,
-        childTypeName,
-        candidate,
-        nestedFieldNodes,
+    const uniqueOwner = mergedTypeInfo.uniqueFields;
+    for (const fieldNode of fields) {
+      if (!fieldNode.selectionSet || fieldNode.name.value === '__typename') {
+        continue;
+      }
+      const field = parentType.getFields()[fieldNode.name.value];
+      if (!field) {
+        continue;
+      }
+      const namedReturn = getNamedType(field.type);
+      if (!isObjectType(namedReturn) && !isAbstractType(namedReturn)) {
+        continue;
+      }
+      const responseKey = fieldNode.alias?.value ?? fieldNode.name.value;
+      const childTypeName = namedReturn.name;
+      if (!stitchingInfo.mergedTypes[childTypeName]) {
+        continue;
+      }
+      const nestedFieldNodes = flattenToFieldNodes(
+        fieldNode.selectionSet.selections,
         fragments,
-        variableValues,
-        [...flattenPath, responseKey],
-        incompleteReasons,
       );
+      const preferred = uniqueOwner[fieldNode.name.value];
+      const sourcesToTry = preferred
+        ? [
+            preferred,
+            ...nestedSourceCandidates.filter((s) => s !== preferred),
+          ]
+        : nestedSourceCandidates;
+      let childPlan: StitchPlanNode | null = null;
+      for (const candidate of sourcesToTry) {
+        childPlan = planMergedTypeFollowUps(
+          schema,
+          stitchingInfo,
+          childTypeName,
+          candidate,
+          nestedFieldNodes,
+          fragments,
+          variableValues,
+          [...flattenPath, responseKey],
+          incompleteReasons,
+        );
+        if (childPlan) {
+          break;
+        }
+      }
       if (childPlan) {
-        break;
+        stages.push(childPlan);
       }
     }
-    if (childPlan) {
-      stages.push(childPlan);
+  };
+
+  // Nested merges for fields fetched in requires-dep stages (e.g. Comment.authorId
+  // after Post fetches `_comments: comments { authorId }`) — must run before the
+  // leftover client-field hop that depends on those keys.
+  for (const delegationMap of delegationMaps) {
+    for (const [, selectionSet] of delegationMap) {
+      appendNestedForFields(
+        flattenToFieldNodes(selectionSet.selections, fragments),
+      );
     }
   }
+
+  // @requires leftovers: after deps (+ nested key resolution), fetch the real
+  // client fields from the requiring subschemas.
+  const leftOver = leftOverByDelegationPlan.get(delegationMaps);
+  if (
+    leftOver?.unproxiableFieldNodes?.length &&
+    leftOver.nonProxiableSubschemas?.length
+  ) {
+    if (leftOver.nonProxiableSubschemas) {
+      for (const s of leftOver.nonProxiableSubschemas) {
+        if (!nestedSourceCandidates.includes(s)) {
+          nestedSourceCandidates.push(s);
+        }
+      }
+    }
+    const leftoverByTarget = new Map<Subschema, FieldNode[]>();
+    for (const fieldNode of leftOver.unproxiableFieldNodes) {
+      const fieldName = fieldNode.name.value;
+      const unique = mergedTypeInfo.uniqueFields[fieldName];
+      const targets = unique
+        ? leftOver.nonProxiableSubschemas.filter((s) => s === unique)
+        : leftOver.nonProxiableSubschemas.filter((s) => {
+            const nonUnique = mergedTypeInfo.nonUniqueFields[fieldName];
+            return nonUnique?.includes(s) || unique == null;
+          });
+      const chosen =
+        (targets.length ? targets : leftOver.nonProxiableSubschemas)[0];
+      if (!chosen) {
+        continue;
+      }
+      let list = leftoverByTarget.get(chosen);
+      if (!list) {
+        list = [];
+        leftoverByTarget.set(chosen, list);
+      }
+      list.push(fieldNode);
+    }
+    if (leftoverByTarget.size === 1) {
+      const [target, fields] = [...leftoverByTarget.entries()][0]!;
+      stages.push({
+        kind: 'Fetch',
+        subschema: target,
+        entityTypeName: typeName,
+        selectionSet: ensureTypename(selectionSetOf(fields)),
+        flattenPath,
+      });
+    } else if (leftoverByTarget.size > 1) {
+      stages.push({
+        kind: 'Parallel',
+        nodes: [...leftoverByTarget.entries()].map(([target, fields]) => ({
+          kind: 'Fetch' as const,
+          subschema: target,
+          entityTypeName: typeName,
+          selectionSet: ensureTypename(selectionSetOf(fields)),
+          flattenPath,
+        })),
+      });
+    }
+  }
+
+  // Nested merges for the original client selection (Review.product.inStock, …).
+  appendNestedForFields(fieldNodes);
 
   if (!stages.length) {
     return null;
@@ -599,24 +616,6 @@ function planRootField(
   const requested: FieldNode[] = fieldNode.selectionSet
     ? flattenToFieldNodes(fieldNode.selectionSet.selections, fragments)
     : [];
-
-  // @requires / fieldSelectionSets need leftover multi-hop resolution that the
-  // Fetch executor does not fully cover yet → schema execute for those ops.
-  if (
-    returnTypeName &&
-    requested.length &&
-    selectionHasRequiresDependency(
-      stitchingInfo,
-      returnTypeName,
-      requested,
-      fragments,
-      schema,
-    )
-  ) {
-    incompleteReasons.push(
-      `@requires on ${returnTypeName} fields require schema execute until leftover planning is complete`,
-    );
-  }
 
   const withDeps =
     returnTypeName && requested.length
