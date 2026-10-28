@@ -123,9 +123,7 @@ describe('stitching backbone', () => {
 
   it('executes a merged query via the backbone executor', async () => {
     const schema = createStitched();
-    const executor = createBackboneExecutor(schema, {
-      preferPlannedExecute: true,
-    });
+    const executor = createBackboneExecutor(schema);
     const result = await executor({
       document: parse(/* GraphQL */ `
         query ($id: ID!) {
@@ -189,7 +187,6 @@ describe('stitching backbone', () => {
 
     const executor = createBackboneExecutor(schema, {
       localFields,
-      preferPlannedExecute: true,
     });
     const result = await executor({
       document: parse(/* GraphQL */ `

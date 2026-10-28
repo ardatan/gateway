@@ -102,11 +102,6 @@ export interface BackboneExecutorOptions {
    * safety (hooks may replace the plan with live context).
    */
   hasDelegationPlanHooks?: boolean;
-  /**
-   * Escape hatch: force GraphQL.js schema execute (unit tests only).
-   * Gateway cutover never sets this — incomplete plans must be fixed.
-   */
-  preferPlannedExecute?: boolean;
 }
 
 export interface BackboneExecutionContext {
