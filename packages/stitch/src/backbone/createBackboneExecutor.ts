@@ -1,6 +1,7 @@
 import { createDefaultExecutor } from '@graphql-tools/delegate';
 import { getFragmentsFromDocument } from '@graphql-tools/executor';
 import {
+  createGraphQLError,
   ExecutionRequest,
   ExecutionResult,
   Executor,
@@ -67,22 +68,22 @@ function stableStringify(value: Record<string, any>): string {
 }
 
 /**
- * Stitching backbone executor.
+ * Stitching backbone executor — replaces classic GraphQL.js stitching execute.
  *
  * Every request:
- * 1. Builds (or reuses a cached) operation-level plan — this warms
- *    delegation-plan memoization even when we later fall back.
- * 2. If the plan is complete → execute Fetch/Parallel/Sequence/Island and
- *    project to the client selection.
- * 3. If incomplete (abstracts, @skip/@include until Condition nodes exist,
- *    hooks, subscriptions, …) → GraphQL.js schema execute on the stitched
- *    schema (same correctness as classic stitching).
+ * 1. Builds (or reuses a cached) operation-level plan.
+ * 2. Executes Fetch/Parallel/Sequence/Island and projects to the client
+ *    selection. There is no schema-execute fallback: incomplete plans must be
+ *    fixed in the planner (plan quality = execute model).
+ *
+ * Introspection still uses schema execute (SDL walk, not a federated plan).
+ * `preferPlannedExecute: false` remains an escape hatch for focused unit tests
+ * that intentionally exercise schema execute only.
  */
 export function createBackboneExecutor(
   schema: GraphQLSchema,
   options: BackboneExecutorOptions = {},
 ): Executor {
-  const fallbackToSchemaExecute = options.fallbackToSchemaExecute !== false;
   const schemaExecutor = createDefaultExecutor(schema);
   const planCache = new WeakMap<
     ExecutionRequest['document'],
@@ -162,15 +163,22 @@ export function createBackboneExecutor(
       variables: coerced,
     };
 
-    // preferPlannedExecute: true  → always try planned (tests)
-    // preferPlannedExecute: false → never planned (escape hatch)
-    // undefined (gateway default) → planned when complete
-    const prefer = options.preferPlannedExecute;
-    const usePlanned =
-      prefer === true ? true : prefer === false ? false : !plan.incomplete;
-
-    if (!usePlanned) {
+    // preferPlannedExecute: false → schema execute escape hatch (unit tests).
+    // Default / true → always planned execute (incomplete plans must be fixed).
+    if (options.preferPlannedExecute === false) {
       return schemaExecutor(requestWithCoercedVars);
+    }
+
+    if (plan.incomplete) {
+      return {
+        data: null,
+        errors: [
+          createGraphQLError(
+            `Incomplete stitch plan: ${plan.incompleteReasons.join('; ') || 'unknown'}`,
+            { extensions: { code: 'INCOMPLETE_STITCH_PLAN' } },
+          ),
+        ],
+      };
     }
 
     return handleMaybePromise(
@@ -186,17 +194,7 @@ export function createBackboneExecutor(
             result.data as any,
           ) as any,
         };
-
-        if (projected.errors?.length && fallbackToSchemaExecute) {
-          return schemaExecutor(requestWithCoercedVars);
-        }
         return projected;
-      },
-      (err) => {
-        if (fallbackToSchemaExecute) {
-          return schemaExecutor(requestWithCoercedVars);
-        }
-        throw err;
       },
     );
   };

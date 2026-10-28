@@ -47,11 +47,6 @@ export interface StitchPlan {
 
 export interface BackboneExecutorOptions {
   /**
-   * When true (default), operations that cannot be fully planned fall back to
-   * GraphQL.js schema execution instead of failing.
-   */
-  fallbackToSchemaExecute?: boolean;
-  /**
    * Fields introduced via additionalResolvers / @resolveTo / gateway-only
    * typeDefs. Keyed by parent type name → field names.
    */
@@ -62,8 +57,8 @@ export interface BackboneExecutorOptions {
    */
   hasDelegationPlanHooks?: boolean;
   /**
-   * When true, always run the planned Fetch executor even if the plan is
-   * marked incomplete (used by focused backbone unit tests).
+   * Escape hatch: force GraphQL.js schema execute (unit tests only).
+   * Gateway cutover never sets this — incomplete plans must be fixed.
    */
   preferPlannedExecute?: boolean;
 }
