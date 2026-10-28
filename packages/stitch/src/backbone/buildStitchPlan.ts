@@ -22,6 +22,7 @@ import {
   OperationDefinitionNode,
   SelectionNode,
   SelectionSetNode,
+  valueFromASTUntyped,
 } from 'graphql';
 import { isLocalField } from './localFields.js';
 import { selectionHasAbstractTypes } from './projectResult.js';
@@ -37,42 +38,28 @@ function selectionSetOf(
   return { kind: Kind.SELECTION_SET, selections: [...selections] };
 }
 
-function operationHasSkipOrInclude(
+/**
+ * Fill omitted operation variables from their GraphQL default values so
+ * `@skip`/`@include` and collectFields can evaluate without throwing.
+ */
+export function coerceOperationVariables(
   operation: OperationDefinitionNode,
-  fragments: Record<string, FragmentDefinitionNode>,
-): boolean {
-  const visitSelections = (selections: readonly SelectionNode[]): boolean => {
-    for (const selection of selections) {
-      if (
-        selection.directives?.some(
-          (d) => d.name.value === 'skip' || d.name.value === 'include',
-        )
-      ) {
-        return true;
-      }
-      if (
-        selection.kind === Kind.FIELD ||
-        selection.kind === Kind.INLINE_FRAGMENT
-      ) {
-        if (
-          selection.selectionSet &&
-          visitSelections(selection.selectionSet.selections)
-        ) {
-          return true;
-        }
-      } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
-        const fragment = fragments[selection.name.value];
-        if (
-          fragment &&
-          visitSelections(fragment.selectionSet.selections)
-        ) {
-          return true;
-        }
-      }
+  variableValues: Record<string, any>,
+): Record<string, any> {
+  const out: Record<string, any> = { ...variableValues };
+  for (const def of operation.variableDefinitions ?? []) {
+    const name = def.variable.name.value;
+    if (out[name] === undefined && def.defaultValue != null) {
+      out[name] = valueFromASTUntyped(def.defaultValue, out);
     }
-    return false;
-  };
-  return visitSelections(operation.selectionSet.selections);
+  }
+  // Drop remaining undefined entries (Yoga may inject them).
+  for (const key of Object.keys(out)) {
+    if (out[key] === undefined) {
+      delete out[key];
+    }
+  }
+  return out;
 }
 
 function ensureTypename(selectionSet: SelectionSetNode): SelectionSetNode {
@@ -646,6 +633,98 @@ function planRootField(
         provided,
       };
     }
+    // Abstract return types: keep inline fragments / spreads and partition
+    // against each concrete type condition so we don't flatten away the shape.
+    if (returnType && isAbstractType(returnType) && fieldNode.selectionSet) {
+      const available: SelectionNode[] = [];
+      const unavailable: SelectionNode[] = [];
+      for (const sel of fieldNode.selectionSet.selections) {
+        if (sel.kind === Kind.FIELD) {
+          if (
+            fieldAvailableOnSubschema(
+              owner,
+              returnTypeName,
+              sel.name.value,
+              provided,
+            ) ||
+            sel.name.value === '__typename'
+          ) {
+            available.push(sel);
+          } else {
+            unavailable.push(sel);
+          }
+        } else if (sel.kind === Kind.INLINE_FRAGMENT) {
+          const cond = sel.typeCondition?.name.value ?? returnTypeName;
+          const concrete = schema.getType(cond);
+          if (
+            concrete &&
+            owner.transformedSchema.getType(cond) != null
+          ) {
+            const nested = partitionSelectionsForSubschema(
+              owner,
+              cond,
+              sel.selectionSet,
+              fragments,
+              provided,
+            );
+            if (nested.available.length) {
+              available.push({
+                ...sel,
+                selectionSet: selectionSetOf(nested.available),
+              });
+            }
+            if (nested.unavailable.length) {
+              unavailable.push({
+                ...sel,
+                selectionSet: selectionSetOf(nested.unavailable),
+              });
+            }
+          } else {
+            unavailable.push(sel);
+          }
+        } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
+          const fragment = fragments[sel.name.value];
+          if (!fragment) {
+            unavailable.push(sel);
+            continue;
+          }
+          const cond = fragment.typeCondition.name.value;
+          if (owner.transformedSchema.getType(cond) != null) {
+            const nested = partitionSelectionsForSubschema(
+              owner,
+              cond,
+              fragment.selectionSet,
+              fragments,
+            );
+            if (nested.available.length) {
+              available.push({
+                kind: Kind.INLINE_FRAGMENT,
+                typeCondition: fragment.typeCondition,
+                directives: [
+                  ...(fragment.directives ?? []),
+                  ...(sel.directives ?? []),
+                ],
+                selectionSet: selectionSetOf(nested.available),
+              });
+            }
+            if (nested.unavailable.length) {
+              unavailable.push({
+                kind: Kind.INLINE_FRAGMENT,
+                typeCondition: fragment.typeCondition,
+                directives: [
+                  ...(fragment.directives ?? []),
+                  ...(sel.directives ?? []),
+                ],
+                selectionSet: selectionSetOf(nested.unavailable),
+              });
+            }
+          } else {
+            unavailable.push(sel);
+          }
+        }
+      }
+      return { owner, available, unavailable, provided };
+    }
     const partitioned = partitionSelectionsForSubschema(
       owner,
       returnTypeName,
@@ -711,7 +790,12 @@ function planRootField(
       ? rootFetches[0]!
       : { kind: 'Parallel', nodes: rootFetches };
 
-  // Entity follow-ups: fields still missing after all root contributions.
+  // Entity follow-ups for object return types. Abstract roots stay as
+  // pass-through Fetches (inline fragments) until Cast/Flatten lands.
+  if (returnType && isAbstractType(returnType)) {
+    return rootNode;
+  }
+
   const coveredNames = new Set<string>();
   for (const p of usedPartitions) {
     for (const sel of p.available) {
@@ -724,7 +808,6 @@ function planRootField(
     (fn) => !coveredNames.has(fn.name.value),
   );
 
-  // Source for merge planning: the owner that covered the most (keys live there).
   const primary = usedPartitions[0]!.owner;
 
   if (
@@ -797,8 +880,9 @@ export function buildStitchPlan(
 
   const rootType = getDefinedRootType(schema, operation.operation);
 
-  // Abstract types / union fragments need Flatten+Cast semantics the planned
-  // executor does not fully cover yet — fall back to schema execute.
+  // Abstract types / union fragments need Flatten+Cast for cross-subgraph
+  // member hydration. Root pass-through plans are still built (inline
+  // fragments partitioned per owner) for warming, but execute falls back.
   if (
     selectionHasAbstractTypes(
       schema,
@@ -823,21 +907,10 @@ export function buildStitchPlan(
     }
   }
 
-  // @skip / @include need Condition nodes. collectFields/getFieldsNotInSubschema
-  // evaluate those directives and throw when the variable has a default but was
-  // omitted from the variables map — bail out before that walk.
-  if (operationHasSkipOrInclude(operation, fragments)) {
-    return {
-      operation,
-      fragments,
-      root: { kind: 'Parallel', nodes: [] },
-      incomplete: true,
-      incompleteReasons: [
-        ...incompleteReasons,
-        '@skip/@include require schema execute until Condition nodes exist',
-      ],
-    };
-  }
+  // Apply variable defaults so @skip/@include + collectFields evaluate safely.
+  // Plans that depend on directive variables are cached per coerced variable map
+  // in createBackboneExecutor.
+  const coercedVariables = coerceOperationVariables(operation, variableValues);
 
   if (incompleteReasons.length > 0) {
     // Still attempt a best-effort plan for warming, but never throw out of here.
@@ -847,7 +920,7 @@ export function buildStitchPlan(
         stitchingInfo,
         operation,
         fragments,
-        variableValues,
+        coercedVariables,
         options,
         rootType,
         incompleteReasons,
@@ -868,7 +941,7 @@ export function buildStitchPlan(
     stitchingInfo,
     operation,
     fragments,
-    variableValues,
+    coercedVariables,
     options,
     rootType,
     incompleteReasons,
