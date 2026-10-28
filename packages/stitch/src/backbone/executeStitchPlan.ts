@@ -30,6 +30,9 @@ import {
   isObjectType,
   Kind,
   OperationTypeNode,
+  SelectionNode,
+  VariableDefinitionNode,
+  visit,
 } from 'graphql';
 import type {
   BackboneExecutionContext,
@@ -121,27 +124,95 @@ function mergeRootValues(existing: any, incoming: any): any {
   return incoming;
 }
 
+/** Drop @skip/@include — already evaluated at plan time. */
+function stripSkipInclude(selection: SelectionNode): SelectionNode {
+  if (selection.kind === Kind.FIELD) {
+    const directives = selection.directives?.filter(
+      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
+    );
+    const selectionSet = selection.selectionSet
+      ? {
+          ...selection.selectionSet,
+          selections: selection.selectionSet.selections.map(stripSkipInclude),
+        }
+      : undefined;
+    return {
+      ...selection,
+      directives: directives?.length ? directives : undefined,
+      selectionSet,
+    };
+  }
+  if (selection.kind === Kind.INLINE_FRAGMENT) {
+    const directives = selection.directives?.filter(
+      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
+    );
+    return {
+      ...selection,
+      directives: directives?.length ? directives : undefined,
+      selectionSet: {
+        ...selection.selectionSet,
+        selections: selection.selectionSet.selections.map(stripSkipInclude),
+      },
+    };
+  }
+  return selection;
+}
+
+function collectUsedVariableNames(node: SelectionNode): Set<string> {
+  const used = new Set<string>();
+  visit(node, {
+    Variable(v) {
+      used.add(v.name.value);
+    },
+  });
+  return used;
+}
+
+function filterVariableDefinitions(
+  defs: readonly VariableDefinitionNode[] | undefined,
+  used: Set<string>,
+): VariableDefinitionNode[] | undefined {
+  if (!defs?.length) {
+    return undefined;
+  }
+  const filtered = defs.filter((d) => used.has(d.variable.name.value));
+  return filtered.length ? filtered : undefined;
+}
+
 function buildRootDocument(
   operationName: string | undefined,
   operationType: OperationTypeNode,
   fieldNode: FieldNode,
   variableDefinitions: StitchPlan['operation']['variableDefinitions'],
+  variableValues: Record<string, any>,
 ) {
+  const cleaned = stripSkipInclude(fieldNode) as FieldNode;
+  const usedVars = collectUsedVariableNames(cleaned);
+  const filteredDefs = filterVariableDefinitions(variableDefinitions, usedVars);
+  const filteredVars: Record<string, any> = {};
+  for (const name of usedVars) {
+    if (name in variableValues) {
+      filteredVars[name] = variableValues[name];
+    }
+  }
   const op = {
     kind: Kind.OPERATION_DEFINITION as const,
     operation: operationType,
     name: operationName
       ? { kind: Kind.NAME as const, value: operationName }
       : undefined,
-    variableDefinitions,
+    variableDefinitions: filteredDefs,
     selectionSet: {
       kind: Kind.SELECTION_SET as const,
-      selections: [fieldNode],
+      selections: [cleaned],
     },
   };
   return {
-    kind: Kind.DOCUMENT as const,
-    definitions: [op],
+    document: {
+      kind: Kind.DOCUMENT as const,
+      definitions: [op],
+    },
+    variables: filteredVars,
   };
 }
 
@@ -188,11 +259,12 @@ function executeFetchNode(
   const executor = getSubschemaExecutor(node.subschema);
 
   if (node.rootField) {
-    const document = buildRootDocument(
+    const { document, variables } = buildRootDocument(
       ctx.operation.name?.value,
       ctx.operation.operation,
       node.rootField,
       ctx.operation.variableDefinitions,
+      ctx.variableValues,
     );
     const responseKey =
       node.rootField.alias?.value ?? node.rootField.name.value;
@@ -200,7 +272,7 @@ function executeFetchNode(
       () =>
         executor({
           document,
-          variables: ctx.variableValues,
+          variables,
           context: ctx.contextValue,
           rootValue: ctx.rootValue,
           operationType: ctx.operation.operation,
