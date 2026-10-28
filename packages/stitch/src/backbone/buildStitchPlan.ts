@@ -3077,493 +3077,6 @@ function entityBatchKey(
   return `${node.subschema.name ?? ''}|${node.entityTypeName}|${selectionSetKey(node.selectionSet)}`;
 }
 
-/** Same subgraph entity (selection/path ignored) — candidate for field union. */
-function entityTypeKey(
-  node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-): string | null {
-  if (node.rootField || !node.entityTypeName) {
-    return null;
-  }
-  if (!fetchFlattenPaths(node).length) {
-    return null;
-  }
-  return `${node.subschema.name ?? ''}|${node.entityTypeName}`;
-}
-
-function fieldResponseKey(field: FieldNode): string {
-  return field.alias?.value ?? field.name.value;
-}
-
-function fieldArgsKey(field: FieldNode): string {
-  if (!field.arguments?.length) {
-    return '';
-  }
-  return JSON.stringify(field.arguments.map((a) => [a.name.value, a.value]));
-}
-
-function pathsHaveNesting(paths: PathSegment[][]): boolean {
-  for (let i = 0; i < paths.length; i++) {
-    for (let j = 0; j < paths.length; j++) {
-      if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-function pathsEqual(a: PathSegment[], b: PathSegment[]): boolean {
-  return a.length === b.length && a.every((seg, i) => seg === b[i]);
-}
-
-/**
- * Locate merge field config across computed-isolation Subschema clones that
- * share a name but split `merge.fields` (e.g. shippingEstimate vs EUR).
- */
-function findMergeFieldConfig(
-  stitchingInfo: StitchingInfo,
-  subschema: Subschema,
-  typeName: string,
-  fieldName: string,
-) {
-  const direct = subschema.merge?.[typeName]?.fields?.[fieldName];
-  if (direct?.selectionSet || direct?.computed) {
-    return direct;
-  }
-  for (const s of stitchingInfo.subschemaMap.values()) {
-    if (subschema.name && s.name !== subschema.name) {
-      continue;
-    }
-    const field = s.merge?.[typeName]?.fields?.[fieldName];
-    if (field?.selectionSet || field?.computed) {
-      return field;
-    }
-  }
-  return undefined;
-}
-
-/** @requires bridge field nodes for one client field on a merge target. */
-function requiresDepsForField(
-  stitchingInfo: StitchingInfo,
-  subschema: Subschema,
-  typeName: string,
-  fieldName: string,
-): FieldNode[] {
-  if (fieldName === '__typename') {
-    return [];
-  }
-  const mergeField = findMergeFieldConfig(
-    stitchingInfo,
-    subschema,
-    typeName,
-    fieldName,
-  );
-  if (!mergeField?.selectionSet && !mergeField?.computed) {
-    return [];
-  }
-  return stitchingInfo.fieldNodesByField?.[typeName]?.[fieldName] ?? [];
-}
-
-/**
- * Collect @requires deps for every field in a Fetch selection. Used both for
- * selection-union safety (arg conflicts) and wave dependency edges.
- */
-function collectRequiresDeps(
-  stitchingInfo: StitchingInfo,
-  fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-): FieldNode[] {
-  if (!fetch.entityTypeName) {
-    return [];
-  }
-  const deps: FieldNode[] = [];
-  for (const sel of fetch.selectionSet.selections) {
-    if (sel.kind !== Kind.FIELD) {
-      continue;
-    }
-    deps.push(
-      ...requiresDepsForField(
-        stitchingInfo,
-        fetch.subschema,
-        fetch.entityTypeName,
-        sel.name.value,
-      ),
-    );
-  }
-  return deps;
-}
-
-
-function collectSelectedFieldNames(
-  selectionSet: SelectionSetNode,
-): Set<string> {
-  const names = new Set<string>();
-  for (const sel of selectionSet.selections) {
-    if (sel.kind === Kind.FIELD) {
-      names.add(sel.name.value);
-    }
-  }
-  return names;
-}
-
-/**
- * True when two selections can share one _entities Fetch: no @requires key
- * argument conflicts (requires-with-argument-conflict must stay split).
- */
-function requiresArgsCompatible(
-  stitchingInfo: StitchingInfo,
-  a: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-  b: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-): boolean {
-  const byName = new Map<string, string>();
-  for (const dep of [
-    ...collectRequiresDeps(stitchingInfo, a),
-    ...collectRequiresDeps(stitchingInfo, b),
-  ]) {
-    const args = fieldArgsKey(dep);
-    const prev = byName.get(dep.name.value);
-    if (prev != null && prev !== args) {
-      return false;
-    }
-    byName.set(dep.name.value, args);
-  }
-  return true;
-}
-
-function selectionsCompatibleForUnion(
-  a: SelectionSetNode,
-  b: SelectionSetNode,
-): boolean {
-  const aFields = new Map<string, FieldNode>();
-  for (const sel of a.selections) {
-    if (sel.kind === Kind.FIELD) {
-      aFields.set(fieldResponseKey(sel), sel);
-    }
-  }
-  for (const sel of b.selections) {
-    if (sel.kind !== Kind.FIELD) {
-      continue;
-    }
-    const key = fieldResponseKey(sel);
-    const prior = aFields.get(key);
-    if (!prior) {
-      continue;
-    }
-    if (
-      prior.name.value !== sel.name.value ||
-      fieldArgsKey(prior) !== fieldArgsKey(sel)
-    ) {
-      return false;
-    }
-    if (prior.selectionSet && sel.selectionSet) {
-      if (!selectionsCompatibleForUnion(prior.selectionSet, sel.selectionSet)) {
-        return false;
-      }
-    } else if (prior.selectionSet || sel.selectionSet) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function unionSelectionSets(
-  a: SelectionSetNode,
-  b: SelectionSetNode,
-): SelectionSetNode {
-  const byKey = new Map<string, SelectionNode>();
-  const add = (sel: SelectionNode) => {
-    if (sel.kind === Kind.FIELD) {
-      const key = `f:${fieldResponseKey(sel)}`;
-      const prior = byKey.get(key);
-      if (!prior || prior.kind !== Kind.FIELD) {
-        byKey.set(key, sel);
-        return;
-      }
-      if (prior.selectionSet && sel.selectionSet) {
-        byKey.set(key, {
-          ...prior,
-          selectionSet: unionSelectionSets(
-            prior.selectionSet,
-            sel.selectionSet,
-          ),
-        });
-      }
-      return;
-    }
-    byKey.set(selectionIdentity(sel), sel);
-  };
-  for (const sel of a.selections) {
-    add(sel);
-  }
-  for (const sel of b.selections) {
-    add(sel);
-  }
-  return { kind: Kind.SELECTION_SET, selections: [...byKey.values()] };
-}
-
-/**
- * Merge entity Fetches on the same subgraph type into one multi-path Fetch
- * with a unioned selection when @requires keys don't conflict.
- */
-function tryUnionEntityFetches(
-  stitchingInfo: StitchingInfo,
-  fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
-): Extract<StitchPlanNode, { kind: 'Fetch' }> | null {
-  if (fetches.length < 2) {
-    return null;
-  }
-  const typeKey = entityTypeKey(fetches[0]!);
-  if (!typeKey || fetches.some((f) => entityTypeKey(f) !== typeKey)) {
-    return null;
-  }
-  const pathMap = new Map<string, PathSegment[]>();
-  for (const p of fetches.flatMap(fetchFlattenPaths)) {
-    pathMap.set(p.join('\0'), p);
-  }
-  const paths = [...pathMap.values()];
-  if (!paths.length || pathsHaveNesting(paths)) {
-    return null;
-  }
-  // Do not union different field sets across different flatten paths when any
-  // side has @requires — that would schedule shippingEstimate on deep paths
-  // before PRODUCTS weight is available (Hive keeps those waves separate).
-  const pathKeys = new Set(
-    fetches.map((f) =>
-      fetchFlattenPaths(f)
-        .map((p) => p.join('\0'))
-        .sort()
-        .join('/'),
-    ),
-  );
-  const requiresCounts = fetches.map(
-    (f) => collectRequiresDeps(stitchingInfo, f).length,
-  );
-  const fetchesWithRequires = requiresCounts.filter((n) => n > 0).length;
-  // At most one hop in the union may carry @requires fields. This allows
-  // inStock (no requires) ∪ shippingEstimate, but keeps requires-circular /
-  // requires-with-argument sibling computed fields in separate Fetches.
-  if (fetchesWithRequires > 1) {
-    return null;
-  }
-  if (pathKeys.size > 1 && fetchesWithRequires > 0) {
-    return null;
-  }
-  for (let i = 0; i < fetches.length; i++) {
-    for (let j = i + 1; j < fetches.length; j++) {
-      if (!requiresArgsCompatible(stitchingInfo, fetches[i]!, fetches[j]!)) {
-        return null;
-      }
-      if (
-        !selectionsCompatibleForUnion(
-          fetches[i]!.selectionSet,
-          fetches[j]!.selectionSet,
-        )
-      ) {
-        return null;
-      }
-    }
-  }
-  let selectionSet = fetches[0]!.selectionSet;
-  for (let i = 1; i < fetches.length; i++) {
-    selectionSet = unionSelectionSets(selectionSet, fetches[i]!.selectionSet);
-  }
-  // Reject unions where one selected field @requires another selected
-  // computed field (requires-circular: byExpert needs byNovice first).
-  const selected = collectSelectedFieldNames(selectionSet);
-  const template = fetches[0]!;
-  for (const name of selected) {
-    const deps = requiresDepsForField(
-      stitchingInfo,
-      template.subschema,
-      template.entityTypeName!,
-      name,
-    );
-    for (const dep of deps) {
-      if (dep.name.value === name || !selected.has(dep.name.value)) {
-        continue;
-      }
-      const depMerge = findMergeFieldConfig(
-        stitchingInfo,
-        template.subschema,
-        template.entityTypeName!,
-        dep.name.value,
-      );
-      if (depMerge?.selectionSet || depMerge?.computed) {
-        return null;
-      }
-    }
-  }
-  return {
-    kind: 'Fetch',
-    subschema: template.subschema,
-    entityTypeName: template.entityTypeName,
-    selectionSet,
-    flattenPath: paths[0],
-    flattenPaths: paths,
-  };
-}
-
-/**
- * True when `selectionSet` nests fields matching `suffix` (path segments after
- * an earlier flatten path). Entity hops only "produce" deeper paths when their
- * selection actually returns those nested objects — hydrating inStock on
- * Product does not create Product.reviews.author.
- */
-function selectionProducesPathSuffix(
-  selectionSet: SelectionSetNode,
-  suffix: PathSegment[],
-): boolean {
-  if (!suffix.length) {
-    return true;
-  }
-  const head = suffix[0];
-  if (typeof head !== 'string') {
-    return selectionProducesPathSuffix(selectionSet, suffix.slice(1));
-  }
-  for (const sel of selectionSet.selections) {
-    if (sel.kind !== Kind.FIELD) {
-      continue;
-    }
-    const key = sel.alias?.value ?? sel.name.value;
-    if (key !== head) {
-      continue;
-    }
-    if (suffix.length === 1) {
-      return true;
-    }
-    if (sel.selectionSet) {
-      return selectionProducesPathSuffix(sel.selectionSet, suffix.slice(1));
-    }
-  }
-  return false;
-}
-
-/**
- * Parallel(PROVIDER…, INV_early), INV_late → [PROVIDER…, INV_early∪late]
- * when INV_late needs PROVIDER for @requires and the two INV hops can union.
- */
-function trySinkRequiresUnion(
-  parallel: Extract<StitchPlanNode, { kind: 'Parallel' }>,
-  late: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-  stitchingInfo: StitchingInfo,
-): StitchPlanNode | null {
-  const lateKey = entityTypeKey(late);
-  if (!lateKey) {
-    return null;
-  }
-  let earlyIdx = -1;
-  let early: Extract<StitchPlanNode, { kind: 'Fetch' }> | null = null;
-  for (let i = 0; i < parallel.nodes.length; i++) {
-    const n = parallel.nodes[i]!;
-    if (n.kind === 'Fetch' && entityTypeKey(n) === lateKey) {
-      earlyIdx = i;
-      early = n;
-      break;
-    }
-  }
-  if (!early || earlyIdx < 0) {
-    return null;
-  }
-  const providers = parallel.nodes.filter(
-    (n, i) =>
-      i !== earlyIdx &&
-      n.kind === 'Fetch' &&
-      fetchDependsOn(stitchingInfo, late, n),
-  );
-  if (!providers.length) {
-    return null;
-  }
-  const united = tryUnionEntityFetches(stitchingInfo, [early, late]);
-  if (!united) {
-    return null;
-  }
-  const remaining = parallel.nodes.filter((_, i) => i !== earlyIdx);
-  if (!remaining.length) {
-    return united;
-  }
-  return {
-    kind: 'Sequence',
-    nodes: [toParOrSingle(remaining), united],
-  };
-}
-
-/**
- * Does `later` need `earlier` to complete first? Path production or @requires.
- */
-function fetchDependsOn(
-  stitchingInfo: StitchingInfo,
-  later: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }>,
-): boolean {
-  const laterPaths = fetchFlattenPaths(later);
-  const earlierPaths = fetchFlattenPaths(earlier);
-  if (earlier.rootField) {
-    const rk =
-      earlier.rootField.alias?.value ?? earlier.rootField.name.value;
-    // Root Fetch produces the top segment; also check nested selection under it.
-    for (const lp of laterPaths) {
-      if (lp[0] !== rk) {
-        continue;
-      }
-      if (lp.length === 1) {
-        return true;
-      }
-      if (
-        selectionProducesPathSuffix(earlier.selectionSet, lp.slice(1))
-      ) {
-        return true;
-      }
-    }
-  }
-
-  for (const lp of laterPaths) {
-    for (const ep of earlierPaths) {
-      if (!pathIsPrefix(ep, lp)) {
-        continue;
-      }
-      const suffix = lp.slice(ep.length);
-      if (selectionProducesPathSuffix(earlier.selectionSet, suffix)) {
-        return true;
-      }
-    }
-  }
-
-  const reqNames = new Set(
-    collectRequiresDeps(stitchingInfo, later).map((d) => d.name.value),
-  );
-  if (!reqNames.size) {
-    return false;
-  }
-  const provided = collectSelectedFieldNames(earlier.selectionSet);
-  let providesNeeded = false;
-  for (const n of reqNames) {
-    if (provided.has(n)) {
-      providesNeeded = true;
-      break;
-    }
-  }
-  if (!providesNeeded) {
-    return false;
-  }
-  // Requires edge only if paths relate (same / ancestor / root).
-  if (earlier.rootField) {
-    const rk =
-      earlier.rootField.alias?.value ?? earlier.rootField.name.value;
-    if (laterPaths.some((lp) => lp[0] === rk)) {
-      return true;
-    }
-  }
-  for (const lp of laterPaths) {
-    for (const ep of earlierPaths) {
-      // earlier must be at the same path or an ancestor path of later —
-      // a deeper Fetch cannot satisfy requires for a shallower one.
-      if (pathsEqual(lp, ep) || pathIsPrefix(ep, lp)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 function fetchFlattenPaths(
   node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
 ): PathSegment[][] {
@@ -3623,13 +3136,13 @@ function collectBatchLocs(seqs: StitchPlanNode[][]): BatchLoc[] {
     for (let pos = 0; pos < seq.length; pos++) {
       const n = seq[pos]!;
       if (n.kind === 'Fetch') {
-        if (entityTypeKey(n) || entityBatchKey(n)) {
+        if (entityBatchKey(n)) {
           locs.push({ seqIdx: si, pos, fetch: n });
         }
       } else if (n.kind === 'Parallel') {
         for (let pi = 0; pi < n.nodes.length; pi++) {
           const c = n.nodes[pi]!;
-          if (c.kind === 'Fetch' && (entityTypeKey(c) || entityBatchKey(c))) {
+          if (c.kind === 'Fetch' && entityBatchKey(c)) {
             locs.push({
               seqIdx: si,
               pos,
@@ -3685,21 +3198,15 @@ function splitSeqAroundLoc(
  */
 function tryCrossBatchSequences(
   parallelNodes: StitchPlanNode[],
-  _stitchingInfo: StitchingInfo,
 ): StitchPlanNode | null {
   if (parallelNodes.length < 2) {
     return null;
   }
   const seqs = parallelNodes.map((n) => flattenSequenceNodes(n));
   const allLocs = collectBatchLocs(seqs);
-  // Identical selection only across sequences (safe BatchFetch). Field-set
-  // union across sequences is handled by adjacent/Parallel same-path union.
   const byKey = new Map<string, BatchLoc[]>();
   for (const loc of allLocs) {
-    const key = entityBatchKey(loc.fetch);
-    if (!key) {
-      continue;
-    }
+    const key = entityBatchKey(loc.fetch)!;
     let list = byKey.get(key);
     if (!list) {
       list = [];
@@ -3710,6 +3217,8 @@ function tryCrossBatchSequences(
 
   let best: BatchLoc[] | null = null;
   for (const locs of byKey.values()) {
+    // Prefer the latest loc per sequence so path prefixes (e.g. PRODUCTS
+    // price/weight before shippingEstimate @requires) stay in the prefix.
     const latestBySeq = new Map<number, BatchLoc>();
     for (const loc of locs) {
       const prev = latestBySeq.get(loc.seqIdx);
@@ -3727,7 +3236,16 @@ function tryCrossBatchSequences(
       continue;
     }
     const paths = uniq.flatMap((l) => fetchFlattenPaths(l.fetch));
-    if (pathsHaveNesting(paths)) {
+    let nested = false;
+    for (let i = 0; i < paths.length && !nested; i++) {
+      for (let j = 0; j < paths.length; j++) {
+        if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+          nested = true;
+          break;
+        }
+      }
+    }
+    if (nested) {
       continue;
     }
     if (!best || uniq.length > best.length) {
@@ -3739,19 +3257,14 @@ function tryCrossBatchSequences(
   }
 
   const batchPaths = best.flatMap((l) => fetchFlattenPaths(l.fetch));
-  const pathMap = new Map<string, PathSegment[]>();
-  for (const p of batchPaths) {
-    pathMap.set(p.join('\0'), p);
-  }
-  const dedupedPaths = [...pathMap.values()];
   const template = best[0]!.fetch;
   const batchFetch: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
     kind: 'Fetch',
     subschema: template.subschema,
     entityTypeName: template.entityTypeName,
     selectionSet: template.selectionSet,
-    flattenPath: dedupedPaths[0],
-    flattenPaths: dedupedPaths,
+    flattenPath: batchPaths[0],
+    flattenPaths: batchPaths,
   };
 
   const locBySeq = new Map(best.map((l) => [l.seqIdx, l]));
@@ -3811,16 +3324,10 @@ function mergeMultiPathFetches(
  *   fan-outs that must keep sameKey isolation)
  * - Drop exact-duplicate Fetches left by double nested planning
  */
-function optimizeStitchPlanNode(
-  node: StitchPlanNode,
-  stitchingInfo: StitchingInfo,
-): StitchPlanNode {
+function optimizeStitchPlanNode(node: StitchPlanNode): StitchPlanNode {
   if (node.kind === 'Island') {
     return node.continue
-      ? {
-          ...node,
-          continue: optimizeStitchPlanNode(node.continue, stitchingInfo),
-        }
+      ? { ...node, continue: optimizeStitchPlanNode(node.continue) }
       : node;
   }
   if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
@@ -3841,9 +3348,7 @@ function optimizeStitchPlanNode(
     return false;
   };
   const flat: StitchPlanNode[] = [];
-  for (const child of node.nodes.map((c) =>
-    optimizeStitchPlanNode(c, stitchingInfo),
-  )) {
+  for (const child of node.nodes.map(optimizeStitchPlanNode)) {
     // Do not flatten Parallel groups that contain root Fetches — shared-root
     // sameKey isolation (account vs chat) requires each alias's fan-out to stay
     // in its own Parallel unit.
@@ -3857,48 +3362,18 @@ function optimizeStitchPlanNode(
     }
   }
 
-  // Parallel: same-path field union (inStock∥shippingEstimate), then multi-path
-  // BatchFetch for identical selections across flatten paths.
+  // Parallel: batch same entity+selection across different flatten paths into
+  // one multi-path Fetch (Hive BatchFetch). Different selections at the same
+  // path stay separate (@requires-with-argument-conflict).
   const coalesced: StitchPlanNode[] = [];
   if (kind === 'Parallel') {
-    const byTypePath = new Map<
-      string,
-      Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
-    >();
-    const nonEntity: StitchPlanNode[] = [];
-    for (const child of flat) {
-      if (child.kind !== 'Fetch' || !entityTypeKey(child)) {
-        nonEntity.push(child);
-        continue;
-      }
-      const pk = fetchFlattenPaths(child)
-        .map((p) => p.join('\0'))
-        .sort()
-        .join('/');
-      const key = `${entityTypeKey(child)}::${pk}`;
-      let list = byTypePath.get(key);
-      if (!list) {
-        list = [];
-        byTypePath.set(key, list);
-      }
-      list.push(child);
-    }
-    const afterUnion: StitchPlanNode[] = [...nonEntity];
-    for (const group of byTypePath.values()) {
-      const united = tryUnionEntityFetches(stitchingInfo, group);
-      if (united) {
-        afterUnion.push(united);
-      } else {
-        afterUnion.push(...group);
-      }
-    }
     const batchGroups = new Map<
       string,
       Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
     >();
     const rest: StitchPlanNode[] = [];
     const seenExact = new Set<string>();
-    for (const child of afterUnion) {
+    for (const child of flat) {
       if (child.kind !== 'Fetch') {
         rest.push(child);
         continue;
@@ -3926,10 +3401,22 @@ function optimizeStitchPlanNode(
     for (const group of batchGroups.values()) {
       if (group.length === 1) {
         coalesced.push(group[0]!);
-      } else if (pathsHaveNesting(group.flatMap(fetchFlattenPaths))) {
-        coalesced.push(...group);
       } else {
-        coalesced.push(mergeMultiPathFetches(group));
+        const paths = group.flatMap(fetchFlattenPaths);
+        let nested = false;
+        for (let i = 0; i < paths.length && !nested; i++) {
+          for (let j = 0; j < paths.length; j++) {
+            if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+              nested = true;
+              break;
+            }
+          }
+        }
+        if (nested) {
+          coalesced.push(...group);
+        } else {
+          coalesced.push(mergeMultiPathFetches(group));
+        }
       }
     }
     coalesced.push(...rest);
@@ -3948,33 +3435,12 @@ function optimizeStitchPlanNode(
         ) {
           continue;
         }
-        const united = tryUnionEntityFetches(stitchingInfo, [prev, child]);
-        if (united) {
-          coalesced[coalesced.length - 1] = united;
-          continue;
-        }
-      }
-      // Sink pattern: Parallel(PROVIDER, INV_a), INV_b → PROVIDER then INV_a∪b
-      // when INV_b @requires fields from PROVIDER (Hive: one inventory hop).
-      if (
-        child.kind === 'Fetch' &&
-        prev?.kind === 'Parallel' &&
-        entityTypeKey(child)
-      ) {
-        const sunk = trySinkRequiresUnion(prev, child, stitchingInfo);
-        if (sunk) {
-          coalesced[coalesced.length - 1] = sunk;
-          continue;
-        }
       }
       coalesced.push(child);
     }
-    const withinBatched = tryBatchWithinSequence(coalesced, stitchingInfo);
+    const withinBatched = tryBatchWithinSequence(coalesced);
     if (withinBatched) {
-      return optimizeStitchPlanNode(
-        { kind: 'Sequence', nodes: withinBatched },
-        stitchingInfo,
-      );
+      return optimizeStitchPlanNode({ kind: 'Sequence', nodes: withinBatched });
     }
   }
 
@@ -3983,9 +3449,9 @@ function optimizeStitchPlanNode(
   }
 
   if (kind === 'Parallel') {
-    const crossBatched = tryCrossBatchSequences(coalesced, stitchingInfo);
+    const crossBatched = tryCrossBatchSequences(coalesced);
     if (crossBatched) {
-      return optimizeStitchPlanNode(crossBatched, stitchingInfo);
+      return optimizeStitchPlanNode(crossBatched);
     }
   }
 
@@ -3999,15 +3465,11 @@ function optimizeStitchPlanNode(
  */
 function tryBatchWithinSequence(
   nodes: StitchPlanNode[],
-  stitchingInfo: StitchingInfo,
 ): StitchPlanNode[] | null {
   const locs = collectBatchLocs([nodes]);
   const byKey = new Map<string, BatchLoc[]>();
   for (const loc of locs) {
-    const key = entityBatchKey(loc.fetch);
-    if (!key) {
-      continue;
-    }
+    const key = entityBatchKey(loc.fetch)!;
     let list = byKey.get(key);
     if (!list) {
       list = [];
@@ -4026,7 +3488,16 @@ function tryBatchWithinSequence(
     if (pathKeys.size < 2) {
       continue;
     }
-    if (pathsHaveNesting(paths)) {
+    let nested = false;
+    for (let i = 0; i < paths.length && !nested; i++) {
+      for (let j = 0; j < paths.length; j++) {
+        if (i !== j && pathIsPrefix(paths[i]!, paths[j]!)) {
+          nested = true;
+          break;
+        }
+      }
+    }
+    if (nested) {
       continue;
     }
     if (!best || group.length > best.length) {
@@ -4044,19 +3515,14 @@ function tryBatchWithinSequence(
   );
   const latest = sorted[sorted.length - 1]!;
   const batchPaths = best.flatMap((l) => fetchFlattenPaths(l.fetch));
-  const pathMap = new Map<string, PathSegment[]>();
-  for (const p of batchPaths) {
-    pathMap.set(p.join('\0'), p);
-  }
-  const dedupedPaths = [...pathMap.values()];
   const template = latest.fetch;
   const batchFetch: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
     kind: 'Fetch',
     subschema: template.subschema,
     entityTypeName: template.entityTypeName,
     selectionSet: template.selectionSet,
-    flattenPath: dedupedPaths[0],
-    flattenPaths: dedupedPaths,
+    flattenPath: batchPaths[0],
+    flattenPaths: batchPaths,
   };
 
   // Rebuild sequence: walk positions, skip removed fetches, insert batch at latest.
@@ -4167,7 +3633,7 @@ function buildCompletePlan(
   return {
     operation,
     fragments,
-    root: optimizeStitchPlanNode(rootRaw, stitchingInfo),
+    root: optimizeStitchPlanNode(rootRaw),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
   };
