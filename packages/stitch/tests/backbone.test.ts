@@ -150,6 +150,53 @@ describe('stitching backbone', () => {
     });
   });
 
+  it('emits Condition nodes for root @skip/@include and shares one plan', async () => {
+    const schema = createStitched();
+    const document = parse(/* GraphQL */ `
+      query ($id: ID!, $skipEmail: Boolean!) {
+        userById(id: $id) @skip(if: $skipEmail) {
+          id
+          email
+        }
+      }
+    `);
+    const operation = document.definitions[0] as any;
+    const planSkip = buildStitchPlan(schema, operation, {}, {
+      id: '1',
+      skipEmail: true,
+    });
+    const planInclude = buildStitchPlan(schema, operation, {}, {
+      id: '1',
+      skipEmail: false,
+    });
+    expect(planSkip.incompleteReasons).toEqual([]);
+    expect(planSkip.root.kind).toBe('Condition');
+    expect((planSkip.root as any).condition).toBe('skipEmail');
+    expect((planSkip.root as any).elseClause).toBeTruthy();
+    expect((planSkip.root as any).ifClause).toBeUndefined();
+    // Same structure regardless of variable map (one cached plan shape).
+    expect(planInclude.root.kind).toBe('Condition');
+
+    const executor = createBackboneExecutor(schema);
+    const skipped = await executor({
+      document,
+      variables: { id: '1', skipEmail: true },
+      context: {},
+    });
+    expect(skipped.errors).toBeUndefined();
+    expect(skipped.data).toEqual({});
+
+    const included = await executor({
+      document,
+      variables: { id: '1', skipEmail: false },
+      context: {},
+    });
+    expect(included.errors).toBeUndefined();
+    expect(included.data).toEqual({
+      userById: { id: '1', email: '1@example.com' },
+    });
+  });
+
   it('marks additionalResolvers as islands and still hydrates merge keys', async () => {
     const schema = stitchSchemas({
       subschemas: [

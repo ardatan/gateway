@@ -172,8 +172,8 @@ export function createBackboneExecutor(
     );
     // Condition nodes → one plan per document. Legacy peel still keys by vars.
     const hasSkipInclude = operationHasSkipOrIncludeFast(operation);
-    // Default off until Condition planner is fully wired; enable via options.
-    const useConditionPlans = options.useConditionNodes === true;
+    // Default on (Hive-style). Opt out with `useConditionNodes: false`.
+    const useConditionPlans = options.useConditionNodes !== false;
     const cacheKey =
       (operation.name?.value ?? '') +
       (useConditionPlans

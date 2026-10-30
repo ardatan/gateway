@@ -318,6 +318,10 @@ function finalizeRootResult(
     result.data = null;
   } else if (Object.keys(data).length) {
     result.data = data;
+  } else if (!ctx.errors.length) {
+    // All root fields skipped via @skip/@include Condition — graphql-js
+    // still returns an empty data object.
+    result.data = {};
   }
   if (ctx.errors.length) {
     result.errors = ctx.errors as any;
@@ -649,7 +653,9 @@ function buildRootDocument(
   variableValues: Record<string, any>,
   targetSchema?: GraphQLSchema,
 ) {
-  let cleaned = stripSkipInclude(fieldNode) as FieldNode;
+  // Keep nested @skip/@include — subgraph evaluates them (Condition / peel
+  // already decided which root fields run).
+  let cleaned = fieldNode;
   if (targetSchema && cleaned.selectionSet) {
     cleaned = {
       ...cleaned,
@@ -1357,6 +1363,15 @@ function collectExecutableHops(
 ): void {
   if (node.kind === 'Fetch' || node.kind === 'BatchFetch') {
     out.push(node);
+    return;
+  }
+  if (node.kind === 'Condition') {
+    if (node.ifClause) {
+      collectExecutableHops(node.ifClause, out);
+    }
+    if (node.elseClause) {
+      collectExecutableHops(node.elseClause, out);
+    }
     return;
   }
   if (node.kind === 'Sequence' || node.kind === 'Parallel') {

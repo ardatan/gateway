@@ -114,7 +114,7 @@ export interface BackboneExecutorOptions {
   installRootTrampoline?: boolean;
   /**
    * Emit Condition nodes for `@skip`/`@include` instead of specializing the
-   * plan per variable map. Default true.
+   * plan per variable map. Default true (set `false` for legacy peel).
    */
   useConditionNodes?: boolean;
   /**

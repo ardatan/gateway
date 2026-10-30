@@ -403,7 +403,10 @@ function buildRootFetchDocument(
   fieldNode: FieldNode,
   subgraphSchema: GraphQLSchema,
 ): DocumentNode {
-  let cleaned = stripSkipInclude(fieldNode) as FieldNode;
+  // Keep nested @skip/@include for subgraph evaluation (provides-scope /
+  // Condition). Root Condition nodes strip only the root field's own
+  // directives before planning.
+  let cleaned = fieldNode;
   if (cleaned.selectionSet) {
     cleaned = {
       ...cleaned,
@@ -453,6 +456,17 @@ export function preparePlanDocuments(
     return {
       kind: root.kind,
       nodes: root.nodes.map((n) => preparePlanDocuments(n, options)),
+    };
+  }
+  if (root.kind === 'Condition') {
+    return {
+      ...root,
+      ifClause: root.ifClause
+        ? preparePlanDocuments(root.ifClause, options)
+        : undefined,
+      elseClause: root.elseClause
+        ? preparePlanDocuments(root.elseClause, options)
+        : undefined,
     };
   }
   if (root.kind === 'Island') {
