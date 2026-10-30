@@ -6,6 +6,10 @@ export {
   isLocalField,
 } from './localFields.js';
 export { projectDataToOperation } from './projectResult.js';
+export {
+  BACKBONE_EXECUTING,
+  installRootTrampoline,
+} from './rootTrampoline.js';
 export type {
   BackboneExecutorOptions,
   StitchPlan,

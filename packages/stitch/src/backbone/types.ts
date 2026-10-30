@@ -79,6 +79,16 @@ export type StitchPlanNode =
       fieldNode: FieldNode;
       /** Federated follow-up after the local resolver returns a merge key. */
       continue?: StitchPlanNode;
+    }
+  | {
+      /**
+       * Hive-style runtime `@skip`/`@include` branch. `condition` is the
+       * variable name; true → ifClause, otherwise elseClause.
+       */
+      kind: 'Condition';
+      condition: string;
+      ifClause?: StitchPlanNode;
+      elseClause?: StitchPlanNode;
     };
 
 export interface StitchPlan {
@@ -97,6 +107,24 @@ export interface BackboneExecutorOptions {
    * typeDefs. Keyed by parent type name → field names.
    */
   localFields?: Map<string, Set<string>>;
+  /**
+   * Install Query/Mutation root resolvers that forward stock graphql-js
+   * `execute` into this backbone executor. Default true.
+   */
+  installRootTrampoline?: boolean;
+  /**
+   * Emit Condition nodes for `@skip`/`@include` instead of specializing the
+   * plan per variable map. Default true.
+   */
+  useConditionNodes?: boolean;
+  /**
+   * Progressive override label handler (gateway `progressiveOverride`).
+   * Called at plan time with request context when labels are present.
+   */
+  handleProgressiveOverride?: (
+    label: string,
+    context: any,
+  ) => boolean | Promise<boolean>;
 }
 
 export interface BackboneExecutionContext {

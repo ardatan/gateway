@@ -6,18 +6,21 @@ import {
   ExecutionResult,
   Executor,
   getOperationASTFromRequest,
+  isAsyncIterable,
 } from '@graphql-tools/utils';
 import { handleMaybePromise } from '@whatwg-node/promise-helpers';
-import { GraphQLSchema, Kind } from 'graphql';
+import { GraphQLSchema, Kind, OperationDefinitionNode } from 'graphql';
 import {
   buildStitchPlan,
   coerceOperationVariables,
 } from './buildStitchPlan.js';
 import { executeStitchPlan } from './executeStitchPlan.js';
 import { projectDataToOperation } from './projectResult.js';
+import { installRootTrampoline } from './rootTrampoline.js';
 import type { BackboneExecutorOptions, StitchPlan } from './types.js';
 
-function isIntrospectionOperation(request: ExecutionRequest): boolean {
+/** Full SDL introspection — schema execute (Hive also special-cases these). */
+function isSchemaIntrospectionOperation(request: ExecutionRequest): boolean {
   for (const def of request.document.definitions) {
     if (def.kind !== Kind.OPERATION_DEFINITION) {
       continue;
@@ -34,8 +37,69 @@ function isIntrospectionOperation(request: ExecutionRequest): boolean {
   return false;
 }
 
+/**
+ * Query that only asks for `__typename` (and aliases) — no subgraph owns the
+ * meta-field; Hive routes these to schema execute.
+ */
+function isOnlyTypenameQuery(operation: OperationDefinitionNode): boolean {
+  if (operation.operation !== 'query') {
+    return false;
+  }
+  const stack = [...operation.selectionSet.selections];
+  let sawField = false;
+  while (stack.length) {
+    const sel = stack.pop()!;
+    if (sel.kind === Kind.FIELD) {
+      sawField = true;
+      if (sel.name.value !== '__typename') {
+        return false;
+      }
+      continue;
+    }
+    if (
+      (sel.kind === Kind.INLINE_FRAGMENT ||
+        sel.kind === Kind.FRAGMENT_SPREAD) &&
+      'selectionSet' in sel &&
+      sel.selectionSet
+    ) {
+      stack.push(...sel.selectionSet.selections);
+    }
+  }
+  return sawField;
+}
+
+function documentHasDeferOrStream(request: ExecutionRequest): boolean {
+  for (const def of request.document.definitions) {
+    if (
+      def.kind !== Kind.OPERATION_DEFINITION &&
+      def.kind !== Kind.FRAGMENT_DEFINITION
+    ) {
+      continue;
+    }
+    const stack = [...def.selectionSet.selections];
+    while (stack.length) {
+      const sel = stack.pop()!;
+      if (
+        'directives' in sel &&
+        sel.directives?.some(
+          (d) => d.name.value === 'defer' || d.name.value === 'stream',
+        )
+      ) {
+        return true;
+      }
+      if (
+        (sel.kind === Kind.FIELD || sel.kind === Kind.INLINE_FRAGMENT) &&
+        sel.selectionSet
+      ) {
+        stack.push(...sel.selectionSet.selections);
+      }
+    }
+  }
+  return false;
+}
+
 function operationHasSkipOrIncludeFast(
-  operation: import('graphql').OperationDefinitionNode,
+  operation: OperationDefinitionNode,
 ): boolean {
   const stack = [...operation.selectionSet.selections];
   while (stack.length) {
@@ -68,15 +132,10 @@ function stableStringify(value: Record<string, any>): string {
 }
 
 /**
- * Stitching backbone executor — replaces classic GraphQL.js stitching execute.
- *
- * Every request:
- * 1. Builds (or reuses a cached) operation-level plan.
- * 2. Executes Fetch/Parallel/Sequence/Island and projects to the client
- *    selection. There is no schema-execute fallback: incomplete plans must be
- *    fixed in the planner (plan quality = execute model).
- *
- * Introspection still uses schema execute (SDL walk, not a federated plan).
+ * Stitching backbone executor — plan once (cached) and run Fetch/Parallel/
+ * Sequence/Island/Condition. Subscriptions, SDL introspection, `{ __typename }`,
+ * and @defer/@stream still use schema execute (classic subscribe / incremental)
+ * until those are planned end-to-end.
  */
 export function createBackboneExecutor(
   schema: GraphQLSchema,
@@ -87,6 +146,13 @@ export function createBackboneExecutor(
     ExecutionRequest['document'],
     Map<string | null, StitchPlan>
   >();
+
+  // graphql-js execute on this schema → same backbone (Query/Mutation roots).
+  if (options.installRootTrampoline !== false) {
+    installRootTrampoline(schema, (request) =>
+      stitchingBackboneExecutor(request),
+    );
+  }
 
   function getCachedPlan(request: ExecutionRequest): StitchPlan {
     const operation = getOperationASTFromRequest(request);
@@ -104,12 +170,17 @@ export function createBackboneExecutor(
       operation,
       request.variables ?? {},
     );
-    // Include coerced variables in the cache key when @skip/@include are present
-    // so directive evaluation stays consistent with the planned selection.
+    // Condition nodes → one plan per document. Legacy peel still keys by vars.
     const hasSkipInclude = operationHasSkipOrIncludeFast(operation);
+    // Default off until Condition planner is fully wired; enable via options.
+    const useConditionPlans = options.useConditionNodes === true;
     const cacheKey =
       (operation.name?.value ?? '') +
-      (hasSkipInclude ? `::${stableStringify(coerced)}` : '');
+      (useConditionPlans
+        ? ''
+        : hasSkipInclude
+          ? `::${stableStringify(coerced)}`
+          : '');
     let byName = planCache.get(request.document);
     if (byName) {
       const cached = byName.get(cacheKey);
@@ -122,15 +193,8 @@ export function createBackboneExecutor(
     }
     let plan: StitchPlan;
     try {
-      plan = buildStitchPlan(
-        schema,
-        operation,
-        fragments,
-        coerced,
-        options,
-      );
+      plan = buildStitchPlan(schema, operation, fragments, coerced, options);
     } catch (err) {
-      // Directive evaluation during planning can throw; fall back to schema.
       plan = {
         operation,
         fragments,
@@ -145,17 +209,22 @@ export function createBackboneExecutor(
     return plan;
   }
 
-  return function stitchingBackboneExecutor(request: ExecutionRequest) {
-    if (isIntrospectionOperation(request)) {
+  function stitchingBackboneExecutor(request: ExecutionRequest) {
+    const operation = getOperationASTFromRequest(request);
+
+    // Schema-execute paths (not yet planned end-to-end on the backbone).
+    if (
+      isSchemaIntrospectionOperation(request) ||
+      (operation && isOnlyTypenameQuery(operation)) ||
+      (operation && operation.operation === 'subscription') ||
+      documentHasDeferOrStream(request)
+    ) {
       return schemaExecutor(request);
     }
 
     const plan = getCachedPlan(request);
-    const operation = getOperationASTFromRequest(request) ?? plan.operation;
-    const coerced = coerceOperationVariables(
-      operation,
-      request.variables ?? {},
-    );
+    const op = operation ?? plan.operation;
+    const coerced = coerceOperationVariables(op, request.variables ?? {});
     const requestWithCoercedVars: ExecutionRequest = {
       ...request,
       variables: coerced,
@@ -176,11 +245,14 @@ export function createBackboneExecutor(
     return handleMaybePromise(
       () => executeStitchPlan(schema, plan, requestWithCoercedVars),
       (result: ExecutionResult) => {
+        if (isAsyncIterable(result)) {
+          return result;
+        }
         const projected: ExecutionResult = {
           ...result,
           data: projectDataToOperation(
             schema,
-            operation,
+            op,
             plan.fragments,
             coerced,
             result.data as any,
@@ -189,5 +261,7 @@ export function createBackboneExecutor(
         return projected;
       },
     );
-  };
+  }
+
+  return stitchingBackboneExecutor;
 }
