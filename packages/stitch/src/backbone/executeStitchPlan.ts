@@ -40,6 +40,7 @@ import {
   VariableDefinitionNode,
   visit,
 } from 'graphql';
+import { BACKBONE_EXECUTING } from './rootTrampoline.js';
 import type {
   BackboneExecutionContext,
   PathSegment,
@@ -991,11 +992,18 @@ function executeIslandNode(
     return;
   }
   const fieldName = node.fieldNode.name.value;
+  const responseKey = node.fieldNode.alias?.value ?? fieldName;
+
+  // Meta-field: no GraphQLField.resolve on the type.
+  if (fieldName === '__typename') {
+    ctx.data[responseKey] = node.parentTypeName;
+    return;
+  }
+
   const field = parentType.getFields()[fieldName];
   if (!field?.resolve) {
     return;
   }
-  const responseKey = node.fieldNode.alias?.value ?? fieldName;
   const args = getArgumentValues(field, node.fieldNode, ctx.variableValues);
   const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
   const info = {
@@ -1159,6 +1167,15 @@ function executePlanNode(
       return executeBatchFetchNode(node, ctx);
     case 'Island':
       return executeIslandNode(node, ctx);
+    case 'Condition': {
+      const value = ctx.variableValues?.[node.condition];
+      if (value === true) {
+        return node.ifClause ? executePlanNode(node.ifClause, ctx) : undefined;
+      }
+      return node.elseClause
+        ? executePlanNode(node.elseClause, ctx)
+        : undefined;
+    }
     default:
       return;
   }
@@ -1549,13 +1566,20 @@ export function executeStitchPlan(
 
   const variableValues = request.variables ?? {};
 
+  const contextValue =
+    request.context != null && typeof request.context === 'object'
+      ? request.context
+      : Object.create(null);
+  // Let root trampoline know Island resolvers must use original resolves.
+  (contextValue as any)[BACKBONE_EXECUTING] = true;
+
   const ctx: BackboneExecutionContext = {
     schema,
     document: request.document,
     operation,
     fragments,
     variableValues,
-    contextValue: request.context,
+    contextValue,
     rootValue: request.rootValue,
     signal: request.signal,
     data: {},
@@ -1569,14 +1593,18 @@ export function executeStitchPlan(
   return handleMaybePromise(
     () => executePlanNode(plan.root, ctx),
     () => {
-      const result: ExecutionResult = {};
-      if (Object.keys(ctx.data).length) {
-        result.data = ctx.data;
+      try {
+        const result: ExecutionResult = {};
+        if (Object.keys(ctx.data).length) {
+          result.data = ctx.data;
+        }
+        if (ctx.errors.length) {
+          result.errors = ctx.errors as any;
+        }
+        return result;
+      } finally {
+        delete (contextValue as any)[BACKBONE_EXECUTING];
       }
-      if (ctx.errors.length) {
-        result.errors = ctx.errors as any;
-      }
-      return result;
     },
   );
 }

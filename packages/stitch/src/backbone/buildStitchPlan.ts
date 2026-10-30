@@ -1813,6 +1813,16 @@ function planRootField(
   const fieldName = fieldNode.name.value;
   const responseKey = fieldNode.alias?.value ?? fieldName;
 
+  // Meta-field: always local (Hive routes pure-__typename queries to schema
+  // execute; mixed selections write the root type name here).
+  if (fieldName === '__typename') {
+    return {
+      kind: 'Island',
+      parentTypeName: rootType.name,
+      fieldNode,
+    };
+  }
+
   if (isLocalField(localFields, rootType.name, fieldName)) {
     let continuePlan: StitchPlanNode | undefined;
     const field = rootType.getFields()[fieldName];
@@ -2955,15 +2965,8 @@ export function buildStitchPlan(
     };
   }
 
-  if (operation.operation === 'subscription') {
-    return {
-      operation,
-      fragments,
-      root: { kind: 'Parallel', nodes: [] },
-      incomplete: true,
-      incompleteReasons: ['Subscriptions are not planned by the backbone yet'],
-    };
-  }
+  // Subscriptions are routed to schema execute in createBackboneExecutor
+  // (classic subscribe + type merging). Planning them here is unused.
 
   const rootType = getDefinedRootType(schema, operation.operation);
 
