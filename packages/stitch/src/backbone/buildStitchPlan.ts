@@ -3710,6 +3710,15 @@ function collectEntityFetchOrders(
     }
     return;
   }
+  if (node.kind === 'Condition') {
+    if (node.ifClause) {
+      collectEntityFetchOrders(node.ifClause, locs, counter);
+    }
+    if (node.elseClause) {
+      collectEntityFetchOrders(node.elseClause, locs, counter);
+    }
+    return;
+  }
   if (node.kind === 'Sequence' || node.kind === 'Parallel') {
     for (const child of node.nodes) {
       collectEntityFetchOrders(child, locs, counter);
@@ -3741,6 +3750,18 @@ function applyFetchOrderUpdates(
       return { ...node, continue: undefined };
     }
     return { ...node, continue: cont };
+  }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? applyFetchOrderUpdates(node.ifClause, updates, counter) ?? undefined
+        : undefined,
+      elseClause: node.elseClause
+        ? applyFetchOrderUpdates(node.elseClause, updates, counter) ??
+          undefined
+        : undefined,
+    };
   }
   if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
     return node;
@@ -3921,6 +3942,17 @@ function packIndependentWaves(
           continue: packIndependentWaves(node.continue, stitchingInfo),
         }
       : node;
+  }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? packIndependentWaves(node.ifClause, stitchingInfo)
+        : undefined,
+      elseClause: node.elseClause
+        ? packIndependentWaves(node.elseClause, stitchingInfo)
+        : undefined,
+    };
   }
   if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
     return node;
@@ -4365,6 +4397,17 @@ function optimizeStitchPlanNode(
         }
       : node;
   }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? optimizeStitchPlanNode(node.ifClause, stitchingInfo)
+        : undefined,
+      elseClause: node.elseClause
+        ? optimizeStitchPlanNode(node.elseClause, stitchingInfo)
+        : undefined,
+    };
+  }
   if (node.kind !== 'Sequence' && node.kind !== 'Parallel') {
     return node;
   }
@@ -4376,6 +4419,12 @@ function optimizeStitchPlanNode(
     }
     if (n.kind === 'Parallel' || n.kind === 'Sequence') {
       return n.nodes.some(hasRootFetch);
+    }
+    if (n.kind === 'Condition') {
+      return (
+        (n.ifClause != null && hasRootFetch(n.ifClause)) ||
+        (n.elseClause != null && hasRootFetch(n.elseClause))
+      );
     }
     if (n.kind === 'Island') {
       return true;
@@ -4666,6 +4715,163 @@ function tryBatchWithinSequence(
   return out;
 }
 
+/**
+ * Expand root selections without evaluating `@skip`/`@include` (Condition path).
+ * Fragment spreads / inline fragments are flattened to field nodes.
+ */
+function collectRootFieldNodesPreservingSkipInclude(
+  selectionSet: SelectionSetNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+): FieldNode[] {
+  const out: FieldNode[] = [];
+  for (const sel of selectionSet.selections) {
+    if (sel.kind === Kind.FIELD) {
+      out.push(sel);
+      continue;
+    }
+    if (sel.kind === Kind.INLINE_FRAGMENT) {
+      out.push(
+        ...collectRootFieldNodesPreservingSkipInclude(
+          sel.selectionSet,
+          fragments,
+        ),
+      );
+      continue;
+    }
+    if (sel.kind === Kind.FRAGMENT_SPREAD) {
+      const frag = fragments[sel.name.value];
+      if (frag) {
+        out.push(
+          ...collectRootFieldNodesPreservingSkipInclude(
+            frag.selectionSet,
+            fragments,
+          ),
+        );
+      }
+    }
+  }
+  return out;
+}
+
+/** Variable name for `@skip(if: $v)` / `@include(if: $v)`, else null. */
+function skipIncludeVariableName(
+  field: FieldNode,
+  directiveName: 'skip' | 'include',
+): string | null {
+  const dir = field.directives?.find((d) => d.name.value === directiveName);
+  const arg = dir?.arguments?.find((a) => a.name.value === 'if');
+  if (!arg) {
+    return null;
+  }
+  if (arg.value.kind === Kind.VARIABLE) {
+    return arg.value.name.value;
+  }
+  return null;
+}
+
+/** Literal `@skip(if: true)` / `@include(if: false)` — never plan this field. */
+function isUnconditionallyOmittedBySkipInclude(field: FieldNode): boolean {
+  for (const dir of field.directives ?? []) {
+    const arg = dir.arguments?.find((a) => a.name.value === 'if');
+    if (!arg || arg.value.kind !== Kind.BOOLEAN) {
+      continue;
+    }
+    if (dir.name.value === 'skip' && arg.value.value === true) {
+      return true;
+    }
+    if (dir.name.value === 'include' && arg.value.value === false) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Strip only this field's skip/include; keep nested directives for subgraphs. */
+function stripOwnSkipIncludeDirectives(field: FieldNode): FieldNode {
+  const directives = field.directives?.filter(
+    (d) => d.name.value !== 'skip' && d.name.value !== 'include',
+  );
+  return {
+    ...field,
+    directives: directives?.length ? directives : undefined,
+  };
+}
+
+/**
+ * Wrap a root-field plan in Hive-style Condition nodes for variable-driven
+ * `@skip` / `@include`. `ifClause` runs when the variable is `true`.
+ */
+function wrapRootFieldWithConditions(
+  field: FieldNode,
+  plan: StitchPlanNode,
+): StitchPlanNode {
+  let node = plan;
+  const includeVar = skipIncludeVariableName(field, 'include');
+  if (includeVar) {
+    node = {
+      kind: 'Condition',
+      condition: includeVar,
+      ifClause: node,
+    };
+  }
+  const skipVar = skipIncludeVariableName(field, 'skip');
+  if (skipVar) {
+    node = {
+      kind: 'Condition',
+      condition: skipVar,
+      elseClause: node,
+    };
+  }
+  return node;
+}
+
+/**
+ * Plan-time vars that keep every `@skip`/`@include` selection present so one
+ * document plan covers all runtime maps. Nested directives stay on the AST and
+ * are evaluated by the subgraph (or by Condition at roots).
+ */
+function variablesForcingSkipIncludePresent(
+  operation: OperationDefinitionNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+  variableValues: Record<string, any>,
+): Record<string, any> {
+  const forced = { ...variableValues };
+  const visitSet = (selectionSet: SelectionSetNode) => {
+    for (const sel of selectionSet.selections) {
+      if (
+        (sel.kind === Kind.FIELD || sel.kind === Kind.INLINE_FRAGMENT) &&
+        sel.directives
+      ) {
+        for (const dir of sel.directives) {
+          if (dir.name.value !== 'skip' && dir.name.value !== 'include') {
+            continue;
+          }
+          const arg = dir.arguments?.find((a) => a.name.value === 'if');
+          if (arg?.value.kind !== Kind.VARIABLE) {
+            continue;
+          }
+          const name = arg.value.name.value;
+          // @skip(if: $v) present when $v is false; @include when $v is true.
+          forced[name] = dir.name.value === 'include';
+        }
+      }
+      if (
+        (sel.kind === Kind.FIELD || sel.kind === Kind.INLINE_FRAGMENT) &&
+        sel.selectionSet
+      ) {
+        visitSet(sel.selectionSet);
+      } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
+        const frag = fragments[sel.name.value];
+        if (frag) {
+          visitSet(frag.selectionSet);
+        }
+      }
+    }
+  };
+  visitSet(operation.selectionSet);
+  return forced;
+}
+
 function buildCompletePlan(
   schema: GraphQLSchema,
   stitchingInfo: StitchingInfo,
@@ -4676,39 +4882,83 @@ function buildCompletePlan(
   rootType: GraphQLObjectType,
   incompleteReasons: string[],
 ): StitchPlan {
-  const { fields } = collectFields(
-    schema,
-    fragments,
-    getVariableValues(variableValues),
-    rootType,
-    operation.selectionSet,
-  );
+  // Default on: one plan per document with Condition nodes. Opt out via
+  // `useConditionNodes: false` to keep legacy collectFields peel + var cache.
+  const useConditionNodes = options.useConditionNodes !== false;
 
   const rootNodes: StitchPlanNode[] = [];
-  for (const [, fieldNodes] of fields) {
-    const fieldNode = fieldNodes[0];
-    if (!fieldNode) {
-      continue;
-    }
-    if (
-      fieldNode.name.value === '__schema' ||
-      fieldNode.name.value === '__type'
-    ) {
-      incompleteReasons.push('Introspection requires schema execute');
-      continue;
-    }
-    rootNodes.push(
-      planRootField(
+
+  if (useConditionNodes) {
+    // Include all skip/include selections while planning so the cached plan is
+    // valid for every variable map; subgraphs still see the directives.
+    const planVars = variablesForcingSkipIncludePresent(
+      operation,
+      fragments,
+      variableValues,
+    );
+    for (const fieldNode of collectRootFieldNodesPreservingSkipInclude(
+      operation.selectionSet,
+      fragments,
+    )) {
+      if (
+        fieldNode.name.value === '__schema' ||
+        fieldNode.name.value === '__type'
+      ) {
+        incompleteReasons.push('Introspection requires schema execute');
+        continue;
+      }
+      if (isUnconditionallyOmittedBySkipInclude(fieldNode)) {
+        continue;
+      }
+      // Condition decides the root field; strip only own directives so nested
+      // @skip/@include remain for subgraph evaluation / provides-scope.
+      const cleaned = stripOwnSkipIncludeDirectives(fieldNode);
+      const planned = planRootField(
         schema,
         stitchingInfo,
         operation,
-        fieldNode,
+        cleaned,
         fragments,
-        variableValues,
+        planVars,
         options.localFields,
         incompleteReasons,
-      ),
+      );
+      rootNodes.push(wrapRootFieldWithConditions(fieldNode, planned));
+    }
+  } else {
+    const { fields } = collectFields(
+      schema,
+      fragments,
+      getVariableValues(variableValues),
+      rootType,
+      operation.selectionSet,
     );
+
+    for (const [, fieldNodes] of fields) {
+      const fieldNode = fieldNodes[0];
+      if (!fieldNode) {
+        continue;
+      }
+      if (
+        fieldNode.name.value === '__schema' ||
+        fieldNode.name.value === '__type'
+      ) {
+        incompleteReasons.push('Introspection requires schema execute');
+        continue;
+      }
+      rootNodes.push(
+        planRootField(
+          schema,
+          stitchingInfo,
+          operation,
+          fieldNode,
+          fragments,
+          variableValues,
+          options.localFields,
+          incompleteReasons,
+        ),
+      );
+    }
   }
 
   if (!rootNodes.length && incompleteReasons.length === 0) {
@@ -4790,6 +5040,15 @@ function collectExecutableFetches(
     }
     return;
   }
+  if (node.kind === 'Condition') {
+    if (node.ifClause) {
+      collectExecutableFetches(node.ifClause, out);
+    }
+    if (node.elseClause) {
+      collectExecutableFetches(node.elseClause, out);
+    }
+    return;
+  }
   if (node.kind === 'Sequence' || node.kind === 'Parallel') {
     for (const child of node.nodes) {
       collectExecutableFetches(child, out);
@@ -4813,6 +5072,17 @@ function peelRootParallelHeads(
           continue: peelRootParallelHeads(node.continue, stitchingInfo),
         }
       : node;
+  }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? peelRootParallelHeads(node.ifClause, stitchingInfo)
+        : undefined,
+      elseClause: node.elseClause
+        ? peelRootParallelHeads(node.elseClause, stitchingInfo)
+        : undefined,
+    };
   }
   if (node.kind === 'Sequence') {
     return {
@@ -4884,6 +5154,17 @@ function peelLeadingEntityFetches(
           continue: peelLeadingEntityFetches(node.continue, stitchingInfo),
         }
       : node;
+  }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? peelLeadingEntityFetches(node.ifClause, stitchingInfo)
+        : undefined,
+      elseClause: node.elseClause
+        ? peelLeadingEntityFetches(node.elseClause, stitchingInfo)
+        : undefined,
+    };
   }
   if (node.kind === 'Sequence') {
     return {
@@ -5001,6 +5282,17 @@ function compressProductsIntoDeepWave(
         }
       : node;
   }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? compressProductsIntoDeepWave(node.ifClause, stitchingInfo)
+        : undefined,
+      elseClause: node.elseClause
+        ? compressProductsIntoDeepWave(node.elseClause, stitchingInfo)
+        : undefined,
+    };
+  }
   if (node.kind === 'Parallel') {
     return {
       kind: 'Parallel',
@@ -5111,6 +5403,17 @@ function groupParallelBatchFetches(
           continue: groupParallelBatchFetches(node.continue, stitchingInfo),
         }
       : node;
+  }
+  if (node.kind === 'Condition') {
+    return {
+      ...node,
+      ifClause: node.ifClause
+        ? groupParallelBatchFetches(node.ifClause, stitchingInfo)
+        : undefined,
+      elseClause: node.elseClause
+        ? groupParallelBatchFetches(node.elseClause, stitchingInfo)
+        : undefined,
+    };
   }
   if (node.kind === 'Sequence') {
     return {
@@ -5289,6 +5592,17 @@ function annotateFetchDeps(
         ? { ...node, continue: assign(node.continue, sequenceBarrier) }
         : node;
     }
+    if (node.kind === 'Condition') {
+      return {
+        ...node,
+        ifClause: node.ifClause
+          ? assign(node.ifClause, sequenceBarrier)
+          : undefined,
+        elseClause: node.elseClause
+          ? assign(node.elseClause, sequenceBarrier)
+          : undefined,
+      };
+    }
     if (node.kind === 'Parallel') {
       return {
         kind: 'Parallel',
@@ -5327,6 +5641,15 @@ function collectCompletedIds(node: StitchPlanNode, out: string[]): void {
   if (node.kind === 'Island') {
     if (node.continue) {
       collectCompletedIds(node.continue, out);
+    }
+    return;
+  }
+  if (node.kind === 'Condition') {
+    if (node.ifClause) {
+      collectCompletedIds(node.ifClause, out);
+    }
+    if (node.elseClause) {
+      collectCompletedIds(node.elseClause, out);
     }
     return;
   }
