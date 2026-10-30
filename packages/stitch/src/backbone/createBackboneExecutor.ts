@@ -174,13 +174,39 @@ export function createBackboneExecutor(
     const hasSkipInclude = operationHasSkipOrIncludeFast(operation);
     // Default on (Hive-style). Opt out with `useConditionNodes: false`.
     const useConditionPlans = options.useConditionNodes !== false;
+    let overrideKey = '';
+    if (options.overrideLabels && request.context != null) {
+      const labels = [...options.overrideLabels];
+      // Percent overrides roll RNG inside fieldConfig.override at plan time —
+      // never reuse a cached plan across requests when any percent label exists.
+      if (labels.some((l) => l.startsWith('percent('))) {
+        overrideKey += `::pct:${Math.random().toString(36).slice(2)}`;
+      } else if (options.handleProgressiveOverride) {
+        const enabled: string[] = [];
+        for (const label of labels) {
+          try {
+            const on = options.handleProgressiveOverride(
+              label,
+              request.context,
+            );
+            if (on === true) {
+              enabled.push(label);
+            }
+          } catch {
+            // ignore async/throwing handlers for cache key
+          }
+        }
+        overrideKey += `::ov:${enabled.sort().join(',')}`;
+      }
+    }
     const cacheKey =
       (operation.name?.value ?? '') +
       (useConditionPlans
         ? ''
         : hasSkipInclude
           ? `::${stableStringify(coerced)}`
-          : '');
+          : '') +
+      overrideKey;
     let byName = planCache.get(request.document);
     if (byName) {
       const cached = byName.get(cacheKey);
@@ -193,7 +219,10 @@ export function createBackboneExecutor(
     }
     let plan: StitchPlan;
     try {
-      plan = buildStitchPlan(schema, operation, fragments, coerced, options);
+      plan = buildStitchPlan(schema, operation, fragments, coerced, {
+        ...options,
+        context: request.context,
+      });
     } catch (err) {
       plan = {
         operation,

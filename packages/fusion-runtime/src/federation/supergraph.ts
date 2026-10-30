@@ -493,6 +493,10 @@ export const handleFederationSupergraph = function ({
   const localFields = collectLocalFieldsFromResolvers(additionalResolvers);
   const executor = createBackboneExecutor(executableUnifiedGraph, {
     localFields,
+    handleProgressiveOverride,
+    overrideLabels: executableUnifiedGraph.extensions?.['overrideLabels'] as
+      | Iterable<string>
+      | undefined,
   });
 
   return {
