@@ -287,9 +287,10 @@ export const handleFederationSupergraph = function ({
         additionalTypeDefs,
         additionalResolvers,
       );
-      // Backbone plan-time Fetches own computed/@requires hops — skip
-      // isolateComputedFields / splitMergedTypeEntryPoints subschema clones.
-      opts.isolateComputedFields = false;
+      // NOTE: isolateComputedFields stays true for now — requires-circular /
+      // requires-with-argument federation-compat still need isolation clones.
+      // Set opts.isolateComputedFields = false once plan-time Fetches cover
+      // per-field @requires selection sets without TransformCompositeFields.
       // @ts-expect-error - Typings are wrong
       opts.resolvers = additionalResolvers;
       // @ts-expect-error - Typings are wrong
