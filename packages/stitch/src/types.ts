@@ -71,6 +71,13 @@ export interface IStitchSchemasOptions<
   mergeTypes?: boolean | Array<string> | MergeTypeFilter<TContext>;
   typeMergingOptions?: TypeMergingOptions<TContext>;
   subschemaConfigTransforms?: Array<SubschemaConfigTransform<TContext>>;
+  /**
+   * Run isolateComputedFields + splitMergedTypeEntryPoints presets that clone
+   * subschemas for computed/@requires isolation. Default true for classic
+   * stitching resolvers. Gateway backbone plan-time Fetches do not need clones
+   * — fusion-runtime sets this false.
+   */
+  isolateComputedFields?: boolean;
 }
 
 export type SubschemaConfigTransform<TContext = Record<string, any>> = (

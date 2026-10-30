@@ -377,6 +377,7 @@ function applySubschemaConfigTransforms<TContext = Record<string, any>>(
     Subschema<any, any, any, TContext>,
     GraphQLSchema | SubschemaConfig<any, any, any, TContext>
   >,
+  isolateComputedFields = true,
 ): Array<Subschema<any, any, any, TContext>> {
   let subschemaConfig: SubschemaConfig<any, any, any, TContext>;
   if (isSubschemaConfig(subschemaOrSubschemaConfig)) {
@@ -389,15 +390,18 @@ function applySubschemaConfigTransforms<TContext = Record<string, any>>(
     );
   }
 
-  const transformedSubschemaConfigs = subschemaConfigTransforms
-    .concat(subschemaConfigTransformerPresets)
-    .reduce(
-      (transformedSubschemaConfigs, subschemaConfigTransform) =>
-        transformedSubschemaConfigs.flatMap((ssConfig) =>
-          subschemaConfigTransform(ssConfig),
-        ),
-      [subschemaConfig],
-    );
+  // Isolation presets clone subschemas for classic computed-field resolvers.
+  // Backbone plan-time Fetches (fusion-runtime) set isolateComputedFields: false.
+  const transforms = isolateComputedFields
+    ? subschemaConfigTransforms.concat(subschemaConfigTransformerPresets)
+    : subschemaConfigTransforms;
+  const transformedSubschemaConfigs = transforms.reduce(
+    (transformedSubschemaConfigs, subschemaConfigTransform) =>
+      transformedSubschemaConfigs.flatMap((ssConfig) =>
+        subschemaConfigTransform(ssConfig),
+      ),
+    [subschemaConfig],
+  );
 
   const transformedSubschemas = transformedSubschemaConfigs.map(
     (ssConfig) => new Subschema<any, any, any, TContext>(ssConfig),
@@ -425,6 +429,7 @@ function prepareStitchingData<TContext extends Record<string, any>>(
     mergeTypes = true,
     typeMergingOptions,
     subschemaConfigTransforms = [],
+    isolateComputedFields = true,
     ...rest
   } = options;
 
@@ -441,6 +446,7 @@ function prepareStitchingData<TContext extends Record<string, any>>(
       subschema,
       subschemaMap,
       originalSubschemaMap,
+      isolateComputedFields,
     )) {
       transformedSubschemas.push(transformedSubschemaConfig);
     }
