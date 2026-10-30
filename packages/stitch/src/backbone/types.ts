@@ -103,11 +103,6 @@ export interface StitchPlan {
 
 export interface BackboneExecutorOptions {
   /**
-   * Fields introduced via additionalResolvers / @resolveTo / gateway-only
-   * typeDefs. Keyed by parent type name → field names.
-   */
-  localFields?: Map<string, Set<string>>;
-  /**
    * Install Query/Mutation root resolvers that forward stock graphql-js
    * `execute` into this backbone executor. Default true.
    */

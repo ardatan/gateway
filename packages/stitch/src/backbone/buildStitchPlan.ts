@@ -1855,15 +1855,13 @@ function planRootField(
   fieldNode: FieldNode,
   fragments: Record<string, FragmentDefinitionNode>,
   variableValues: Record<string, any>,
-  localFields: Map<string, Set<string>> | undefined,
   incompleteReasons: string[],
 ): StitchPlanNode {
   const rootType = getDefinedRootType(schema, operation.operation);
   const fieldName = fieldNode.name.value;
   const responseKey = fieldNode.alias?.value ?? fieldName;
 
-  // Meta-field: always local (Hive routes pure-__typename queries to schema
-  // execute; mixed selections write the root type name here).
+  // Meta-field: Island writes the root type name (pure `{ __typename }` included).
   if (fieldName === '__typename') {
     return {
       kind: 'Island',
@@ -1872,7 +1870,7 @@ function planRootField(
     };
   }
 
-  if (isLocalField(localFields, rootType.name, fieldName)) {
+  if (isLocalField(stitchingInfo.localFields, rootType.name, fieldName)) {
     let continuePlan: StitchPlanNode | undefined;
     const field = rootType.getFields()[fieldName];
     if (field && fieldNode.selectionSet) {
@@ -4975,7 +4973,6 @@ function buildCompletePlan(
         cleaned,
         fragments,
         planVars,
-        options.localFields,
         incompleteReasons,
       );
       rootNodes.push(wrapRootFieldWithConditions(fieldNode, planned));
@@ -5009,7 +5006,6 @@ function buildCompletePlan(
           fieldNode,
           fragments,
           variableValues,
-          options.localFields,
           incompleteReasons,
         ),
       );
