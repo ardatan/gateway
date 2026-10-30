@@ -287,6 +287,9 @@ export const handleFederationSupergraph = function ({
         additionalTypeDefs,
         additionalResolvers,
       );
+      // Backbone plan-time Fetches own computed/@requires hops — skip
+      // isolateComputedFields / splitMergedTypeEntryPoints subschema clones.
+      opts.isolateComputedFields = false;
       // @ts-expect-error - Typings are wrong
       opts.resolvers = additionalResolvers;
       // @ts-expect-error - Typings are wrong
