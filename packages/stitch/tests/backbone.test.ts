@@ -2,9 +2,9 @@ import { createDefaultExecutor } from '@graphql-tools/delegate';
 import { makeExecutableSchema } from '@graphql-tools/schema';
 import { parse } from 'graphql';
 import { describe, expect, it } from 'vitest';
+import type { StitchingInfo } from '@graphql-tools/delegate';
 import {
   buildStitchPlan,
-  collectLocalFieldsFromResolvers,
   createBackboneExecutor,
 } from '../src/backbone/index';
 import { stitchSchemas } from '../src/stitchSchemas';
@@ -227,14 +227,10 @@ describe('stitching backbone', () => {
       },
     });
 
-    const localFields = collectLocalFieldsFromResolvers({
-      Query: { me: () => ({ id: '42' }) },
-    });
-    expect(localFields.get('Query')?.has('me')).toBe(true);
+    const stitchingInfo = schema.extensions?.['stitchingInfo'] as StitchingInfo;
+    expect(stitchingInfo.localFields.get('Query')?.has('me')).toBe(true);
 
-    const executor = createBackboneExecutor(schema, {
-      localFields,
-    });
+    const executor = createBackboneExecutor(schema);
     const result = await executor({
       document: parse(/* GraphQL */ `
         {
@@ -250,5 +246,28 @@ describe('stitching backbone', () => {
     expect(result.data).toEqual({
       me: { id: '42', email: '42@example.com' },
     });
+  });
+
+  it('plans pure __typename as Island (no schema-execute escape)', async () => {
+    const schema = createStitched();
+    const document = parse(/* GraphQL */ `
+      {
+        __typename
+      }
+    `);
+    const plan = buildStitchPlan(
+      schema,
+      document.definitions[0] as any,
+      {},
+      {},
+    );
+    expect(plan.incompleteReasons).toEqual([]);
+    expect(plan.root.kind).toBe('Island');
+    expect((plan.root as any).fieldNode.name.value).toBe('__typename');
+
+    const executor = createBackboneExecutor(schema);
+    const result = await executor({ document, context: {} });
+    expect(result.errors).toBeUndefined();
+    expect(result.data).toEqual({ __typename: 'Query' });
   });
 });

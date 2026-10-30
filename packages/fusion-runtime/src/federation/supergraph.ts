@@ -15,7 +15,6 @@ import {
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
 import {
-  collectLocalFieldsFromResolvers,
   createBackboneExecutor,
   createMergedTypeResolver,
 } from '@graphql-tools/stitch';
@@ -287,10 +286,6 @@ export const handleFederationSupergraph = function ({
         additionalTypeDefs,
         additionalResolvers,
       );
-      // NOTE: isolateComputedFields stays true for now — requires-circular /
-      // requires-with-argument federation-compat still need isolation clones.
-      // Set opts.isolateComputedFields = false once plan-time Fetches cover
-      // per-field @requires selection sets without TransformCompositeFields.
       // @ts-expect-error - Typings are wrong
       opts.resolvers = additionalResolvers;
       // @ts-expect-error - Typings are wrong
@@ -494,9 +489,7 @@ export const handleFederationSupergraph = function ({
   // and run Fetch/Parallel/Sequence/Island. No schema-execute fallback —
   // incomplete plans surface as errors until the planner covers them.
   // Variable defaults for @skip/@include: getExecuteFnFromExecutor.
-  const localFields = collectLocalFieldsFromResolvers(additionalResolvers);
   const executor = createBackboneExecutor(executableUnifiedGraph, {
-    localFields,
     handleProgressiveOverride,
     overrideLabels: executableUnifiedGraph.extensions?.['overrideLabels'] as
       | Iterable<string>

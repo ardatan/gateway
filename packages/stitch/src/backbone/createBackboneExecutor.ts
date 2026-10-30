@@ -37,37 +37,6 @@ function isSchemaIntrospectionOperation(request: ExecutionRequest): boolean {
   return false;
 }
 
-/**
- * Query that only asks for `__typename` (and aliases) — no subgraph owns the
- * meta-field; Hive routes these to schema execute.
- */
-function isOnlyTypenameQuery(operation: OperationDefinitionNode): boolean {
-  if (operation.operation !== 'query') {
-    return false;
-  }
-  const stack = [...operation.selectionSet.selections];
-  let sawField = false;
-  while (stack.length) {
-    const sel = stack.pop()!;
-    if (sel.kind === Kind.FIELD) {
-      sawField = true;
-      if (sel.name.value !== '__typename') {
-        return false;
-      }
-      continue;
-    }
-    if (
-      (sel.kind === Kind.INLINE_FRAGMENT ||
-        sel.kind === Kind.FRAGMENT_SPREAD) &&
-      'selectionSet' in sel &&
-      sel.selectionSet
-    ) {
-      stack.push(...sel.selectionSet.selections);
-    }
-  }
-  return sawField;
-}
-
 function documentHasDeferOrStream(request: ExecutionRequest): boolean {
   for (const def of request.document.definitions) {
     if (
@@ -133,9 +102,10 @@ function stableStringify(value: Record<string, any>): string {
 
 /**
  * Stitching backbone executor — plan once (cached) and run Fetch/Parallel/
- * Sequence/Island/Condition. Subscriptions, SDL introspection, `{ __typename }`,
- * and @defer/@stream still use schema execute (classic subscribe / incremental)
- * until those are planned end-to-end.
+ * Sequence/Island/Condition. Subscriptions, SDL introspection (`__schema` /
+ * `__type`), and @defer/@stream still use schema execute (classic subscribe /
+ * incremental) until those are planned end-to-end. Pure `{ __typename }` is an
+ * Island on the backbone.
  */
 export function createBackboneExecutor(
   schema: GraphQLSchema,
@@ -244,7 +214,6 @@ export function createBackboneExecutor(
     // Schema-execute paths (not yet planned end-to-end on the backbone).
     if (
       isSchemaIntrospectionOperation(request) ||
-      (operation && isOnlyTypenameQuery(operation)) ||
       (operation && operation.operation === 'subscription') ||
       documentHasDeferOrStream(request)
     ) {
