@@ -18,7 +18,9 @@ import {
   getArgumentValues,
   getDefinedRootType,
   getOperationASTFromRequest,
+  isGraphQLErrorLike,
   mergeDeep,
+  relocatedError,
 } from '@graphql-tools/utils';
 import {
   handleMaybePromise,
@@ -27,6 +29,8 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   FieldNode,
+  getNamedType,
+  GraphQLError,
   GraphQLList,
   GraphQLOutputType,
   GraphQLSchema,
@@ -183,6 +187,142 @@ function stampSubschema(
   } else if (errors?.length) {
     (object as any)[UNPATHED_ERRORS_SYMBOL] = [...errors];
   }
+}
+
+/**
+ * Concrete root/list payloads omit planner-injected `__typename` in the outbound
+ * query; stamp the known object type so later entity hops can match parents.
+ */
+function stampConcreteTypename(value: any, returnType: GraphQLOutputType): void {
+  const named = getNamedType(returnType);
+  if (!isObjectType(named)) {
+    return;
+  }
+  if (value == null) {
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      stampConcreteTypename(item, named);
+    }
+    return;
+  }
+  if (typeof value === 'object' && value.__typename == null) {
+    value.__typename = named.name;
+  }
+}
+
+/**
+ * Locate subgraph / plugin errors onto the gateway root field path (classic
+ * checkResultAndHandleErrors parity). Preserve plugin extensions (COST_*).
+ */
+function locateRootFieldErrors(
+  errors: readonly GraphQLError[],
+  responseKey: string,
+  _fieldNode: FieldNode,
+): GraphQLError[] {
+  return errors.map((error) => {
+    if (error.path?.length) {
+      if (error.path[0] === responseKey) {
+        return error;
+      }
+      return relocatedError(error, [responseKey, ...error.path]);
+    }
+    // Preserve original nodes/locations (often absent for transport errors);
+    // only attach the gateway path — classic checkResultAndHandleErrors parity.
+    return createGraphQLError(error.message, {
+      originalError: error,
+      nodes: error.nodes,
+      source: error.source,
+      positions: error.positions,
+      path: [responseKey],
+      extensions: error.extensions,
+    });
+  });
+}
+
+/**
+ * Preserve GraphQLError extensions from onSubgraphExecute plugins (demand
+ * control COST_*). Only synthesize DOWNSTREAM_SERVICE_ERROR for unknown throws.
+ */
+function errorFromFetchThrow(
+  err: unknown,
+  subschema: Subschema,
+  responseKey: string,
+  fieldNode?: FieldNode,
+): GraphQLError {
+  if (err instanceof GraphQLError || isGraphQLErrorLike(err)) {
+    const gqlErr = err as GraphQLError;
+    return createGraphQLError(gqlErr.message, {
+      originalError: gqlErr instanceof Error ? gqlErr : undefined,
+      nodes: gqlErr.nodes?.length
+        ? gqlErr.nodes
+        : fieldNode
+          ? [fieldNode]
+          : undefined,
+      source: gqlErr.source,
+      positions: gqlErr.positions,
+      path: gqlErr.path?.length ? gqlErr.path : [responseKey],
+      extensions: gqlErr.extensions,
+    });
+  }
+  return createGraphQLError(err instanceof Error ? err.message : String(err), {
+    originalError: err instanceof Error ? err : undefined,
+    nodes: fieldNode ? [fieldNode] : undefined,
+    path: [responseKey],
+    extensions: {
+      code: 'DOWNSTREAM_SERVICE_ERROR',
+      serviceName: subschema.name,
+    },
+  });
+}
+
+/** After plan execute: fill missing nullable roots with null; bubble non-null. */
+function finalizeRootResult(
+  ctx: BackboneExecutionContext,
+): ExecutionResult {
+  const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
+  const data: Record<string, any> = { ...ctx.data };
+  let nullWhole = false;
+
+  for (const sel of ctx.operation.selectionSet.selections) {
+    if (sel.kind !== Kind.FIELD) {
+      continue;
+    }
+    const fieldName = sel.name.value;
+    if (fieldName.startsWith('__')) {
+      continue;
+    }
+    const field = rootType.getFields()[fieldName];
+    if (!field) {
+      continue;
+    }
+    const responseKey = sel.alias?.value ?? fieldName;
+    const hasFieldError = ctx.errors.some(
+      (e) => !e.path?.length || e.path[0] === responseKey,
+    );
+    const missing = !(responseKey in data) || data[responseKey] === undefined;
+    if (missing && hasFieldError) {
+      if (!isNullableType(field.type)) {
+        nullWhole = true;
+      } else {
+        data[responseKey] = null;
+      }
+    } else if (data[responseKey] === null && !isNullableType(field.type)) {
+      nullWhole = true;
+    }
+  }
+
+  const result: ExecutionResult = {};
+  if (nullWhole) {
+    result.data = null;
+  } else if (Object.keys(data).length) {
+    result.data = data;
+  }
+  if (ctx.errors.length) {
+    result.errors = ctx.errors as any;
+  }
+  return result;
 }
 
 /**
@@ -618,6 +758,7 @@ function executeFetchNode(
     }
     const responseKey =
       node.rootField.alias?.value ?? node.rootField.name.value;
+    const rootFieldNode = node.rootField;
     return handleMaybePromise(
       () =>
         executor({
@@ -631,8 +772,15 @@ function executeFetchNode(
           subgraphName: node.subschema.name,
         } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
       (result: ExecutionResult) => {
-        if (result.errors?.length) {
-          ctx.errors.push(...result.errors);
+        const located = result.errors?.length
+          ? locateRootFieldErrors(
+              result.errors as GraphQLError[],
+              responseKey,
+              rootFieldNode,
+            )
+          : [];
+        if (located.length) {
+          ctx.errors.push(...located);
         }
         if (result.data && responseKey in result.data) {
           const annotated = annotateValue(
@@ -640,6 +788,16 @@ function executeFetchNode(
             result.errors ?? [],
             node.subschema,
           );
+          if (annotated != null) {
+            const rootType = getDefinedRootType(
+              ctx.schema,
+              ctx.operation.operation,
+            );
+            const fieldDef = rootType.getFields()[rootFieldNode.name.value];
+            if (fieldDef) {
+              stampConcreteTypename(annotated, fieldDef.type);
+            }
+          }
           if (responseKey in ctx.data) {
             ctx.data[responseKey] = mergeRootValues(
               ctx.data[responseKey],
@@ -648,18 +806,26 @@ function executeFetchNode(
           } else {
             ctx.data[responseKey] = annotated;
           }
+        } else if (located.length) {
+          // Subgraph down / errors-only result: expose null for the root key
+          // so finalizeRootResult can apply nullability bubbling.
+          if (!(responseKey in ctx.data)) {
+            ctx.data[responseKey] = null;
+          }
         }
       },
       (err) => {
         ctx.errors.push(
-          createGraphQLError(err instanceof Error ? err.message : String(err), {
-            originalError: err instanceof Error ? err : undefined,
-            extensions: {
-              code: 'DOWNSTREAM_SERVICE_ERROR',
-              serviceName: node.subschema.name,
-            },
-          }),
+          errorFromFetchThrow(
+            err,
+            node.subschema,
+            responseKey,
+            rootFieldNode,
+          ),
         );
+        if (!(responseKey in ctx.data)) {
+          ctx.data[responseKey] = null;
+        }
       },
     );
   }
@@ -1519,16 +1685,7 @@ function executeBatchFetchNode(
         },
         (err) => {
           ctx.errors.push(
-            createGraphQLError(
-              err instanceof Error ? err.message : String(err),
-              {
-                originalError: err instanceof Error ? err : undefined,
-                extensions: {
-                  code: 'DOWNSTREAM_SERVICE_ERROR',
-                  serviceName: node.subschema.name,
-                },
-              },
-            ),
+            errorFromFetchThrow(err, node.subschema, node.aliases[0]?.alias ?? '_entities'),
           );
         },
       );
@@ -1594,14 +1751,7 @@ export function executeStitchPlan(
     () => executePlanNode(plan.root, ctx),
     () => {
       try {
-        const result: ExecutionResult = {};
-        if (Object.keys(ctx.data).length) {
-          result.data = ctx.data;
-        }
-        if (ctx.errors.length) {
-          result.errors = ctx.errors as any;
-        }
-        return result;
+        return finalizeRootResult(ctx);
       } finally {
         delete (contextValue as any)[BACKBONE_EXECUTING];
       }

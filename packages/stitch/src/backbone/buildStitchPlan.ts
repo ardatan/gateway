@@ -2114,7 +2114,15 @@ function planRootField(
         selectionSet: selectionSetOf([]),
       };
     }
-    const selectionSet = ensureTypename(selectionSetOf(p.available));
+    // Abstract roots need subgraph `__typename` for runtime typing. Concrete
+    // roots stamp typename locally after fetch (classic stitch parity — avoid
+    // injecting `__typename` into the outbound query when the client did not
+    // ask for it). Nested entity parents still get ensureTypename via
+    // partitionSelectionsForSubschema.
+    const selectionSet =
+      returnType && isAbstractType(returnType)
+        ? ensureTypename(selectionSetOf(p.available))
+        : selectionSetOf(p.available);
     return {
       kind: 'Fetch' as const,
       subschema: p.owner,
