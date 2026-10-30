@@ -119,12 +119,22 @@ export interface BackboneExecutorOptions {
   useConditionNodes?: boolean;
   /**
    * Progressive override label handler (gateway `progressiveOverride`).
-   * Called at plan time with request context when labels are present.
+   * Used for plan-cache keying when `overrideLabels` is also set.
    */
   handleProgressiveOverride?: (
     label: string,
     context: any,
   ) => boolean | Promise<boolean>;
+  /**
+   * Known progressive-override labels from the supergraph. Combined with
+   * `handleProgressiveOverride` + request context to cache plans per enabled set.
+   */
+  overrideLabels?: Iterable<string>;
+  /**
+   * Per-request GraphQL context (progressive override / delegationPlanBuilder).
+   * Set by createBackboneExecutor for each operation — not a static option.
+   */
+  context?: any;
 }
 
 export interface BackboneExecutionContext {

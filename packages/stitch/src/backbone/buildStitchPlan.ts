@@ -4,6 +4,7 @@ import type {
 } from '@graphql-tools/delegate';
 import {
   getVariableValues,
+  handleOverrideByDelegation,
   leftOverByDelegationPlan,
 } from '@graphql-tools/delegate';
 import {
@@ -43,6 +44,13 @@ function selectionSetOf(
 ): SelectionSetNode {
   return { kind: Kind.SELECTION_SET, selections: [...selections] };
 }
+
+/**
+ * Request context for the in-flight `buildStitchPlan` call. Used so
+ * `delegationPlanBuilder` can evaluate progressive-override handlers without
+ * threading context through every recursive plan helper.
+ */
+let planningContext: any = undefined;
 
 /**
  * Fill omitted operation variables from their GraphQL default values so
@@ -724,7 +732,32 @@ function partitionSelectionsForSubschema(
           fieldName,
           effectiveProvided,
         );
-    return ok;
+    if (!ok) {
+      return false;
+    }
+    // Progressive override: when this subschema's override handler says the
+    // field is not active, treat it as unavailable (entity hop / other owner).
+    if (planningContext != null && fieldName !== '__typename') {
+      const overrideHandler =
+        subschema.merge?.[typeName]?.fields?.[fieldName]?.override;
+      if (overrideHandler != null) {
+        const info = {
+          schema: gatewaySchema,
+          parentType: gatewaySchema?.getType(typeName),
+          fieldName,
+          fieldNodes: [],
+          fragments: {},
+          variableValues: {},
+          path: { key: fieldName, typename: typeName, prev: undefined },
+        } as any;
+        if (
+          !handleOverrideByDelegation(info, planningContext, overrideHandler)
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
   };
 
   const visit = (selections: readonly SelectionNode[]) => {
@@ -1452,12 +1485,28 @@ function planMergedTypeFollowUps(
     selectionSet: selectionSetOf([...fieldNodes, ...extraSelections]),
   };
 
+  // Progressive override: fieldConfig.override handlers need context + info.
+  const overrideInfo =
+    planningContext != null
+      ? ({
+          schema,
+          parentType: schema.getType(typeName),
+          returnType: schema.getType(typeName),
+          fieldName: typeName,
+          fieldNodes: [planningParentField],
+          fragments,
+          variableValues,
+          path: { key: typeName, typename: typeName, prev: undefined },
+        } as any)
+      : undefined;
   const delegationMaps = mergedTypeInfo.delegationPlanBuilder(
     schema,
     sourceSubschema,
     variableValues,
     fragments,
     [planningParentField],
+    planningContext,
+    overrideInfo,
   );
 
   const stages: StitchPlanNode[] = [];
@@ -2987,40 +3036,46 @@ export function buildStitchPlan(
   // in createBackboneExecutor.
   const coercedVariables = coerceOperationVariables(operation, variableValues);
 
-  if (incompleteReasons.length > 0) {
-    // Still attempt a best-effort plan for warming, but never throw out of here.
-    try {
-      return buildCompletePlan(
-        schema,
-        stitchingInfo,
-        operation,
-        fragments,
-        coercedVariables,
-        options,
-        rootType,
-        incompleteReasons,
-      );
-    } catch {
-      return {
-        operation,
-        fragments,
-        root: { kind: 'Parallel', nodes: [] },
-        incomplete: true,
-        incompleteReasons,
-      };
+  const previousPlanningContext = planningContext;
+  planningContext = options.context;
+  try {
+    if (incompleteReasons.length > 0) {
+      // Still attempt a best-effort plan for warming, but never throw out of here.
+      try {
+        return buildCompletePlan(
+          schema,
+          stitchingInfo,
+          operation,
+          fragments,
+          coercedVariables,
+          options,
+          rootType,
+          incompleteReasons,
+        );
+      } catch {
+        return {
+          operation,
+          fragments,
+          root: { kind: 'Parallel', nodes: [] },
+          incomplete: true,
+          incompleteReasons,
+        };
+      }
     }
-  }
 
-  return buildCompletePlan(
-    schema,
-    stitchingInfo,
-    operation,
-    fragments,
-    coercedVariables,
-    options,
-    rootType,
-    incompleteReasons,
-  );
+    return buildCompletePlan(
+      schema,
+      stitchingInfo,
+      operation,
+      fragments,
+      coercedVariables,
+      options,
+      rootType,
+      incompleteReasons,
+    );
+  } finally {
+    planningContext = previousPlanningContext;
+  }
 }
 
 /** Stable identity for coalescing sibling/adjacent Fetches (includes path). */
