@@ -737,6 +737,91 @@ function executeFetchNode(
   const executor = getSubschemaExecutor(node.subschema);
 
   if (node.rootField) {
+    const responseKey =
+      node.rootField.alias?.value ?? node.rootField.name.value;
+    const rootFieldNode = node.rootField;
+    const writeRootResult = (value: any, errors: readonly GraphQLError[] = []) => {
+      if (errors.length) {
+        ctx.errors.push(
+          ...locateRootFieldErrors(errors as GraphQLError[], responseKey, rootFieldNode),
+        );
+      }
+      if (value !== undefined) {
+        const annotated = annotateValue(
+          unwrapNullabilityAliases(value),
+          errors,
+          node.subschema,
+        );
+        if (annotated != null) {
+          const rootType = getDefinedRootType(
+            ctx.schema,
+            ctx.operation.operation,
+          );
+          const fieldDef = rootType.getFields()[rootFieldNode.name.value];
+          if (fieldDef) {
+            stampConcreteTypename(annotated, fieldDef.type);
+          }
+        }
+        if (responseKey in ctx.data) {
+          ctx.data[responseKey] = mergeRootValues(
+            ctx.data[responseKey],
+            annotated,
+          );
+        } else {
+          ctx.data[responseKey] = annotated;
+        }
+      } else if (errors.length && !(responseKey in ctx.data)) {
+        // Subgraph down / errors-only result: expose null for the root key
+        // so finalizeRootResult can apply nullability bubbling.
+        ctx.data[responseKey] = null;
+      }
+    };
+
+    // Rename / encapsulate transforms need Transformer — prebuilt documents
+    // use gateway field names and would miss subgraph renames (authorWithBooks).
+    if (node.subschema.transforms?.length) {
+      const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
+      const fieldDef = rootType.getFields()[rootFieldNode.name.value];
+      const args = fieldDef
+        ? getArgumentValues(fieldDef, rootFieldNode, ctx.variableValues)
+        : {};
+      const info = {
+        ...(ctx.infoStub as any),
+        schema: ctx.schema,
+        parentType: rootType,
+        returnType: fieldDef?.type,
+        fieldName: rootFieldNode.name.value,
+        fieldNodes: [rootFieldNode],
+        fragments: ctx.fragments,
+        operation: ctx.operation,
+        variableValues: ctx.variableValues,
+        path: { typename: rootType.name, key: responseKey, prev: undefined },
+        rootValue: ctx.rootValue,
+      };
+      return handleMaybePromise(
+        () =>
+          delegateToSchema({
+            schema: node.subschema,
+            operation: ctx.operation.operation,
+            fieldName: rootFieldNode.name.value,
+            args,
+            selectionSet: rootFieldNode.selectionSet,
+            context: ctx.contextValue,
+            info: info as any,
+            skipTypeMerging: true,
+          }),
+        (value) => writeRootResult(value),
+        (err) => {
+          ctx.errors.push(
+            errorFromFetchThrow(err, node.subschema, responseKey, rootFieldNode),
+          );
+          if (!(responseKey in ctx.data)) {
+            ctx.data[responseKey] = null;
+          }
+        },
+      );
+    }
+
     let document = node.document;
     let variables: Record<string, any>;
     if (document) {
@@ -762,9 +847,6 @@ function executeFetchNode(
       document = built.document;
       variables = built.variables;
     }
-    const responseKey =
-      node.rootField.alias?.value ?? node.rootField.name.value;
-    const rootFieldNode = node.rootField;
     return handleMaybePromise(
       () =>
         executor({
@@ -779,45 +861,12 @@ function executeFetchNode(
         } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
       (result: ExecutionResult) => {
         const located = result.errors?.length
-          ? locateRootFieldErrors(
-              result.errors as GraphQLError[],
-              responseKey,
-              rootFieldNode,
-            )
+          ? (result.errors as GraphQLError[])
           : [];
-        if (located.length) {
-          ctx.errors.push(...located);
-        }
         if (result.data && responseKey in result.data) {
-          const annotated = annotateValue(
-            unwrapNullabilityAliases(result.data[responseKey]),
-            result.errors ?? [],
-            node.subschema,
-          );
-          if (annotated != null) {
-            const rootType = getDefinedRootType(
-              ctx.schema,
-              ctx.operation.operation,
-            );
-            const fieldDef = rootType.getFields()[rootFieldNode.name.value];
-            if (fieldDef) {
-              stampConcreteTypename(annotated, fieldDef.type);
-            }
-          }
-          if (responseKey in ctx.data) {
-            ctx.data[responseKey] = mergeRootValues(
-              ctx.data[responseKey],
-              annotated,
-            );
-          } else {
-            ctx.data[responseKey] = annotated;
-          }
-        } else if (located.length) {
-          // Subgraph down / errors-only result: expose null for the root key
-          // so finalizeRootResult can apply nullability bubbling.
-          if (!(responseKey in ctx.data)) {
-            ctx.data[responseKey] = null;
-          }
+          writeRootResult(result.data[responseKey], located);
+        } else {
+          writeRootResult(undefined, located);
         }
       },
       (err) => {
@@ -1160,7 +1209,7 @@ function executeIslandNode(
   ctx: BackboneExecutionContext,
 ): MaybePromise<void> {
   const parentType = ctx.schema.getType(node.parentTypeName);
-  if (!isObjectType(parentType)) {
+  if (!isObjectType(parentType) && !isInterfaceType(parentType)) {
     return;
   }
   const fieldName = node.fieldNode.name.value;
@@ -1177,6 +1226,57 @@ function executeIslandNode(
     return;
   }
   const args = getArgumentValues(field, node.fieldNode, ctx.variableValues);
+
+  const flattenPaths =
+    node.flattenPaths ??
+    (node.flattenPath != null ? [node.flattenPath] : null);
+
+  // Nested Island: resolve on every parent object at the flatten path(s).
+  if (flattenPaths?.length) {
+    const parents: Array<Record<string, any>> = [];
+    const seen = new Set<Record<string, any>>();
+    for (const path of flattenPaths) {
+      for (const p of collectEntitiesAtPath(ctx.data, path)) {
+        if (p != null && typeof p === 'object' && !seen.has(p)) {
+          seen.add(p);
+          parents.push(p);
+        }
+      }
+    }
+    if (!parents.length) {
+      return;
+    }
+    const jobs = parents.map((parent) => {
+      const info = {
+        ...(ctx.infoStub as any),
+        schema: ctx.schema,
+        parentType,
+        returnType: field.type,
+        fieldName,
+        fieldNodes: [node.fieldNode],
+        fragments: ctx.fragments,
+        operation: ctx.operation,
+        variableValues: ctx.variableValues,
+        path: {
+          typename: node.parentTypeName,
+          key: responseKey,
+          prev: undefined,
+        },
+      };
+      return handleMaybePromise(
+        () => field.resolve!(parent, args, ctx.contextValue, info),
+        (result) => {
+          parent[responseKey] = result;
+        },
+      );
+    });
+    return handleMaybePromise(
+      () => awaitMaybePromises(jobs),
+      () => (node.continue ? executePlanNode(node.continue, ctx) : undefined),
+    );
+  }
+
+  // Root Island: write into ctx.data[responseKey].
   const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
   const info = {
     ...(ctx.infoStub as any),
