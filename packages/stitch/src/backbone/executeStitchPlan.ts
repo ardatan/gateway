@@ -1458,28 +1458,42 @@ function executePlanNode(
 
 type ExecutableHop =
   | Extract<StitchPlanNode, { kind: 'Fetch' }>
-  | Extract<StitchPlanNode, { kind: 'BatchFetch' }>;
+  | Extract<StitchPlanNode, { kind: 'BatchFetch' }>
+  | Extract<StitchPlanNode, { kind: 'Island' }>;
 
+/**
+ * Collect hops for one execution. Condition picks a single branch from
+ * variables (never both). Island is a hop; its continue is queued after.
+ */
 function collectExecutableHops(
   node: StitchPlanNode,
   out: ExecutableHop[],
+  variableValues: Record<string, any>,
 ): void {
-  if (node.kind === 'Fetch' || node.kind === 'BatchFetch') {
+  if (
+    node.kind === 'Fetch' ||
+    node.kind === 'BatchFetch' ||
+    node.kind === 'Island'
+  ) {
     out.push(node);
+    if (node.kind === 'Island' && node.continue) {
+      collectExecutableHops(node.continue, out, variableValues);
+    }
     return;
   }
   if (node.kind === 'Condition') {
-    if (node.ifClause) {
-      collectExecutableHops(node.ifClause, out);
-    }
-    if (node.elseClause) {
-      collectExecutableHops(node.elseClause, out);
+    const taken =
+      variableValues?.[node.condition] === true
+        ? node.ifClause
+        : node.elseClause;
+    if (taken) {
+      collectExecutableHops(taken, out, variableValues);
     }
     return;
   }
   if (node.kind === 'Sequence' || node.kind === 'Parallel') {
     for (const child of node.nodes) {
-      collectExecutableHops(child, out);
+      collectExecutableHops(child, out, variableValues);
     }
   }
 }
@@ -1491,17 +1505,114 @@ function hopCompletesIds(hop: ExecutableHop): string[] {
   return hop.id ? [hop.id] : [];
 }
 
+function hopDependsOn(hop: ExecutableHop): string[] {
+  return hop.dependsOn ?? [];
+}
+
+function rootResponseKey(
+  hop: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): string | null {
+  if (!hop.rootField) {
+    return null;
+  }
+  return hop.rootField.alias?.value ?? hop.rootField.name.value;
+}
+
+function entityPathKey(
+  hop: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): string | null {
+  if (!hop.entityTypeName) {
+    return null;
+  }
+  return JSON.stringify(hop.flattenPaths ?? hop.flattenPath ?? null);
+}
+
+function selectedEntityFields(
+  hop: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): Set<string> {
+  const names = new Set<string>();
+  for (const sel of hop.selectionSet.selections) {
+    if (sel.kind === Kind.FIELD && sel.name.value !== '__typename') {
+      names.add(sel.name.value);
+    }
+  }
+  return names;
+}
+
+function runOneHop(
+  hop: ExecutableHop,
+  ctx: BackboneExecutionContext,
+): MaybePromise<void> {
+  if (hop.kind === 'BatchFetch') {
+    return executeBatchFetchNode(hop, ctx);
+  }
+  if (hop.kind === 'Island') {
+    return executeIslandNode(hop, ctx);
+  }
+  return executeFetchNode(hop, ctx);
+}
+
 /**
- * Barrier-free dataflow: fire every Fetch/BatchFetch as soon as its
- * `dependsOn` ids are complete — Sequence wave barriers are ignored.
+ * Shared-root Parallel: isolate per-subgraph errors then deep-merge (provides /
+ * union-intersection — one owner errors while another returns data).
  */
-/** Reserved: barrier-free execute once fetchDependsOn covers provides/abstract. */
+function runSameKeyRootFetches(
+  fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
+  ctx: BackboneExecutionContext,
+): MaybePromise<void> {
+  const responseKey = rootResponseKey(fetches[0]!)!;
+  const jobs = fetches.map((child) => {
+    const childErrors: any[] = [];
+    const childCtx: BackboneExecutionContext = {
+      ...ctx,
+      data: {},
+      errors: childErrors,
+    };
+    return handleMaybePromise(
+      () => executeFetchNode(child, childCtx),
+      () => ({
+        data: childCtx.data[responseKey],
+        errors: childErrors,
+      }),
+    );
+  });
+  return handleMaybePromise(
+    () => allMaybePromises(jobs),
+    (parts: Array<{ data: any; errors: any[] }>) => {
+      let merged: any = undefined;
+      let anyData = false;
+      for (const part of parts) {
+        if (part.data !== undefined) {
+          anyData = true;
+          merged = mergeRootValues(merged, part.data);
+        }
+      }
+      if (merged !== undefined) {
+        ctx.data[responseKey] = merged;
+      }
+      if (!anyData) {
+        for (const part of parts) {
+          ctx.errors.push(...part.errors);
+        }
+      }
+    },
+  );
+}
+
+/**
+ * Barrier-free dataflow: fire every annotated hop as soon as its `dependsOn`
+ * ids are complete. Preserves tree semantics for:
+ * - shared-root Parallel merge (provides / abstract roots)
+ * - overlapping same-path entity field writes
+ * - Condition branch selection
+ * - Island → continue ordering
+ */
 export function executeDataflowPlan(
   root: StitchPlanNode,
   ctx: BackboneExecutionContext,
 ): MaybePromise<void> {
   const hops: ExecutableHop[] = [];
-  collectExecutableHops(root, hops);
+  collectExecutableHops(root, hops, ctx.variableValues ?? {});
   if (!hops.length) {
     return;
   }
@@ -1514,26 +1625,38 @@ export function executeDataflowPlan(
   const pending = new Set(hops);
   let remaining = hops.length;
 
+  const markDone = (hop: ExecutableHop) => {
+    for (const id of hopCompletesIds(hop)) {
+      done.add(id);
+    }
+    remaining--;
+  };
+
   const runReady = (): MaybePromise<void> => {
     if (remaining === 0) {
       return;
     }
     const ready: ExecutableHop[] = [];
     for (const hop of pending) {
-      if (hop.dependsOn!.every((d) => done.has(d))) {
+      if (hopDependsOn(hop).every((d) => done.has(d))) {
         ready.push(hop);
       }
     }
     if (!ready.length) {
-      // Missed edge — drain sequentially.
+      // Missed edge — drain sequentially (still apply root-merge rules).
       let chain: MaybePromise<void> = undefined;
-      for (const hop of pending) {
+      const left = [...pending];
+      for (const hop of left) {
+        pending.delete(hop);
         chain = handleMaybePromise(
           () => chain,
           () =>
-            hop.kind === 'BatchFetch'
-              ? executeBatchFetchNode(hop, ctx)
-              : executeFetchNode(hop, ctx),
+            handleMaybePromise(
+              () => runOneHop(hop, ctx),
+              () => {
+                markDone(hop);
+              },
+            ),
         );
       }
       return chain;
@@ -1541,20 +1664,118 @@ export function executeDataflowPlan(
     for (const hop of ready) {
       pending.delete(hop);
     }
-    const jobs = ready.map((hop) =>
-      handleMaybePromise(
-        () =>
-          hop.kind === 'BatchFetch'
-            ? executeBatchFetchNode(hop, ctx)
-            : executeFetchNode(hop, ctx),
-        () => {
-          for (const id of hopCompletesIds(hop)) {
-            done.add(id);
+
+    // Group same-key root Fetches → isolated merge (tree Parallel sameKey).
+    const rootGroups = new Map<
+      string,
+      Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
+    >();
+    const rest: ExecutableHop[] = [];
+    for (const hop of ready) {
+      if (hop.kind === 'Fetch') {
+        const key = rootResponseKey(hop);
+        if (key != null) {
+          let list = rootGroups.get(key);
+          if (!list) {
+            list = [];
+            rootGroups.set(key, list);
           }
-          remaining--;
-        },
-      ),
-    );
+          list.push(hop);
+          continue;
+        }
+      }
+      rest.push(hop);
+    }
+
+    const jobs: Array<MaybePromise<void>> = [];
+
+    for (const group of rootGroups.values()) {
+      if (group.length > 1) {
+        jobs.push(
+          handleMaybePromise(
+            () => runSameKeyRootFetches(group, ctx),
+            () => {
+              for (const hop of group) {
+                markDone(hop);
+              }
+            },
+          ),
+        );
+      } else {
+        rest.push(group[0]!);
+      }
+    }
+
+    // Overlapping same-path entity Fetches must serialize (merge race).
+    const entityByPath = new Map<
+      string,
+      Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>
+    >();
+    const nonEntity: ExecutableHop[] = [];
+    for (const hop of rest) {
+      if (hop.kind === 'Fetch') {
+        const pk = entityPathKey(hop);
+        if (pk != null) {
+          let list = entityByPath.get(pk);
+          if (!list) {
+            list = [];
+            entityByPath.set(pk, list);
+          }
+          list.push(hop);
+          continue;
+        }
+      }
+      nonEntity.push(hop);
+    }
+
+    for (const group of entityByPath.values()) {
+      let overlapping = false;
+      if (group.length > 1) {
+        const fieldSets = group.map(selectedEntityFields);
+        outer: for (let i = 0; i < fieldSets.length; i++) {
+          for (let j = i + 1; j < fieldSets.length; j++) {
+            for (const name of fieldSets[i]!) {
+              if (fieldSets[j]!.has(name)) {
+                overlapping = true;
+                break outer;
+              }
+            }
+          }
+        }
+      }
+      if (overlapping) {
+        let chain: MaybePromise<void> = undefined;
+        for (const hop of group) {
+          chain = handleMaybePromise(
+            () => chain,
+            () =>
+              handleMaybePromise(
+                () => executeFetchNode(hop, ctx),
+                () => {
+                  markDone(hop);
+                },
+              ),
+          );
+        }
+        jobs.push(chain);
+      } else {
+        for (const hop of group) {
+          nonEntity.push(hop);
+        }
+      }
+    }
+
+    for (const hop of nonEntity) {
+      jobs.push(
+        handleMaybePromise(
+          () => runOneHop(hop, ctx),
+          () => {
+            markDone(hop);
+          },
+        ),
+      );
+    }
+
     return handleMaybePromise(
       () => awaitMaybePromises(jobs),
       () => runReady(),
@@ -1863,11 +2084,10 @@ export function executeStitchPlan(
     infoStub: {},
   };
 
-  // Tree Sequence/Parallel execute. Dataflow (executeDataflowPlan) needs
-  // complete @provides/abstract edges beyond Sequence barriers — keep tree
-  // until fetchDependsOn covers those cases.
+  // Barrier-free dataflow (shared-root merge + Condition/Island aware).
+  // Falls back to tree execute when hops lack id/dependsOn annotations.
   return handleMaybePromise(
-    () => executePlanNode(plan.root, ctx),
+    () => executeDataflowPlan(plan.root, ctx),
     () => {
       try {
         return finalizeRootResult(ctx);
