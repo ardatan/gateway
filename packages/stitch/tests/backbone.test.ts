@@ -1,5 +1,6 @@
 import { createDefaultExecutor } from '@graphql-tools/delegate';
 import { makeExecutableSchema } from '@graphql-tools/schema';
+import type { ExecutionResult } from '@graphql-tools/utils';
 import { parse } from 'graphql';
 import { describe, expect, it } from 'vitest';
 import type { StitchingInfo } from '@graphql-tools/delegate';
@@ -8,6 +9,13 @@ import {
   createBackboneExecutor,
 } from '../src/backbone/index';
 import { stitchSchemas } from '../src/stitchSchemas';
+
+async function exec(
+  executor: ReturnType<typeof createBackboneExecutor>,
+  request: Parameters<typeof executor>[0],
+): Promise<ExecutionResult> {
+  return (await executor(request)) as ExecutionResult;
+}
 
 describe('stitching backbone', () => {
   const authors = makeExecutableSchema({
@@ -124,7 +132,7 @@ describe('stitching backbone', () => {
   it('executes a merged query via the backbone executor', async () => {
     const schema = createStitched();
     const executor = createBackboneExecutor(schema);
-    const result = await executor({
+    const result = await exec(executor, {
       document: parse(/* GraphQL */ `
         query ($id: ID!) {
           userById(id: $id) {
@@ -178,7 +186,7 @@ describe('stitching backbone', () => {
     expect(planInclude.root.kind).toBe('Condition');
 
     const executor = createBackboneExecutor(schema);
-    const skipped = await executor({
+    const skipped = await exec(executor, {
       document,
       variables: { id: '1', skipEmail: true },
       context: {},
@@ -186,7 +194,7 @@ describe('stitching backbone', () => {
     expect(skipped.errors).toBeUndefined();
     expect(skipped.data).toEqual({});
 
-    const included = await executor({
+    const included = await exec(executor, {
       document,
       variables: { id: '1', skipEmail: false },
       context: {},
@@ -231,7 +239,7 @@ describe('stitching backbone', () => {
     expect(stitchingInfo.localFields.get('Query')?.has('me')).toBe(true);
 
     const executor = createBackboneExecutor(schema);
-    const result = await executor({
+    const result = await exec(executor, {
       document: parse(/* GraphQL */ `
         {
           me {
@@ -266,7 +274,7 @@ describe('stitching backbone', () => {
     expect((plan.root as any).fieldNode.name.value).toBe('__typename');
 
     const executor = createBackboneExecutor(schema);
-    const result = await executor({ document, context: {} });
+    const result = await exec(executor, { document, context: {} });
     expect(result.errors).toBeUndefined();
     expect(result.data).toEqual({ __typename: 'Query' });
   });
@@ -323,7 +331,7 @@ describe('stitching backbone', () => {
               fieldName: 'authors',
               selectionSet: '{ id }',
               key: ({ id }: { id: string }) => id,
-              argsFromKeys: (ids: string[]) => ({ ids }),
+              argsFromKeys: (ids: readonly string[]) => ({ ids }),
             },
           },
           batch: true,
@@ -388,7 +396,7 @@ describe('stitching backbone', () => {
     expect(hasNestedAuthorIsland(plan.root)).toBe(true);
 
     const executor = createBackboneExecutor(schema);
-    const result = await executor({ document, context: {} });
+    const result = await exec(executor, { document, context: {} });
     expect(result.errors).toBeUndefined();
     expect(result.data).toEqual({
       books: [

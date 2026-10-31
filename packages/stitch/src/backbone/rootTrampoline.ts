@@ -5,6 +5,7 @@ import {
   GraphQLSchema,
   isObjectType,
   Kind,
+  type SelectionNode,
 } from 'graphql';
 
 const TRAMPOLINE_INSTALLED = Symbol.for(
@@ -19,6 +20,28 @@ export const BACKBONE_EXECUTING = Symbol.for(
 const ORIGINAL_RESOLVE = Symbol.for(
   'graphql-tools.stitch.backboneOriginalResolve',
 );
+
+function selectionHasDeferOrStream(selections: readonly SelectionNode[]): boolean {
+  const stack = [...selections];
+  while (stack.length) {
+    const sel = stack.pop()!;
+    if (
+      'directives' in sel &&
+      sel.directives?.some(
+        (d) => d.name.value === 'defer' || d.name.value === 'stream',
+      )
+    ) {
+      return true;
+    }
+    if (
+      (sel.kind === Kind.FIELD || sel.kind === Kind.INLINE_FRAGMENT) &&
+      sel.selectionSet
+    ) {
+      stack.push(...sel.selectionSet.selections);
+    }
+  }
+  return false;
+}
 
 /**
  * Replace Query/Mutation root field resolvers so stock graphql-js `execute`
@@ -60,6 +83,18 @@ export function installRootTrampoline(
           context != null &&
           typeof context === 'object' &&
           (context as any)[BACKBONE_EXECUTING]
+        ) {
+          return previousResolve(root, args, context, info);
+        }
+        // @defer/@stream: classic incremental execute. The backbone executor
+        // falls back to schemaExecutor for these, which would re-enter this
+        // trampoline and recurse forever if we ran the plan here.
+        if (
+          info?.operation?.selectionSet &&
+          (selectionHasDeferOrStream(info.operation.selectionSet.selections) ||
+            Object.values(info.fragments ?? {}).some((f) =>
+              selectionHasDeferOrStream(f.selectionSet.selections),
+            ))
         ) {
           return previousResolve(root, args, context, info);
         }

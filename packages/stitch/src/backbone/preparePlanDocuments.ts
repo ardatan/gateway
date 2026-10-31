@@ -6,6 +6,7 @@ import {
   GraphQLSchema,
   isNullableType,
   isObjectType,
+  isUnionType,
   Kind,
   OperationDefinitionNode,
   OperationTypeNode,
@@ -21,6 +22,33 @@ const TYPENAME_FIELD: FieldNode = {
   name: { kind: Kind.NAME, value: '__typename' },
 };
 
+function pushOrMergeField(
+  next: SelectionNode[],
+  seen: Map<string, number>,
+  sel: FieldNode,
+): void {
+  const key = sel.alias?.value ?? sel.name.value;
+  const idx = seen.get(key);
+  if (idx != null) {
+    const prev = next[idx];
+    if (prev?.kind === Kind.FIELD && (sel.selectionSet || prev.selectionSet)) {
+      const sels = [
+        ...(prev.selectionSet?.selections ?? []),
+        ...(sel.selectionSet?.selections ?? []),
+      ];
+      next[idx] = {
+        ...prev,
+        selectionSet: sels.length
+          ? { kind: Kind.SELECTION_SET, selections: sels }
+          : undefined,
+      };
+    }
+    return;
+  }
+  seen.set(key, next.length);
+  next.push(sel);
+}
+
 /**
  * Hive QP strips selections to what the target subgraph can resolve — at plan
  * time. Recurse into nested selections; inject `__typename` for later entity
@@ -29,6 +57,9 @@ const TYPENAME_FIELD: FieldNode = {
  * When a field is absent from the subgraph but `fieldNodesByField` lists key
  * deps that *are* present (e.g. Book.author @resolveTo → authorId), those deps
  * are injected so nested Islands can read their keys.
+ *
+ * Union types have no fields — only fragment selections are kept (never collapse
+ * the whole set to bare `__typename`, which emptied union root fetches).
  */
 export function filterSelectionSetForSubschema(
   selectionSet: SelectionSetNode,
@@ -44,7 +75,76 @@ export function filterSelectionSetForSubschema(
   fieldNodesByField?: Record<string, Record<string, FieldNode[]>>,
 ): SelectionSetNode {
   const type = schema.getType(typeName);
-  if (!type || !('getFields' in type)) {
+  if (!type) {
+    return { kind: Kind.SELECTION_SET, selections: [TYPENAME_FIELD] };
+  }
+
+  if (isUnionType(type)) {
+    const next: SelectionNode[] = [];
+    let hasTypename = false;
+    const members = new Set(type.getTypes().map((t) => t.name));
+    for (const sel of selectionSet.selections) {
+      if (sel.kind === Kind.FIELD) {
+        if (sel.name.value === '__typename') {
+          hasTypename = true;
+          next.push(sel);
+        }
+        continue;
+      }
+      if (sel.kind === Kind.INLINE_FRAGMENT) {
+        const on = sel.typeCondition?.name.value;
+        if (on) {
+          if (!schema.getType(on) || !members.has(on)) {
+            continue;
+          }
+        }
+        const filtered = filterSelectionSetForSubschema(
+          sel.selectionSet,
+          on ?? typeName,
+          schema,
+          fragments,
+          fieldNodesByField,
+        );
+        if (filtered.selections.length) {
+          next.push({ ...sel, selectionSet: filtered });
+        }
+        continue;
+      }
+      if (sel.kind === Kind.FRAGMENT_SPREAD) {
+        const frag = fragments[sel.name.value];
+        if (!frag) {
+          continue;
+        }
+        const on = frag.typeCondition.name.value;
+        if (!schema.getType(on) || !members.has(on)) {
+          continue;
+        }
+        const filtered = filterSelectionSetForSubschema(
+          frag.selectionSet,
+          on,
+          schema,
+          fragments,
+          fieldNodesByField,
+        );
+        if (filtered.selections.length) {
+          next.push({
+            kind: Kind.INLINE_FRAGMENT,
+            typeCondition: {
+              kind: Kind.NAMED_TYPE,
+              name: { kind: Kind.NAME, value: on },
+            },
+            selectionSet: filtered,
+          });
+        }
+      }
+    }
+    if (!hasTypename) {
+      next.unshift(TYPENAME_FIELD);
+    }
+    return { kind: Kind.SELECTION_SET, selections: next };
+  }
+
+  if (!('getFields' in type)) {
     return { kind: Kind.SELECTION_SET, selections: [TYPENAME_FIELD] };
   }
   const fields = (
@@ -52,15 +152,8 @@ export function filterSelectionSetForSubschema(
   ).getFields();
   const next: SelectionNode[] = [];
   let hasTypename = false;
-  const seen = new Set<string>();
-  const pushField = (sel: FieldNode) => {
-    const key = sel.alias?.value ?? sel.name.value;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    next.push(sel);
-  };
+  const seen = new Map<string, number>();
+  const pushField = (sel: FieldNode) => pushOrMergeField(next, seen, sel);
   for (const sel of selectionSet.selections) {
     if (sel.kind === Kind.FIELD) {
       const name = sel.name.value;
@@ -79,6 +172,7 @@ export function filterSelectionSetForSubschema(
             if (dep.name.value === '__typename') {
               continue;
             }
+            // `fields` is already the target subgraph schema's field map.
             if (fields[dep.name.value]) {
               pushField(dep);
             }
@@ -90,12 +184,14 @@ export function filterSelectionSetForSubschema(
         pushField(sel);
         continue;
       }
-      const childType = getNamedType(field.type);
+      const childTypeName = (
+        getNamedType(field.type as any) as unknown as { name: string }
+      ).name;
       pushField({
         ...sel,
         selectionSet: filterSelectionSetForSubschema(
           sel.selectionSet,
-          childType.name,
+          childTypeName,
           schema,
           fragments,
           fieldNodesByField,
@@ -147,7 +243,10 @@ export function filterSelectionSetForSubschema(
       if (filtered.selections.length) {
         next.push({
           kind: Kind.INLINE_FRAGMENT,
-          typeCondition: frag.typeCondition,
+          typeCondition: {
+            kind: Kind.NAMED_TYPE,
+            name: { kind: Kind.NAME, value: on },
+          },
           selectionSet: filtered,
         });
       }
@@ -300,39 +399,6 @@ function targetSchema(subschema: Subschema): GraphQLSchema {
   return subschema.schema;
 }
 
-function stripSkipInclude(selection: SelectionNode): SelectionNode {
-  if (selection.kind === Kind.FIELD) {
-    const directives = selection.directives?.filter(
-      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
-    );
-    const selectionSet = selection.selectionSet
-      ? {
-          ...selection.selectionSet,
-          selections: selection.selectionSet.selections.map(stripSkipInclude),
-        }
-      : undefined;
-    return {
-      ...selection,
-      directives: directives?.length ? directives : undefined,
-      selectionSet,
-    };
-  }
-  if (selection.kind === Kind.INLINE_FRAGMENT) {
-    const directives = selection.directives?.filter(
-      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
-    );
-    return {
-      ...selection,
-      directives: directives?.length ? directives : undefined,
-      selectionSet: {
-        ...selection.selectionSet,
-        selections: selection.selectionSet.selections.map(stripSkipInclude),
-      },
-    };
-  }
-  return selection;
-}
-
 function collectUsedVariableNames(node: SelectionNode): Set<string> {
   const used = new Set<string>();
   visit(node, {
@@ -436,6 +502,13 @@ function buildRootFetchDocument(
   // Keep nested @skip/@include for subgraph evaluation (provides-scope /
   // Condition). Root Condition nodes strip only the root field's own
   // directives before planning.
+  //
+  // Do NOT run filterSelectionSetForSubschema here: the planner already
+  // partitioned available (+ @provides) selections onto this rootField.
+  // Re-filtering against the raw subgraph SDL strips @provides fields
+  // (Book.title, Product.categories, User.name) that federation still
+  // resolves on the providing root. Gateway-only merge keys (Product.pid)
+  // are kept out earlier via raw-schema dep checks in partition/inject.
   let cleaned = fieldNode;
   if (cleaned.selectionSet) {
     cleaned = {

@@ -472,60 +472,134 @@ it('should consistently explain the query plan', async () => {
       "extensions": {
         "plan": [
           {
-            "query": "query TestQuery {
-      users {
-        __typename
-        ...User
-        id
-      }
-    }
-
-    fragment User on User {
-      id
-      username
-      name
-    }",
-            "subgraphName": "accounts",
-            "variables": {},
-          },
-          {
-            "query": "query TestQuery($_v0_representations: [_Any!]!, $_v1_representations: [_Any!]!) {
-      _v0__entities: _entities(representations: $_v0_representations) {
-        __typename
-        ... on Product {
-          inStock
+            "query": "query ($__batch_reps_0: [_Any!]!, $__batch_reps_1: [_Any!]!) {
+      _e0: _entities(representations: $__batch_reps_0) {
+        ... on User {
+          __typename
+          reviews {
+            __typename
+            ... on Review {
+              __typename
+              id
+              body
+            }
+            product {
+              __typename
+              ... on Product {
+                __typename
+                upc
+              }
+              reviews {
+                __typename
+                ... on Review {
+                  __typename
+                  id
+                  body
+                }
+                author {
+                  __typename
+                  ... on User {
+                    __typename
+                    id
+                  }
+                  reviews {
+                    __typename
+                    ... on Review {
+                      __typename
+                      id
+                      body
+                    }
+                    product {
+                      __typename
+                      ... on Product {
+                        __typename
+                        upc
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
-      _v1__entities: _entities(representations: $_v1_representations) {
-        __typename
+      _e1: _entities(representations: $__batch_reps_1) {
         ... on Product {
+          __typename
+          reviews {
+            __typename
+            ... on Review {
+              __typename
+              id
+              body
+            }
+            author {
+              __typename
+              ... on User {
+                __typename
+                id
+              }
+              reviews {
+                __typename
+                ... on Review {
+                  __typename
+                  id
+                  body
+                }
+                product {
+                  __typename
+                  ... on Product {
+                    __typename
+                    upc
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }",
+            "subgraphName": "reviews",
+            "variables": {
+              "__batch_reps_0": [
+                {
+                  "__typename": "User",
+                  "id": "1",
+                },
+                {
+                  "__typename": "User",
+                  "id": "2",
+                },
+              ],
+              "__batch_reps_1": [
+                {
+                  "__typename": "Product",
+                  "upc": "1",
+                },
+                {
+                  "__typename": "Product",
+                  "upc": "2",
+                },
+                {
+                  "__typename": "Product",
+                  "upc": "3",
+                },
+              ],
+            },
+          },
+          {
+            "query": "query ($representations: [_Any!]!) {
+      _entities(representations: $representations) {
+        ... on Product {
+          __typename
+          inStock
           shippingEstimate
         }
       }
     }",
             "subgraphName": "inventory",
             "variables": {
-              "_v0_representations": [
-                {
-                  "__typename": "Product",
-                  "price": 899,
-                  "upc": "1",
-                  "weight": 100,
-                },
-                {
-                  "__typename": "Product",
-                  "price": 1299,
-                  "upc": "2",
-                  "weight": 1000,
-                },
-                {
-                  "__typename": "Product",
-                  "price": 54,
-                  "upc": "3",
-                  "weight": 50,
-                },
-              ],
-              "_v1_representations": [
+              "representations": [
                 {
                   "__typename": "Product",
                   "price": 899,
@@ -548,31 +622,10 @@ it('should consistently explain the query plan', async () => {
             },
           },
           {
-            "query": "query TestQuery($first: Int) {
-      topProducts(first: $first) {
-        __typename
-        ...Product
-        upc
-      }
-    }
-
-    fragment Product on Product {
-      __typename
-      upc
-      name
-      price
-      weight
-    }",
-            "subgraphName": "products",
-            "variables": {
-              "first": 5,
-            },
-          },
-          {
-            "query": "query TestQuery($representations: [_Any!]!) {
+            "query": "query ($representations: [_Any!]!) {
       _entities(representations: $representations) {
-        __typename
         ... on Product {
+          __typename
           name
           price
           weight
@@ -598,72 +651,11 @@ it('should consistently explain the query plan', async () => {
             },
           },
           {
-            "query": "query TestQuery($representations: [_Any!]!) {
+            "query": "query ($representations: [_Any!]!) {
       _entities(representations: $representations) {
-        __typename
-        ... on Product {
-          reviews {
-            __typename
-            ...Review
-            author {
-              username
-              __typename
-              __typename
-              ...User
-              reviews {
-                __typename
-                ...Review
-                product {
-                  ...Product
-                }
-                id
-              }
-              id
-            }
-            id
-          }
-          upc
-        }
-      }
-    }
-
-    fragment Product on Product {
-      __typename
-      upc
-    }
-
-    fragment User on User {
-      __typename
-      id
-    }
-
-    fragment Review on Review {
-      id
-      body
-    }",
-            "subgraphName": "reviews",
-            "variables": {
-              "representations": [
-                {
-                  "__typename": "Product",
-                  "upc": "1",
-                },
-                {
-                  "__typename": "Product",
-                  "upc": "2",
-                },
-                {
-                  "__typename": "Product",
-                  "upc": "3",
-                },
-              ],
-            },
-          },
-          {
-            "query": "query TestQuery($representations: [_Any!]!) {
-      _entities(representations: $representations) {
-        __typename
         ... on User {
+          __typename
+          username
           name
         }
       }
@@ -683,72 +675,40 @@ it('should consistently explain the query plan', async () => {
             },
           },
           {
-            "query": "query TestQuery($representations: [_Any!]!) {
-      _entities(representations: $representations) {
-        __typename
-        ... on User {
-          reviews {
-            __typename
-            ...Review
-            product {
-              __typename
-              ...Product
-              reviews {
-                __typename
-                ...Review
-                author {
-                  username
-                  __typename
-                  __typename
-                  ...User
-                  reviews {
-                    __typename
-                    ...Review
-                    product {
-                      ...Product
-                    }
-                    id
-                  }
-                  id
-                }
-                id
-              }
-              upc
-            }
-            id
-          }
-          id
+            "query": "query TestQuery {
+      topProducts {
+        ... on Product {
+          upc
+          name
+          price
+          weight
         }
+        upc
+        name
+        price
+        weight
+        __typename
       }
-    }
-
-    fragment User on User {
-      __typename
-      id
-    }
-
-    fragment Product on Product {
-      __typename
-      upc
-    }
-
-    fragment Review on Review {
-      id
-      body
     }",
-            "subgraphName": "reviews",
-            "variables": {
-              "representations": [
-                {
-                  "__typename": "User",
-                  "id": "1",
-                },
-                {
-                  "__typename": "User",
-                  "id": "2",
-                },
-              ],
-            },
+            "subgraphName": "products",
+            "variables": {},
+          },
+          {
+            "query": "query TestQuery {
+      users {
+        ... on User {
+          id
+          username
+          name
+        }
+        id
+        username
+        name
+        __typename
+      }
+    }",
+            "subgraphName": "accounts",
+            "variables": {},
           },
         ],
       },
