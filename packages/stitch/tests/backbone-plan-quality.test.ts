@@ -94,9 +94,7 @@ describe('backbone plan quality', () => {
         userById: (_: unknown, { id }: { id: string }) => ({ id }),
       },
       User: {
-        chirps: (u: { id: string }) => [
-          { id: `c-${u.id}`, text: 'hello' },
-        ],
+        chirps: (u: { id: string }) => [{ id: `c-${u.id}`, text: 'hello' }],
       },
     },
   });

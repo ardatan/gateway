@@ -21,7 +21,9 @@ const ORIGINAL_RESOLVE = Symbol.for(
   'graphql-tools.stitch.backboneOriginalResolve',
 );
 
-function selectionHasDeferOrStream(selections: readonly SelectionNode[]): boolean {
+function selectionHasDeferOrStream(
+  selections: readonly SelectionNode[],
+): boolean {
   const stack = [...selections];
   while (stack.length) {
     const sel = stack.pop()!;
@@ -145,8 +147,8 @@ export function installRootTrampoline(
 }
 
 /** Original root resolver before trampoline (for tests / debugging). */
-export function getOriginalRootResolve(
-  field: { resolve?: GraphQLFieldResolver<any, any> },
-): GraphQLFieldResolver<any, any> | undefined {
+export function getOriginalRootResolve(field: {
+  resolve?: GraphQLFieldResolver<any, any>;
+}): GraphQLFieldResolver<any, any> | undefined {
   return (field as any)[ORIGINAL_RESOLVE];
 }

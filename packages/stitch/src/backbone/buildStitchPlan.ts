@@ -1,16 +1,10 @@
-import type {
-  StitchingInfo,
-  Subschema,
-} from '@graphql-tools/delegate';
+import type { StitchingInfo, Subschema } from '@graphql-tools/delegate';
 import {
   getVariableValues,
   handleOverrideByDelegation,
   leftOverByDelegationPlan,
 } from '@graphql-tools/delegate';
-import {
-  collectFields,
-  getDefinedRootType,
-} from '@graphql-tools/utils';
+import { collectFields, getDefinedRootType } from '@graphql-tools/utils';
 import {
   FieldNode,
   FragmentDefinitionNode,
@@ -244,9 +238,7 @@ function fieldAvailableOnSubschema(
   // there (not when the field is stripped by isolation clones).
   const transformed = subschema.transformedSchema.getType(typeName);
   if (transformed && 'getFields' in transformed) {
-    return (
-      (transformed as GraphQLObjectType).getFields()[fieldName] != null
-    );
+    return (transformed as GraphQLObjectType).getFields()[fieldName] != null;
   }
   const raw = subschema.schema.getType(typeName);
   if (raw && 'getFields' in raw) {
@@ -270,8 +262,7 @@ function mergeFieldNodes(existing: FieldNode, incoming: FieldNode): FieldNode {
       const key = sel.alias?.value ?? sel.name.value;
       const idx = merged.findIndex(
         (m) =>
-          m.kind === Kind.FIELD &&
-          (m.alias?.value ?? m.name.value) === key,
+          m.kind === Kind.FIELD && (m.alias?.value ?? m.name.value) === key,
       );
       if (idx >= 0) {
         merged[idx] = mergeFieldNodes(merged[idx] as FieldNode, sel);
@@ -314,7 +305,9 @@ function concretesOnSubschema(
     return subType.getTypes().filter(isObjectType);
   }
   if (isInterfaceType(subType)) {
-    return subschema.transformedSchema.getPossibleTypes(subType).filter(isObjectType);
+    return subschema.transformedSchema
+      .getPossibleTypes(subType)
+      .filter(isObjectType);
   }
   // Parent absent here (e.g. interface-object): fall back to gateway possibles
   // that physically exist on the subgraph.
@@ -434,7 +427,9 @@ function expandAbstractSelectionsForSubschema(
       } else if (sel.kind === Kind.INLINE_FRAGMENT) {
         const cond = sel.typeCondition?.name.value;
         if (!cond || cond === concreteName) {
-          out.push(...flattenOntoConcrete(concreteName, sel.selectionSet.selections));
+          out.push(
+            ...flattenOntoConcrete(concreteName, sel.selectionSet.selections),
+          );
           continue;
         }
         const gwCond = gatewaySchema.getType(cond);
@@ -451,7 +446,9 @@ function expandAbstractSelectionsForSubschema(
             isObjectType(subConcrete) &&
             (subschema.transformedSchema
               .getPossibleTypes?.(
-                subschema.transformedSchema.getType(cond) as GraphQLInterfaceType,
+                subschema.transformedSchema.getType(
+                  cond,
+                ) as GraphQLInterfaceType,
               )
               ?.some((t) => t.name === concreteName) ||
               sel.selectionSet.selections.some(
@@ -470,7 +467,9 @@ function expandAbstractSelectionsForSubschema(
             );
           }
         } else if (cond === parentTypeName) {
-          out.push(...flattenOntoConcrete(concreteName, sel.selectionSet.selections));
+          out.push(
+            ...flattenOntoConcrete(concreteName, sel.selectionSet.selections),
+          );
         }
       } else if (sel.kind === Kind.FRAGMENT_SPREAD) {
         const fragment = fragments[sel.name.value];
@@ -478,7 +477,10 @@ function expandAbstractSelectionsForSubschema(
           continue;
         }
         out.push(
-          ...flattenOntoConcrete(concreteName, fragment.selectionSet.selections),
+          ...flattenOntoConcrete(
+            concreteName,
+            fragment.selectionSet.selections,
+          ),
         );
       }
     }
@@ -599,7 +601,11 @@ function expandAbstractSelectionsForSubschema(
         continue;
       }
 
-      if (isInterfaceType(gwCond) || isUnionType(gwCond) || cond === parentTypeName) {
+      if (
+        isInterfaceType(gwCond) ||
+        isUnionType(gwCond) ||
+        cond === parentTypeName
+      ) {
         // Expand to subgraph concretes under the parent (Hive FetchGraph style).
         const concretes = concretesOnSubschema(
           subschema,
@@ -825,10 +831,7 @@ function partitionSelectionsForSubschema(
       typeName,
     );
     if (typed.size) {
-      effectiveProvided = new Set([
-        ...(providedFieldNames ?? []),
-        ...typed,
-      ]);
+      effectiveProvided = new Set([...(providedFieldNames ?? []), ...typed]);
     }
   }
   const fetchable = (fieldName: string) => {
@@ -1052,8 +1055,7 @@ function partitionSelectionsForSubschema(
           });
         }
       } else if (selection.kind === Kind.INLINE_FRAGMENT) {
-        const typeCondition =
-          selection.typeCondition?.name.value ?? typeName;
+        const typeCondition = selection.typeCondition?.name.value ?? typeName;
         // Must check the type exists on this subgraph — __typename is always
         // "available" and must not be used as a proxy for type presence.
         const condType =
@@ -1062,8 +1064,7 @@ function partitionSelectionsForSubschema(
         const parentType =
           subschema.transformedSchema.getType(typeName) ??
           subschema.schema.getType(typeName);
-        let typeOnSubschema =
-          typeCondition === typeName || condType != null;
+        let typeOnSubschema = typeCondition === typeName || condType != null;
         // Object parents cannot host fragments on a different object type
         // (book: Book cannot take `... on Song`).
         if (
@@ -1075,9 +1076,7 @@ function partitionSelectionsForSubschema(
             typeOnSubschema = false;
           } else if (
             isInterfaceType(condType) &&
-            !parentType
-              .getInterfaces()
-              .some((i) => i.name === condType.name)
+            !parentType.getInterfaces().some((i) => i.name === condType.name)
           ) {
             typeOnSubschema = false;
           } else if (
@@ -1195,9 +1194,7 @@ function fieldNodeKey(field: FieldNode): string {
   const alias = field.alias?.value;
   const name = field.name.value;
   const args = field.arguments?.length
-    ? JSON.stringify(
-        field.arguments.map((a) => [a.name.value, a.value]),
-      )
+    ? JSON.stringify(field.arguments.map((a) => [a.name.value, a.value]))
     : '';
   return `${alias ?? ''}:${name}:${args}`;
 }
@@ -1321,12 +1318,7 @@ function selectionFullyLocalOnSubschema(
     }
     const nestedTypeName = getNamedType(field.type).name;
     return selection.selectionSet.selections.every((sel) =>
-      selectionFullyLocalOnSubschema(
-        subschema,
-        nestedTypeName,
-        sel,
-        fragments,
-      ),
+      selectionFullyLocalOnSubschema(subschema, nestedTypeName, sel, fragments),
     );
   }
   if (selection.kind === Kind.INLINE_FRAGMENT) {
@@ -1643,7 +1635,10 @@ function collectFieldsForConcreteType(
           (isInterfaceType(abstractType) &&
             abstractType.getFields()[sel.name.value] != null)
         ) {
-          if (concreteFields[sel.name.value] != null || sel.name.value === '__typename') {
+          if (
+            concreteFields[sel.name.value] != null ||
+            sel.name.value === '__typename'
+          ) {
             fields.push(sel);
           }
         }
@@ -1702,8 +1697,7 @@ function planLocalFieldIsland(
   let continuePlan: StitchPlanNode | undefined;
   const parentType = schema.getType(parentTypeName);
   const field =
-    parentType &&
-    (isObjectType(parentType) || isInterfaceType(parentType))
+    parentType && (isObjectType(parentType) || isInterfaceType(parentType))
       ? parentType.getFields()[fieldNode.name.value]
       : undefined;
   if (field && fieldNode.selectionSet) {
@@ -1897,10 +1891,8 @@ function planMergedTypeFollowUps(
   // Avoid planning the same nested entity path twice — once from a delegation
   // map selection (deep reviews tree) and again from the original fieldNodes.
   const plannedNestedKeys = new Set<string>();
-  const nestedKey = (
-    hopType: string,
-    path: Array<string | number>,
-  ): string => `${hopType}::${path.join('\0')}`;
+  const nestedKey = (hopType: string, path: Array<string | number>): string =>
+    `${hopType}::${path.join('\0')}`;
 
   const appendNestedForFields = (
     fields: readonly FieldNode[],
@@ -1922,11 +1914,7 @@ function planMergedTypeFollowUps(
       }
       // Gateway-local (@resolveTo / additionalResolvers) before entity hops.
       if (
-        isLocalField(
-          stitchingInfo.localFields,
-          typeName,
-          fieldNode.name.value,
-        )
+        isLocalField(stitchingInfo.localFields, typeName, fieldNode.name.value)
       ) {
         stages.push(
           planLocalFieldIsland(
@@ -2105,11 +2093,7 @@ function planMergedTypeFollowUps(
     const fetchableLeftovers: FieldNode[] = [];
     for (const fieldNode of leftOver.unproxiableFieldNodes) {
       if (
-        isLocalField(
-          stitchingInfo.localFields,
-          typeName,
-          fieldNode.name.value,
-        )
+        isLocalField(stitchingInfo.localFields, typeName, fieldNode.name.value)
       ) {
         stages.push(
           planLocalFieldIsland(
@@ -2137,8 +2121,9 @@ function planMergedTypeFollowUps(
             const nonUnique = mergedTypeInfo.nonUniqueFields[fieldName];
             return nonUnique?.includes(s) || unique == null;
           });
-      const chosen =
-        (targets.length ? targets : leftOver.nonProxiableSubschemas)[0];
+      const chosen = (
+        targets.length ? targets : leftOver.nonProxiableSubschemas
+      )[0];
       if (!chosen) {
         continue;
       }
@@ -2315,10 +2300,7 @@ function planRootField(
               stitchingInfo,
               returnType.name,
               someSource,
-              flattenToFieldNodes(
-                fieldNode.selectionSet.selections,
-                fragments,
-              ),
+              flattenToFieldNodes(fieldNode.selectionSet.selections, fragments),
               fragments,
               variableValues,
               [responseKey],
@@ -2491,15 +2473,18 @@ function planRootField(
           sel.name.value,
           owner,
         );
-        const fieldDef = (
-          schema.getType(returnTypeName!) ??
+        const fieldDef = (schema.getType(returnTypeName!) ??
           owner.transformedSchema.getType(returnTypeName!) ??
-          owner.schema.getType(returnTypeName!)
-        ) as GraphQLObjectType | undefined;
+          owner.schema.getType(returnTypeName!)) as
+          | GraphQLObjectType
+          | undefined;
         const nestedReturn = fieldDef?.getFields()?.[sel.name.value]
           ? getNamedType(fieldDef.getFields()[sel.name.value]!.type)
           : undefined;
-        if (!nestedReturn || !isAbstractType(nestedReturn) && !isObjectType(nestedReturn)) {
+        if (
+          !nestedReturn ||
+          (!isAbstractType(nestedReturn) && !isObjectType(nestedReturn))
+        ) {
           continue;
         }
         if (isAbstractType(nestedReturn)) {
@@ -2662,7 +2647,9 @@ function planRootField(
   });
 
   if (!rootFetches.length) {
-    incompleteReasons.push(`No subschema could satisfy root field ${fieldName}`);
+    incompleteReasons.push(
+      `No subschema could satisfy root field ${fieldName}`,
+    );
     return {
       kind: 'Island',
       parentTypeName: rootType.name,
@@ -3043,10 +3030,7 @@ function planRootField(
               continue;
             }
             const nestedNamed = getNamedType(nestedFieldDef.type);
-            if (
-              !isObjectType(nestedNamed) &&
-              !isAbstractType(nestedNamed)
-            ) {
+            if (!isObjectType(nestedNamed) && !isAbstractType(nestedNamed)) {
               continue;
             }
             if (!stitchingInfo.mergedTypes[nestedNamed.name]) {
@@ -3142,9 +3126,7 @@ function planRootField(
     if (followUp) {
       parts.push(followUp);
     }
-    return parts.length === 1
-      ? parts[0]!
-      : { kind: 'Sequence', nodes: parts };
+    return parts.length === 1 ? parts[0]! : { kind: 'Sequence', nodes: parts };
   };
 
   // Interface/union returns:
@@ -3589,8 +3571,7 @@ function coalesceFetchKey(
 ): string | null {
   const sub = node.subschema.name ?? '';
   const paths =
-    node.flattenPaths ??
-    (node.flattenPath != null ? [node.flattenPath] : null);
+    node.flattenPaths ?? (node.flattenPath != null ? [node.flattenPath] : null);
   if (node.entityTypeName && paths?.length) {
     return `e:${sub}:${node.entityTypeName}:${paths.map((p) => p.join('\0')).join('/')}`;
   }
@@ -3629,8 +3610,7 @@ function entityBatchKey(
     return null;
   }
   const paths =
-    node.flattenPaths ??
-    (node.flattenPath != null ? [node.flattenPath] : null);
+    node.flattenPaths ?? (node.flattenPath != null ? [node.flattenPath] : null);
   if (!paths?.length) {
     return null;
   }
@@ -3751,7 +3731,6 @@ function collectRequiresDeps(
   }
   return deps;
 }
-
 
 function collectSelectedFieldNames(
   selectionSet: SelectionSetNode,
@@ -3961,11 +3940,7 @@ function tryUnionEntityFetches(
       }
     }
   }
-  const subschema = resolveSubschemaForUnion(
-    stitchingInfo,
-    template,
-    selected,
-  );
+  const subschema = resolveSubschemaForUnion(stitchingInfo, template, selected);
   return {
     kind: 'Fetch',
     subschema,
@@ -4081,8 +4056,7 @@ function fetchDependsOn(
   const laterPaths = fetchFlattenPaths(later);
   const earlierPaths = fetchFlattenPaths(earlier);
   if (earlier.rootField) {
-    const rk =
-      earlier.rootField.alias?.value ?? earlier.rootField.name.value;
+    const rk = earlier.rootField.alias?.value ?? earlier.rootField.name.value;
     // Root Fetch produces the top segment; also check nested selection under it.
     for (const lp of laterPaths) {
       if (lp[0] !== rk) {
@@ -4091,9 +4065,7 @@ function fetchDependsOn(
       if (lp.length === 1) {
         return true;
       }
-      if (
-        selectionProducesPathSuffix(earlier.selectionSet, lp.slice(1))
-      ) {
+      if (selectionProducesPathSuffix(earlier.selectionSet, lp.slice(1))) {
         return true;
       }
     }
@@ -4158,8 +4130,7 @@ function fetchDependsOn(
   }
   // Requires edge only if paths relate (same / ancestor / root).
   if (earlier.rootField) {
-    const rk =
-      earlier.rootField.alias?.value ?? earlier.rootField.name.value;
+    const rk = earlier.rootField.alias?.value ?? earlier.rootField.name.value;
     if (laterPaths.some((lp) => lp[0] === rk)) {
       return true;
     }
@@ -4485,10 +4456,7 @@ function collectEntityFetchOrders(
 
 function applyFetchOrderUpdates(
   node: StitchPlanNode,
-  updates: Map<
-    number,
-    Extract<StitchPlanNode, { kind: 'Fetch' }> | null
-  >,
+  updates: Map<number, Extract<StitchPlanNode, { kind: 'Fetch' }> | null>,
   counter: { n: number },
 ): StitchPlanNode | null {
   if (node.kind === 'Fetch') {
@@ -4512,11 +4480,11 @@ function applyFetchOrderUpdates(
     return {
       ...node,
       ifClause: node.ifClause
-        ? applyFetchOrderUpdates(node.ifClause, updates, counter) ?? undefined
+        ? (applyFetchOrderUpdates(node.ifClause, updates, counter) ?? undefined)
         : undefined,
       elseClause: node.elseClause
-        ? applyFetchOrderUpdates(node.elseClause, updates, counter) ??
-          undefined
+        ? (applyFetchOrderUpdates(node.elseClause, updates, counter) ??
+          undefined)
         : undefined,
     };
   }
@@ -4554,21 +4522,17 @@ function coalesceSamePathEntityFields(
       order: number;
     }> = [];
     collectEntityFetchOrders(current, locs, { n: 0 });
-    let absorbed:
-      | {
-          earlierOrder: number;
-          laterOrder: number;
-          earlier: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
-          later: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
-        }
-      | null = null;
+    let absorbed: {
+      earlierOrder: number;
+      laterOrder: number;
+      earlier: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
+      later: Extract<StitchPlanNode, { kind: 'Fetch' }> | null;
+    } | null = null;
     outer: for (let i = 0; i < locs.length; i++) {
       for (let j = i + 1; j < locs.length; j++) {
         const a = locs[i]!;
         const b = locs[j]!;
-        const intervening = locs
-          .slice(i + 1, j)
-          .map((l) => l.fetch);
+        const intervening = locs.slice(i + 1, j).map((l) => l.fetch);
         const result = tryAbsorbFetches(
           stitchingInfo,
           a.fetch,
@@ -4596,8 +4560,7 @@ function coalesceSamePathEntityFields(
     >();
     updates.set(absorbed.earlierOrder, absorbed.earlier);
     updates.set(absorbed.laterOrder, absorbed.later);
-    current =
-      applyFetchOrderUpdates(current, updates, { n: 0 }) ?? current;
+    current = applyFetchOrderUpdates(current, updates, { n: 0 }) ?? current;
   }
   return current;
 }
@@ -4652,19 +4615,13 @@ function packIndependentSequenceFetches(
             }
             if (
               pathIsPrefix(gp, mp) &&
-              selectionTouchesPathSuffix(
-                g.selectionSet,
-                mp.slice(gp.length),
-              )
+              selectionTouchesPathSuffix(g.selectionSet, mp.slice(gp.length))
             ) {
               return true;
             }
             if (
               pathIsPrefix(mp, gp) &&
-              selectionTouchesPathSuffix(
-                m.selectionSet,
-                gp.slice(mp.length),
-              )
+              selectionTouchesPathSuffix(m.selectionSet, gp.slice(mp.length))
             ) {
               return true;
             }
@@ -4816,9 +4773,7 @@ function liftTrailingInventoryPastParallelJoin(
     // Place lifted hops just before the first post-join node that any of them
     // don't depend on — typically Parallel(accounts, products) then inventory.
     const invNode =
-      lifted.length === 1
-        ? lifted[0]!
-        : mergeMultiPathFetches(lifted);
+      lifted.length === 1 ? lifted[0]! : mergeMultiPathFetches(lifted);
     // Prefer appending before a trailing inventory, else at end of the
     // independent mid-wave (after first Parallel of entity hops).
     let inserted = false;
@@ -4895,10 +4850,7 @@ function fetchFlattenPaths(
   return [];
 }
 
-function pathIsPrefix(
-  shorter: PathSegment[],
-  longer: PathSegment[],
-): boolean {
+function pathIsPrefix(shorter: PathSegment[], longer: PathSegment[]): boolean {
   if (shorter.length >= longer.length) {
     return false;
   }
@@ -5195,10 +5147,7 @@ function optimizeStitchPlanNode(
     // Do not flatten Parallel groups that contain root Fetches — shared-root
     // sameKey isolation (account vs chat) requires each alias's fan-out to stay
     // in its own Parallel unit.
-    if (
-      child.kind === kind &&
-      !(kind === 'Parallel' && hasRootFetch(child))
-    ) {
+    if (child.kind === kind && !(kind === 'Parallel' && hasRootFetch(child))) {
       flat.push(...child.nodes);
     } else {
       flat.push(child);
@@ -5377,8 +5326,7 @@ function tryBatchWithinSequence(
       continue;
     }
     const sortedGroup = [...group].sort(
-      (a, b) =>
-        a.pos - b.pos || (a.parallelIdx ?? 0) - (b.parallelIdx ?? 0),
+      (a, b) => a.pos - b.pos || (a.parallelIdx ?? 0) - (b.parallelIdx ?? 0),
     );
     const earliest = sortedGroup[0]!;
     const latest = sortedGroup[sortedGroup.length - 1]!;
@@ -5407,8 +5355,7 @@ function tryBatchWithinSequence(
 
   // Place batch at the latest loc; remove all group members from the sequence.
   const sorted = [...best].sort(
-    (a, b) =>
-      a.pos - b.pos || (a.parallelIdx ?? 0) - (b.parallelIdx ?? 0),
+    (a, b) => a.pos - b.pos || (a.parallelIdx ?? 0) - (b.parallelIdx ?? 0),
   );
   const latest = sorted[sorted.length - 1]!;
   const batchPaths = best.flatMap((l) => fetchFlattenPaths(l.fetch));
@@ -5726,8 +5673,7 @@ function buildCompletePlan(
     rootNodes.length === 1
       ? rootNodes[0]!
       : {
-          kind:
-            operation.operation === 'mutation' ? 'Sequence' : 'Parallel',
+          kind: operation.operation === 'mutation' ? 'Sequence' : 'Parallel',
           nodes: rootNodes,
         };
 
@@ -5868,9 +5814,7 @@ function peelRootParallelHeads(
       return {
         head,
         rest:
-          child.nodes.length > 1
-            ? toSeqOrSingle(child.nodes.slice(1))
-            : null,
+          child.nodes.length > 1 ? toSeqOrSingle(child.nodes.slice(1)) : null,
       };
     }
     if (child.kind === 'Fetch' && child.rootField) {
@@ -5928,9 +5872,7 @@ function peelLeadingEntityFetches(
   if (node.kind === 'Sequence') {
     return {
       kind: 'Sequence',
-      nodes: node.nodes.map((c) =>
-        peelLeadingEntityFetches(c, stitchingInfo),
-      ),
+      nodes: node.nodes.map((c) => peelLeadingEntityFetches(c, stitchingInfo)),
     };
   }
   if (node.kind !== 'Parallel' || node.nodes.length < 2) {
@@ -5950,11 +5892,7 @@ function peelLeadingEntityFetches(
       continue;
     }
     const head = child.nodes[0]!;
-    if (
-      head.kind !== 'Fetch' ||
-      !head.entityTypeName ||
-      head.rootField
-    ) {
+    if (head.kind !== 'Fetch' || !head.entityTypeName || head.rootField) {
       kept.push(child);
       continue;
     }
@@ -5994,8 +5932,7 @@ function peelLeadingEntityFetches(
     if (
       k.kind === 'Parallel' &&
       k.nodes.every(
-        (n) =>
-          n.kind === 'Fetch' && Boolean(n.entityTypeName) && !n.rootField,
+        (n) => n.kind === 'Fetch' && Boolean(n.entityTypeName) && !n.rootField,
       )
     ) {
       wave.push(...k.nodes);
@@ -6034,10 +5971,7 @@ function compressProductsIntoDeepWave(
     return node.continue
       ? {
           ...node,
-          continue: compressProductsIntoDeepWave(
-            node.continue,
-            stitchingInfo,
-          ),
+          continue: compressProductsIntoDeepWave(node.continue, stitchingInfo),
         }
       : node;
   }
@@ -6139,10 +6073,7 @@ function compressProductsIntoDeepWave(
       kind: 'Parallel',
       nodes: mergedParallel,
     });
-    return compressProductsIntoDeepWave(
-      toSeqOrSingle(flat),
-      stitchingInfo,
-    );
+    return compressProductsIntoDeepWave(toSeqOrSingle(flat), stitchingInfo);
   }
   return toSeqOrSingle(flat);
 }
@@ -6177,9 +6108,7 @@ function groupParallelBatchFetches(
   if (node.kind === 'Sequence') {
     return {
       kind: 'Sequence',
-      nodes: node.nodes.map((c) =>
-        groupParallelBatchFetches(c, stitchingInfo),
-      ),
+      nodes: node.nodes.map((c) => groupParallelBatchFetches(c, stitchingInfo)),
     };
   }
   if (node.kind !== 'Parallel') {
@@ -6215,15 +6144,13 @@ function groupParallelBatchFetches(
     if (consumed.has(child)) {
       continue;
     }
-    if (
-      child.kind !== 'Fetch' ||
-      !child.entityTypeName ||
-      child.rootField
-    ) {
+    if (child.kind !== 'Fetch' || !child.entityTypeName || child.rootField) {
       next.push(child);
       continue;
     }
-    const group = bySub.get(child.subschema.name ?? String(entityTypeKey(child)));
+    const group = bySub.get(
+      child.subschema.name ?? String(entityTypeKey(child)),
+    );
     if (!group || group.length < 2) {
       next.push(child);
       continue;
@@ -6231,8 +6158,7 @@ function groupParallelBatchFetches(
     // Distinct entity types or selections → BatchFetch once per group.
     const typeKeys = new Set(
       group.map(
-        (g) =>
-          `${g.entityTypeName}\0${selectionSetKey(g.selectionSet)}`,
+        (g) => `${g.entityTypeName}\0${selectionSetKey(g.selectionSet)}`,
       ),
     );
     if (typeKeys.size < 2) {
@@ -6303,9 +6229,7 @@ function groupParallelBatchFetches(
       })),
     });
   }
-  return next.length === 1
-    ? next[0]!
-    : { kind: 'Parallel', nodes: next };
+  return next.length === 1 ? next[0]! : { kind: 'Parallel', nodes: next };
 }
 
 /**
@@ -6359,9 +6283,7 @@ function assignDepsOnly(
   let counter = 0;
   let islandSeq = 0;
 
-  const pathProducersFor = (
-    paths: PathSegment[][] | undefined,
-  ): string[] => {
+  const pathProducersFor = (paths: PathSegment[][] | undefined): string[] => {
     if (!paths?.length) {
       return [];
     }
@@ -6378,8 +6300,7 @@ function assignDepsOnly(
         }
         // Root Fetch with response key matching Island path head.
         if (fetch.rootField) {
-          const rk =
-            fetch.rootField.alias?.value ?? fetch.rootField.name.value;
+          const rk = fetch.rootField.alias?.value ?? fetch.rootField.name.value;
           if (islandPath[0] === rk) {
             ids.push(fetch.id);
           }
@@ -6469,4 +6390,3 @@ function assignDepsOnly(
   };
   return assign(root, []);
 }
-

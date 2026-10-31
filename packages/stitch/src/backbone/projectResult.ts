@@ -1,3 +1,5 @@
+import { getVariableValues } from '@graphql-tools/delegate';
+import { collectFields, getDefinedRootType } from '@graphql-tools/utils';
 import type {
   FieldNode,
   FragmentDefinitionNode,
@@ -15,8 +17,6 @@ import {
   isObjectType,
   Kind,
 } from 'graphql';
-import { collectFields, getDefinedRootType } from '@graphql-tools/utils';
-import { getVariableValues } from '@graphql-tools/delegate';
 
 /**
  * Project execution data down to the client operation selection set.
@@ -98,7 +98,10 @@ function projectValue(
   let objectType: GraphQLObjectType | undefined;
   if (isObjectType(runtimeType)) {
     objectType = runtimeType;
-  } else if (isAbstractType(runtimeType) && typeof value.__typename === 'string') {
+  } else if (
+    isAbstractType(runtimeType) &&
+    typeof value.__typename === 'string'
+  ) {
     const t = schema.getType(value.__typename);
     if (isObjectType(t)) {
       objectType = t;
@@ -171,7 +174,9 @@ function projectValue(
       continue;
     }
     const raw =
-      responseKey in value ? value[responseKey] : value[nestedFieldNode.name.value];
+      responseKey in value
+        ? value[responseKey]
+        : value[nestedFieldNode.name.value];
     projected[responseKey] = projectValue(
       schema,
       fragments,

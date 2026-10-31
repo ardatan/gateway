@@ -210,9 +210,7 @@ function stampSubschema(
     (object as any)[FIELD_SUBSCHEMA_MAP_SYMBOL] = Object.create(null);
   }
   if ((object as any)[UNPATHED_ERRORS_SYMBOL] == null) {
-    (object as any)[UNPATHED_ERRORS_SYMBOL] = errors?.length
-      ? [...errors]
-      : [];
+    (object as any)[UNPATHED_ERRORS_SYMBOL] = errors?.length ? [...errors] : [];
   } else if (errors?.length) {
     (object as any)[UNPATHED_ERRORS_SYMBOL] = [...errors];
   }
@@ -222,7 +220,10 @@ function stampSubschema(
  * Concrete root/list payloads omit planner-injected `__typename` in the outbound
  * query; stamp the known object type so later entity hops can match parents.
  */
-function stampConcreteTypename(value: any, returnType: GraphQLOutputType): void {
+function stampConcreteTypename(
+  value: any,
+  returnType: GraphQLOutputType,
+): void {
   const named = getNamedType(returnType);
   if (!isObjectType(named)) {
     return;
@@ -307,9 +308,7 @@ function errorFromFetchThrow(
 }
 
 /** After plan execute: fill missing nullable roots with null; bubble non-null. */
-function finalizeRootResult(
-  ctx: BackboneExecutionContext,
-): ExecutionResult {
+function finalizeRootResult(ctx: BackboneExecutionContext): ExecutionResult {
   const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
   const data: Record<string, any> = { ...ctx.data };
   let nullWhole = false;
@@ -738,10 +737,17 @@ function executeFetchNode(
     const responseKey =
       node.rootField.alias?.value ?? node.rootField.name.value;
     const rootFieldNode = node.rootField;
-    const writeRootResult = (value: any, errors: readonly GraphQLError[] = []) => {
+    const writeRootResult = (
+      value: any,
+      errors: readonly GraphQLError[] = [],
+    ) => {
       if (errors.length) {
         ctx.errors.push(
-          ...locateRootFieldErrors(errors as GraphQLError[], responseKey, rootFieldNode),
+          ...locateRootFieldErrors(
+            errors as GraphQLError[],
+            responseKey,
+            rootFieldNode,
+          ),
         );
       }
       if (value !== undefined) {
@@ -816,7 +822,12 @@ function executeFetchNode(
         (value) => writeRootResult(value),
         (err) => {
           ctx.errors.push(
-            errorFromFetchThrow(err, node.subschema, responseKey, rootFieldNode),
+            errorFromFetchThrow(
+              err,
+              node.subschema,
+              responseKey,
+              rootFieldNode,
+            ),
           );
           if (!(responseKey in ctx.data)) {
             ctx.data[responseKey] = null;
@@ -874,12 +885,7 @@ function executeFetchNode(
       },
       (err) => {
         ctx.errors.push(
-          errorFromFetchThrow(
-            err,
-            node.subschema,
-            responseKey,
-            rootFieldNode,
-          ),
+          errorFromFetchThrow(err, node.subschema, responseKey, rootFieldNode),
         );
         if (!(responseKey in ctx.data)) {
           ctx.data[responseKey] = null;
@@ -889,8 +895,7 @@ function executeFetchNode(
   }
 
   const flattenPaths =
-    node.flattenPaths ??
-    (node.flattenPath != null ? [node.flattenPath] : null);
+    node.flattenPaths ?? (node.flattenPath != null ? [node.flattenPath] : null);
   if (!node.entityTypeName || !flattenPaths?.length) {
     return;
   }
@@ -1231,8 +1236,7 @@ function executeIslandNode(
   const args = getArgumentValues(field, node.fieldNode, ctx.variableValues);
 
   const flattenPaths =
-    node.flattenPaths ??
-    (node.flattenPath != null ? [node.flattenPath] : null);
+    node.flattenPaths ?? (node.flattenPath != null ? [node.flattenPath] : null);
 
   // Nested Island: resolve on every parent object at the flatten path(s).
   if (flattenPaths?.length) {
@@ -1901,11 +1905,7 @@ function isLeafOnlySelection(selectionSet: SelectionSetNode): boolean {
     if (sel.name.value === '__typename') {
       continue;
     }
-    if (
-      sel.selectionSet ||
-      sel.arguments?.length ||
-      sel.directives?.length
-    ) {
+    if (sel.selectionSet || sel.arguments?.length || sel.directives?.length) {
       return false;
     }
   }
@@ -2025,7 +2025,11 @@ function executeBatchFetchNode(
         },
         (err) => {
           ctx.errors.push(
-            errorFromFetchThrow(err, node.subschema, node.aliases[0]?.alias ?? '_entities'),
+            errorFromFetchThrow(
+              err,
+              node.subschema,
+              node.aliases[0]?.alias ?? '_entities',
+            ),
           );
         },
       );
