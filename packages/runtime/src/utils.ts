@@ -94,6 +94,37 @@ export function delayInMs(ms: number, signal?: AbortSignal) {
   });
 }
 
+/**
+ * Yoga/envelop may pass a variables map that still contains keys whose value
+ * is `undefined` when the client omitted them. GraphQL.js then treats those as
+ * "provided without a runtime value" and skips operation defaults
+ * (`$bool: Boolean = false`), breaking `@skip`/`@include`. Strip undefined
+ * entries (and unwrap graphql@17 `{ sources, coerced }` wrappers) before the
+ * executor sees them.
+ */
+export function normalizeExecutorVariables(
+  variableValues: unknown,
+): Record<string, unknown> | undefined {
+  if (variableValues == null) {
+    return undefined;
+  }
+  const raw = variableValues as {
+    coerced?: Record<string, unknown>;
+    sources?: unknown;
+  };
+  const map =
+    raw.coerced != null && raw.sources != null
+      ? raw.coerced
+      : (variableValues as Record<string, unknown>);
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(map)) {
+    if (value !== undefined) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 export const getExecuteFnFromExecutor = memoize1(
   function getExecuteFnFromExecutor(executor: Executor) {
     return function executeFn(args: ExecutionArgs) {
@@ -101,7 +132,7 @@ export const getExecuteFnFromExecutor = memoize1(
         document: args.document,
         rootValue: args.rootValue,
         context: args.contextValue,
-        variables: args.variableValues,
+        variables: normalizeExecutorVariables(args.variableValues),
         operationName: args.operationName ?? undefined,
         signal: args.signal,
       });
