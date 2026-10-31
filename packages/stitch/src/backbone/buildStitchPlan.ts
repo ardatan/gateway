@@ -4111,16 +4111,39 @@ function fetchDependsOn(
     }
   }
 
-  const reqNames = new Set(
-    collectRequiresDeps(stitchingInfo, later)
-      .map((d) => d.name.value)
-      // __typename is ubiquitous and must not create false depends edges
-      // (inventory@topProducts ∥ reviews@topProducts).
-      .filter((n) => n !== '__typename'),
+  // Same-path key bridge: earlier selects a field later needs as an
+  // entity key (Book.id on B before C.author; Product.pid on LINK before PRICE).
+  if (entityKeyDependsOn(stitchingInfo, later, earlier)) {
+    return true;
+  }
+  // Nested key enrichment: ProductList@{topProducts} keys on
+  // `products { id pid }` so LINK@products must complete first.
+  if (nestedEntityKeyDependsOn(stitchingInfo, later, earlier)) {
+    return true;
+  }
+
+  const reqDeps = collectRequiresDeps(stitchingInfo, later).filter(
+    (d) => d.name.value !== '__typename',
   );
-  if (!reqNames.size) {
+  if (!reqDeps.length) {
     return false;
   }
+  const reqNames = new Set(reqDeps.map((d) => d.name.value));
+
+  // Nested requires provider: earlier sits under later's path
+  // (Post@feed needs Author@feed.author for byNovice @requires author { … }).
+  for (const lp of laterPaths) {
+    for (const ep of earlierPaths) {
+      if (!(pathIsPrefix(lp, ep) && ep.length > lp.length)) {
+        continue;
+      }
+      const childKey = String(ep[lp.length]);
+      if (reqDeps.some((d) => (d.alias?.value ?? d.name.value) === childKey)) {
+        return true;
+      }
+    }
+  }
+
   const provided = collectSelectedFieldNames(earlier.selectionSet);
   provided.delete('__typename');
   let providesNeeded = false;
@@ -4149,6 +4172,146 @@ function fetchDependsOn(
         return true;
       }
     }
+  }
+  return false;
+}
+
+/**
+ * True when `earlier` sits under `later`'s path and provides fields that
+ * appear in `later`'s nested entity-key selection (e.g. ProductList.products
+ * keys need `pid` from a Product hop at `…/products`).
+ */
+function nestedEntityKeyDependsOn(
+  stitchingInfo: StitchingInfo,
+  later: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): boolean {
+  if (!later.entityTypeName || !earlier.entityTypeName) {
+    return false;
+  }
+  const merged = stitchingInfo.mergedTypes[later.entityTypeName];
+  const keySel = merged?.selectionSets.get(later.subschema);
+  if (!keySel) {
+    return false;
+  }
+  const laterPaths = fetchFlattenPaths(later);
+  const earlierPaths = fetchFlattenPaths(earlier);
+  const provided = collectSelectedFieldNames(earlier.selectionSet);
+  provided.delete('__typename');
+  if (!provided.size) {
+    return false;
+  }
+  for (const lp of laterPaths) {
+    for (const ep of earlierPaths) {
+      if (!(pathIsPrefix(lp, ep) && ep.length > lp.length)) {
+        continue;
+      }
+      const suffix = ep.slice(lp.length).map(String);
+      let cursor: SelectionSetNode | undefined = keySel;
+      for (let i = 0; i < suffix.length; i++) {
+        if (!cursor) {
+          break;
+        }
+        const seg = suffix[i]!;
+        let next: SelectionSetNode | undefined;
+        for (const sel of cursor.selections) {
+          if (sel.kind !== Kind.FIELD) {
+            continue;
+          }
+          const key = sel.alias?.value ?? sel.name.value;
+          if (key !== seg && sel.name.value !== seg) {
+            continue;
+          }
+          if (i === suffix.length - 1) {
+            // earlier is at this key field — need any nested key leaf it provides.
+            if (!sel.selectionSet) {
+              if (provided.has(sel.name.value)) {
+                return true;
+              }
+              break;
+            }
+            for (const leaf of sel.selectionSet.selections) {
+              if (
+                leaf.kind === Kind.FIELD &&
+                leaf.name.value !== '__typename' &&
+                provided.has(leaf.name.value)
+              ) {
+                return true;
+              }
+            }
+          }
+          next = sel.selectionSet;
+          break;
+        }
+        cursor = next;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * True when `earlier` at the same entity path selects a merge-key field that
+ * `later`'s subschema needs to build `_entities` representations.
+ */
+function entityKeyDependsOn(
+  stitchingInfo: StitchingInfo,
+  later: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  earlier: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): boolean {
+  if (!later.entityTypeName || !earlier.entityTypeName) {
+    return false;
+  }
+  if (later.entityTypeName !== earlier.entityTypeName) {
+    return false;
+  }
+  const laterPaths = fetchFlattenPaths(later);
+  const earlierPaths = fetchFlattenPaths(earlier);
+  let samePath = false;
+  for (const lp of laterPaths) {
+    for (const ep of earlierPaths) {
+      if (pathsEqual(lp, ep)) {
+        samePath = true;
+        break;
+      }
+    }
+    if (samePath) {
+      break;
+    }
+  }
+  if (!samePath) {
+    return false;
+  }
+  const merged = stitchingInfo.mergedTypes[later.entityTypeName];
+  if (!merged) {
+    return false;
+  }
+  // Only this hop's entity key selection — do not widen to every uniqueFields
+  // entry (that falsely edges LINK↔PRICE via `price` and creates cycles).
+  const keyFields = new Set<string>();
+  const keySel = merged.selectionSets.get(later.subschema);
+  if (keySel) {
+    for (const sel of keySel.selections) {
+      if (sel.kind === Kind.FIELD && sel.name.value !== '__typename') {
+        keyFields.add(sel.name.value);
+      }
+    }
+  }
+  if (!keyFields.size) {
+    return false;
+  }
+  const provided = collectSelectedFieldNames(earlier.selectionSet);
+  const laterSelects = collectSelectedFieldNames(later.selectionSet);
+  for (const k of keyFields) {
+    if (!provided.has(k)) {
+      continue;
+    }
+    // Parent object gains `k` from earlier; later's representations need it.
+    // Skip when later already selects `k` (it can carry its own key).
+    if (laterSelects.has(k)) {
+      continue;
+    }
+    return true;
   }
   return false;
 }
@@ -5578,8 +5741,8 @@ function buildCompletePlan(
     operation,
     fragments,
     // Peel independent root heads + BatchFetch same-subschema entity hops
-    // inside Parallel waves. Full Kahn reschedule is incorrect when
-    // fetchDependsOn misses provides/abstract edges — keep tree order.
+    // inside Parallel waves. annotateFetchDeps + executeDataflowPlan run a
+    // barrier-free schedule from fetchDependsOn (path / requires / keys).
     root:
       operation.operation === 'mutation'
         ? packed
@@ -6146,10 +6309,11 @@ function groupParallelBatchFetches(
 }
 
 /**
- * Attach id/dependsOn for barrier-free execute. Combines:
- * 1. fetchDependsOn (path / @requires edges)
- * 2. Sequence order — later siblings depend on every hop completed by earlier
- *    siblings (Hive wave barriers without flattening the tree unsafely).
+ * Attach id/dependsOn for barrier-free execute from `fetchDependsOn` only
+ * (path production + @requires). Sequence tree shape stays for readability;
+ * execute ignores Sequence barriers and fires hops when dependsOn is met.
+ *
+ * Islands still gate their `continue` subgraph (local resolve → entity hops).
  */
 function annotateFetchDeps(
   root: StitchPlanNode,
@@ -6158,7 +6322,8 @@ function annotateFetchDeps(
   const fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
   collectExecutableFetches(root, fetches);
   if (!fetches.length) {
-    return root;
+    // Still annotate Islands when the plan is Island-only.
+    return assignDepsOnly(root, new Map(), stitchingInfo);
   }
   const ids = fetches.map((_, i) => `f${i}`);
   const depIds: string[][] = fetches.map(() => []);
@@ -6173,24 +6338,86 @@ function annotateFetchDeps(
     }
   }
 
+  const fetchDepMap = new Map<number, { id: string; dependsOn: string[] }>();
+  for (let i = 0; i < fetches.length; i++) {
+    fetchDepMap.set(i, { id: ids[i]!, dependsOn: [...new Set(depIds[i]!)] });
+  }
+  return assignDepsOnly(root, fetchDepMap, stitchingInfo);
+}
+
+function assignDepsOnly(
+  root: StitchPlanNode,
+  fetchDepMap: Map<number, { id: string; dependsOn: string[] }>,
+  _stitchingInfo: StitchingInfo,
+): StitchPlanNode {
+  // First pass: materialize Fetch nodes with ids so Islands can depend on
+  // path-producing hops (nested Island under books[] waits for books Fetch).
+  type AnnotatedFetch = Extract<StitchPlanNode, { kind: 'Fetch' }> & {
+    id: string;
+  };
+  const annotatedFetches: AnnotatedFetch[] = [];
   let counter = 0;
+  let islandSeq = 0;
+
+  const pathProducersFor = (
+    paths: PathSegment[][] | undefined,
+  ): string[] => {
+    if (!paths?.length) {
+      return [];
+    }
+    const ids: string[] = [];
+    for (const fetch of annotatedFetches) {
+      const fps = fetchFlattenPaths(fetch);
+      for (const islandPath of paths) {
+        for (const fp of fps) {
+          // Fetch produces the Island parent when its path is a prefix of
+          // (or equal to) the Island flatten path.
+          if (pathIsPrefix(fp, islandPath) || pathsEqual(fp, islandPath)) {
+            ids.push(fetch.id);
+          }
+        }
+        // Root Fetch with response key matching Island path head.
+        if (fetch.rootField) {
+          const rk =
+            fetch.rootField.alias?.value ?? fetch.rootField.name.value;
+          if (islandPath[0] === rk) {
+            ids.push(fetch.id);
+          }
+        }
+      }
+    }
+    return [...new Set(ids)];
+  };
+
   const assign = (
     node: StitchPlanNode,
-    sequenceBarrier: string[],
+    islandBarrier: string[],
   ): StitchPlanNode => {
     if (node.kind === 'Fetch') {
-      const id = ids[counter]!;
-      const dependsOn = [...new Set([...depIds[counter]!, ...sequenceBarrier])];
+      const meta = fetchDepMap.get(counter) ?? {
+        id: `f${counter}`,
+        dependsOn: [] as string[],
+      };
       counter++;
-      return { ...node, id, dependsOn, completesIds: [id] };
+      const annotated = {
+        ...node,
+        id: meta.id,
+        dependsOn: [...new Set([...meta.dependsOn, ...islandBarrier])],
+        completesIds: [meta.id],
+      };
+      annotatedFetches.push(annotated as AnnotatedFetch);
+      return annotated;
     }
     if (node.kind === 'BatchFetch') {
       const completesIds: string[] = [];
-      const dependsOn = new Set<string>(sequenceBarrier);
+      const dependsOn = new Set<string>(islandBarrier);
       for (const _alias of node.aliases) {
-        const id = ids[counter]!;
-        completesIds.push(id);
-        for (const d of depIds[counter]!) {
+        const meta = fetchDepMap.get(counter) ?? {
+          id: `f${counter}`,
+          dependsOn: [] as string[],
+        };
+        completesIds.push(meta.id);
+        for (const d of meta.dependsOn) {
           dependsOn.add(d);
         }
         counter++;
@@ -6206,74 +6433,40 @@ function annotateFetchDeps(
       };
     }
     if (node.kind === 'Island') {
-      return node.continue
-        ? { ...node, continue: assign(node.continue, sequenceBarrier) }
-        : node;
+      const islandId = `is${islandSeq++}`;
+      const islandPaths =
+        node.flattenPaths ??
+        (node.flattenPath != null ? [node.flattenPath] : undefined);
+      const producers = pathProducersFor(islandPaths);
+      return {
+        ...node,
+        id: islandId,
+        dependsOn: [...new Set([...islandBarrier, ...producers])],
+        completesIds: [islandId],
+        continue: node.continue
+          ? assign(node.continue, [...islandBarrier, islandId])
+          : undefined,
+      };
     }
     if (node.kind === 'Condition') {
       return {
         ...node,
         ifClause: node.ifClause
-          ? assign(node.ifClause, sequenceBarrier)
+          ? assign(node.ifClause, islandBarrier)
           : undefined,
         elseClause: node.elseClause
-          ? assign(node.elseClause, sequenceBarrier)
+          ? assign(node.elseClause, islandBarrier)
           : undefined,
       };
     }
-    if (node.kind === 'Parallel') {
+    if (node.kind === 'Parallel' || node.kind === 'Sequence') {
       return {
-        kind: 'Parallel',
-        nodes: node.nodes.map((c) => assign(c, sequenceBarrier)),
+        kind: node.kind,
+        nodes: node.nodes.map((c) => assign(c, islandBarrier)),
       };
-    }
-    if (node.kind === 'Sequence') {
-      const next: StitchPlanNode[] = [];
-      let barrier = sequenceBarrier;
-      for (const child of node.nodes) {
-        const assigned = assign(child, barrier);
-        next.push(assigned);
-        // Later Sequence siblings wait for every hop this child completes.
-        const completed: string[] = [];
-        collectCompletedIds(assigned, completed);
-        if (completed.length) {
-          barrier = [...barrier, ...completed];
-        }
-      }
-      return { kind: 'Sequence', nodes: next };
     }
     return node;
   };
   return assign(root, []);
 }
 
-function collectCompletedIds(node: StitchPlanNode, out: string[]): void {
-  if (node.kind === 'Fetch' || node.kind === 'BatchFetch') {
-    if (node.completesIds?.length) {
-      out.push(...node.completesIds);
-    } else if (node.id) {
-      out.push(node.id);
-    }
-    return;
-  }
-  if (node.kind === 'Island') {
-    if (node.continue) {
-      collectCompletedIds(node.continue, out);
-    }
-    return;
-  }
-  if (node.kind === 'Condition') {
-    if (node.ifClause) {
-      collectCompletedIds(node.ifClause, out);
-    }
-    if (node.elseClause) {
-      collectCompletedIds(node.elseClause, out);
-    }
-    return;
-  }
-  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
-    for (const child of node.nodes) {
-      collectCompletedIds(child, out);
-    }
-  }
-}

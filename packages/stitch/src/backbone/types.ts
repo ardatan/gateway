@@ -75,6 +75,10 @@ export type StitchPlanNode =
     }
   | {
       kind: 'Island';
+      /** Stable id for barrier-free dataflow execute. */
+      id?: string;
+      completesIds?: string[];
+      dependsOn?: string[];
       parentTypeName: string;
       fieldNode: FieldNode;
       /**
