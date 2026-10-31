@@ -331,9 +331,7 @@ function buildEntitiesDocument(
   };
 }
 
-function buildBatchEntitiesDocument(
-  aliases: StitchBatchAlias[],
-): DocumentNode {
+function buildBatchEntitiesDocument(aliases: StitchBatchAlias[]): DocumentNode {
   const variableDefinitions = aliases.map((a, i) => {
     const varName = a.representationsVariable ?? `__batch_reps_${i}`;
     return {

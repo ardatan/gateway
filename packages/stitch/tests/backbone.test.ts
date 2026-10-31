@@ -1,13 +1,10 @@
 import { createDefaultExecutor } from '@graphql-tools/delegate';
+import type { StitchingInfo } from '@graphql-tools/delegate';
 import { makeExecutableSchema } from '@graphql-tools/schema';
 import type { ExecutionResult } from '@graphql-tools/utils';
 import { parse } from 'graphql';
 import { describe, expect, it } from 'vitest';
-import type { StitchingInfo } from '@graphql-tools/delegate';
-import {
-  buildStitchPlan,
-  createBackboneExecutor,
-} from '../src/backbone/index';
+import { buildStitchPlan, createBackboneExecutor } from '../src/backbone/index';
 import { stitchSchemas } from '../src/stitchSchemas';
 
 async function exec(
@@ -169,14 +166,24 @@ describe('stitching backbone', () => {
       }
     `);
     const operation = document.definitions[0] as any;
-    const planSkip = buildStitchPlan(schema, operation, {}, {
-      id: '1',
-      skipEmail: true,
-    });
-    const planInclude = buildStitchPlan(schema, operation, {}, {
-      id: '1',
-      skipEmail: false,
-    });
+    const planSkip = buildStitchPlan(
+      schema,
+      operation,
+      {},
+      {
+        id: '1',
+        skipEmail: true,
+      },
+    );
+    const planInclude = buildStitchPlan(
+      schema,
+      operation,
+      {},
+      {
+        id: '1',
+        skipEmail: false,
+      },
+    );
     expect(planSkip.incompleteReasons).toEqual([]);
     expect(planSkip.root.kind).toBe('Condition');
     expect((planSkip.root as any).condition).toBe('skipEmail');
@@ -388,7 +395,8 @@ describe('stitching backbone', () => {
       if (n.continue) return hasNestedAuthorIsland(n.continue);
       if (n.ifClause || n.elseClause) {
         return (
-          hasNestedAuthorIsland(n.ifClause) || hasNestedAuthorIsland(n.elseClause)
+          hasNestedAuthorIsland(n.ifClause) ||
+          hasNestedAuthorIsland(n.elseClause)
         );
       }
       return false;

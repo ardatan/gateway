@@ -167,4 +167,3 @@ export function usingHiveRouterRuntime(): boolean {
     process.env.HIVE_ROUTER_RUNTIME === 'enabled'
   );
 }
-
