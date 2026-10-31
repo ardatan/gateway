@@ -137,26 +137,95 @@ function rootTypeOf(
       : schema.getQueryType();
 }
 
+/**
+ * Every Subschema clone known to stitching — `subschemaMap` only holds the
+ * first isolation clone (computed), while base clones live on mergedTypes.
+ */
+function allKnownSubschemas(stitchingInfo: StitchingInfo): Subschema[] {
+  const seen = new Set<Subschema>();
+  const out: Subschema[] = [];
+  const add = (s: Subschema | undefined | null) => {
+    if (s != null && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  };
+  for (const s of stitchingInfo.subschemaMap.values()) {
+    add(s);
+  }
+  for (const typeName in stitchingInfo.mergedTypes) {
+    const merged = stitchingInfo.mergedTypes[typeName];
+    if (!merged) {
+      continue;
+    }
+    for (const s of merged.selectionSets.keys()) {
+      add(s);
+    }
+    for (const s of merged.resolvers.keys()) {
+      add(s);
+    }
+    for (const targets of merged.targetSubschemas.values()) {
+      for (const s of targets) {
+        add(s);
+      }
+    }
+    for (const fieldName in merged.uniqueFields) {
+      add(merged.uniqueFields[fieldName]);
+    }
+    for (const fieldName in merged.nonUniqueFields) {
+      for (const s of merged.nonUniqueFields[fieldName] ?? []) {
+        add(s);
+      }
+    }
+  }
+  return out;
+}
+
 function findOwningSubschemasForRootField(
   stitchingInfo: StitchingInfo,
   operation: OperationDefinitionNode['operation'],
   fieldName: string,
 ): Subschema[] {
-  const owners: Subschema[] = [];
-  for (const subschema of stitchingInfo.subschemaMap.values()) {
-    // Prefer transformedSchema, but fall back to the raw subgraph schema —
-    // stitching transforms sometimes drop Query fields on @interfaceObject
-    // graphs (e.g. anotherUsers) while the HTTP executor still serves them.
+  const transformedOwners: Subschema[] = [];
+  const rawOnlyOwners: Subschema[] = [];
+  const consider = (subschema: Subschema) => {
     const transformedRoot = rootTypeOf(subschema.transformedSchema, operation);
+    if (transformedRoot?.getFields()[fieldName] != null) {
+      transformedOwners.push(subschema);
+      return;
+    }
+    // Isolation clones keep the field on the raw schema while stripping it
+    // from transformedSchema. Prefer transformed owners when any exist so we
+    // do not root-Fetch through a computed-only clone (empty op after
+    // delegateToSchema). Fall back to raw for rare cases where transforms
+    // drop a still-executable root field (e.g. @interfaceObject).
     const rawRoot = rootTypeOf(subschema.schema, operation);
-    if (
-      transformedRoot?.getFields()[fieldName] != null ||
-      rawRoot?.getFields()[fieldName] != null
-    ) {
-      owners.push(subschema);
+    if (rawRoot?.getFields()[fieldName] != null) {
+      rawOnlyOwners.push(subschema);
+    }
+  };
+  for (const subschema of stitchingInfo.subschemaMap.values()) {
+    consider(subschema);
+  }
+  if (transformedOwners.length) {
+    return transformedOwners;
+  }
+  // `subschemaMap` only stores the first isolation clone (computed). When that
+  // clone has no transformed root field, scan mergedTypes for the base clone.
+  const seen = new Set(stitchingInfo.subschemaMap.values());
+  for (const subschema of allKnownSubschemas(stitchingInfo)) {
+    if (seen.has(subschema)) {
+      continue;
+    }
+    const transformedRoot = rootTypeOf(subschema.transformedSchema, operation);
+    if (transformedRoot?.getFields()[fieldName] != null) {
+      transformedOwners.push(subschema);
     }
   }
-  return owners;
+  if (transformedOwners.length) {
+    return transformedOwners;
+  }
+  return rawOnlyOwners;
 }
 
 function fieldAvailableOnSubschema(
@@ -171,15 +240,60 @@ function fieldAvailableOnSubschema(
   if (providedFieldNames?.has(fieldName)) {
     return true;
   }
-  for (const schema of [subschema.transformedSchema, subschema.schema]) {
-    const type = schema.getType(typeName);
-    if (type && 'getFields' in type) {
-      if ((type as GraphQLObjectType).getFields()[fieldName] != null) {
-        return true;
-      }
-    }
+  // Prefer transformedSchema. Only fall back to raw when the *type* is absent
+  // there (not when the field is stripped by isolation clones).
+  const transformed = subschema.transformedSchema.getType(typeName);
+  if (transformed && 'getFields' in transformed) {
+    return (
+      (transformed as GraphQLObjectType).getFields()[fieldName] != null
+    );
+  }
+  const raw = subschema.schema.getType(typeName);
+  if (raw && 'getFields' in raw) {
+    return (raw as GraphQLObjectType).getFields()[fieldName] != null;
   }
   return false;
+}
+
+/** Merge two field nodes that share a response key (union nested selections). */
+function mergeFieldNodes(existing: FieldNode, incoming: FieldNode): FieldNode {
+  if (!incoming.selectionSet) {
+    return existing.selectionSet ? existing : incoming;
+  }
+  if (!existing.selectionSet) {
+    return incoming;
+  }
+  const seen = new Set<string>();
+  const merged: SelectionNode[] = [];
+  const push = (sel: SelectionNode) => {
+    if (sel.kind === Kind.FIELD) {
+      const key = sel.alias?.value ?? sel.name.value;
+      const idx = merged.findIndex(
+        (m) =>
+          m.kind === Kind.FIELD &&
+          (m.alias?.value ?? m.name.value) === key,
+      );
+      if (idx >= 0) {
+        merged[idx] = mergeFieldNodes(merged[idx] as FieldNode, sel);
+        return;
+      }
+      seen.add(key);
+    }
+    merged.push(sel);
+  };
+  for (const sel of existing.selectionSet.selections) {
+    push(sel);
+  }
+  for (const sel of incoming.selectionSet.selections) {
+    push(sel);
+  }
+  return {
+    ...existing,
+    selectionSet: selectionSetOf(merged),
+    directives: existing.directives?.length
+      ? existing.directives
+      : incoming.directives,
+  };
 }
 
 /**
@@ -760,14 +874,19 @@ function partitionSelectionsForSubschema(
     return true;
   };
 
-  const availableNames = new Set<string>();
+  const availableNames = new Map<string, number>();
   const pushAvailable = (sel: SelectionNode) => {
     if (sel.kind === Kind.FIELD) {
       const key = sel.alias?.value ?? sel.name.value;
-      if (availableNames.has(key)) {
+      const idx = availableNames.get(key);
+      if (idx != null) {
+        const prev = available[idx];
+        if (prev?.kind === Kind.FIELD) {
+          available[idx] = mergeFieldNodes(prev, sel);
+        }
         return;
       }
-      availableNames.add(key);
+      availableNames.set(key, available.length);
     }
     available.push(sel);
   };
@@ -779,17 +898,66 @@ function partitionSelectionsForSubschema(
           unavailable.push(selection);
           // Gateway-local / foreign field: still pull key deps that *are*
           // fetchable here (Book.author → authorId) so nested Islands can run.
+          // Require the dep on the *raw* subgraph schema so cross-key links
+          // that only exist on the gateway view (Product.pid on PRODUCTS)
+          // are not injected into outbound queries.
           const deps =
             stitchingInfo?.fieldNodesByField?.[typeName]?.[
               selection.name.value
             ];
           if (deps?.length) {
+            const rawParent = subschema.schema.getType(typeName);
+            const rawFields =
+              rawParent && 'getFields' in rawParent
+                ? (rawParent as GraphQLObjectType).getFields()
+                : undefined;
             for (const dep of deps) {
               if (
-                dep.name.value !== '__typename' &&
-                fetchable(dep.name.value)
+                dep.name.value === '__typename' ||
+                !fetchable(dep.name.value) ||
+                rawFields?.[dep.name.value] == null
               ) {
+                continue;
+              }
+              // Dep FieldNodes can carry nested selections from other
+              // subgraphs (ProductList.first → products{id,pid}). Only keep
+              // nested fields this subschema can actually query.
+              if (!dep.selectionSet) {
                 pushAvailable(dep);
+                continue;
+              }
+              const depField = rawFields[dep.name.value];
+              if (!depField) {
+                continue;
+              }
+              const depReturn = getNamedType(depField.type);
+              if (
+                !depReturn ||
+                (!isObjectType(depReturn) && !isAbstractType(depReturn))
+              ) {
+                pushAvailable({ ...dep, selectionSet: undefined });
+                continue;
+              }
+              const nestedDep = partitionSelectionsForSubschema(
+                subschema,
+                depReturn.name,
+                dep.selectionSet,
+                fragments,
+                providedFieldNames,
+                stitchingInfo,
+                gatewaySchema,
+                {
+                  parentTypeName: typeName,
+                  parentFieldName: dep.name.value,
+                },
+              );
+              if (nestedDep.available.length) {
+                pushAvailable({
+                  ...dep,
+                  selectionSet: ensureTypename(
+                    selectionSetOf(nestedDep.available),
+                  ),
+                });
               }
             }
           }
@@ -1393,27 +1561,40 @@ function injectSelectionsIntoRootFetches(
     if (!toInject.length) {
       return node;
     }
-    const existing = node.rootField.selectionSet?.selections ?? [];
-    const present = new Set(
-      existing
-        .filter((s): s is FieldNode => s.kind === Kind.FIELD)
-        .map((s) => s.alias?.value ?? s.name.value),
-    );
-    const uniqueExtras = toInject.filter((s) => {
-      if (s.kind !== Kind.FIELD) {
-        return true;
+    const existing = [...(node.rootField.selectionSet?.selections ?? [])];
+    const indexByKey = new Map<string, number>();
+    for (let i = 0; i < existing.length; i++) {
+      const s = existing[i]!;
+      if (s.kind === Kind.FIELD) {
+        indexByKey.set(s.alias?.value ?? s.name.value, i);
       }
-      const key = s.alias?.value ?? s.name.value;
-      if (present.has(key)) {
-        return false;
+    }
+    let changed = false;
+    for (const extraSel of toInject) {
+      if (extraSel.kind !== Kind.FIELD) {
+        existing.push(extraSel);
+        changed = true;
+        continue;
       }
-      present.add(key);
-      return true;
-    });
-    if (!uniqueExtras.length) {
+      const key = extraSel.alias?.value ?? extraSel.name.value;
+      const idx = indexByKey.get(key);
+      if (idx != null) {
+        const prev = existing[idx] as FieldNode;
+        const merged = mergeFieldNodes(prev, extraSel);
+        if (merged !== prev) {
+          existing[idx] = merged;
+          changed = true;
+        }
+      } else {
+        indexByKey.set(key, existing.length);
+        existing.push(extraSel);
+        changed = true;
+      }
+    }
+    if (!changed) {
       return node;
     }
-    const selectionSet = selectionSetOf([...existing, ...uniqueExtras]);
+    const selectionSet = selectionSetOf(existing);
     return {
       ...node,
       selectionSet,
@@ -2209,22 +2390,32 @@ function planRootField(
 
   // Preserve inline-fragment @skip/@include wrappers for subgraph evaluation.
   // Flattening into field nodes would drop those directives (provides-scope).
+  // Merge deps into same-name fields so shallow client selections (data {
+  // __typename }) absorb deeper @requires bridges (data { foo ... on Bar }).
   const selectionSetForPartition: SelectionSetNode | undefined =
     fieldNode.selectionSet && returnTypeName
       ? (() => {
-          const original = [...fieldNode.selectionSet.selections];
-          const present = new Set(
-            flattenToFieldNodes(original, fragments).map(fieldNodeKey),
-          );
-          const extras: FieldNode[] = [];
-          for (const dep of withDeps) {
-            const key = fieldNodeKey(dep);
-            if (!present.has(key)) {
-              present.add(key);
-              extras.push(dep);
+          const merged: SelectionNode[] = [
+            ...fieldNode.selectionSet.selections,
+          ];
+          const indexByKey = new Map<string, number>();
+          for (let i = 0; i < merged.length; i++) {
+            const s = merged[i]!;
+            if (s.kind === Kind.FIELD) {
+              indexByKey.set(s.alias?.value ?? s.name.value, i);
             }
           }
-          return selectionSetOf([...original, ...extras]);
+          for (const dep of withDeps) {
+            const key = dep.alias?.value ?? dep.name.value;
+            const idx = indexByKey.get(key);
+            if (idx != null && merged[idx]?.kind === Kind.FIELD) {
+              merged[idx] = mergeFieldNodes(merged[idx] as FieldNode, dep);
+            } else if (idx == null) {
+              indexByKey.set(key, merged.length);
+              merged.push(dep);
+            }
+          }
+          return selectionSetOf(merged);
         })()
       : undefined;
 
@@ -3980,14 +4171,48 @@ function tryAbsorbFetches(
   if (entityTypeKey(earlier) !== entityTypeKey(later)) {
     return null;
   }
+  const aPaths = fetchFlattenPaths(earlier);
+  const bPaths = fetchFlattenPaths(later);
+  // Identical selections on (possibly different) paths → one multi-path Fetch
+  // (topProducts inventory ∥ reviews→product inventory). Avoids duplicate
+  // upstream `_entities` calls that inflate OTEL subgraph.execute counts.
   if (
     selectionSetKey(earlier.selectionSet) ===
     selectionSetKey(later.selectionSet)
   ) {
+    const pathKeys = new Set(aPaths.map((p) => p.join('\0')));
+    const mergedPaths = [...aPaths];
+    for (const p of bPaths) {
+      const key = p.join('\0');
+      if (!pathKeys.has(key)) {
+        pathKeys.add(key);
+        mergedPaths.push(p);
+      }
+    }
+    const united: Extract<StitchPlanNode, { kind: 'Fetch' }> = {
+      ...earlier,
+      flattenPath: mergedPaths[0],
+      flattenPaths: mergedPaths,
+    };
+    const laterNeedsMid = intervening.some((mid) =>
+      fetchDependsOn(stitchingInfo, later, mid),
+    );
+    const midNeedsEarlier = intervening.some((mid) =>
+      fetchDependsOn(stitchingInfo, mid, earlier),
+    );
+    // Prefer dropping the hop that is safe to absorb without breaking
+    // provider→requires ordering around intervening fetches.
+    if (laterNeedsMid && !midNeedsEarlier) {
+      return {
+        earlier: null,
+        later: { ...united, subschema: later.subschema },
+      };
+    }
+    if (!laterNeedsMid) {
+      return { earlier: united, later: null };
+    }
     return null;
   }
-  const aPaths = fetchFlattenPaths(earlier);
-  const bPaths = fetchFlattenPaths(later);
   const bKeys = new Set(bPaths.map((p) => p.join('\0')));
   const common = aPaths.filter((p) => bKeys.has(p.join('\0')));
   if (!common.length) {
@@ -5808,12 +6033,15 @@ function groupParallelBatchFetches(
     return { kind: 'Parallel', nodes: children };
   }
 
-  const bySub = new Map<Subschema, typeof entityFetches>();
+  // Group by subgraph name so isolation clones (inStock vs shippingEstimate)
+  // of the same upstream collapse together.
+  const bySub = new Map<string, typeof entityFetches>();
   for (const f of entityFetches) {
-    let list = bySub.get(f.subschema);
+    const key = f.subschema.name ?? String(entityTypeKey(f));
+    let list = bySub.get(key);
     if (!list) {
       list = [];
-      bySub.set(f.subschema, list);
+      bySub.set(key, list);
     }
     list.push(f);
   }
@@ -5832,7 +6060,7 @@ function groupParallelBatchFetches(
       next.push(child);
       continue;
     }
-    const group = bySub.get(child.subschema);
+    const group = bySub.get(child.subschema.name ?? String(entityTypeKey(child)));
     if (!group || group.length < 2) {
       next.push(child);
       continue;
@@ -5845,8 +6073,27 @@ function groupParallelBatchFetches(
       ),
     );
     if (typeKeys.size < 2) {
-      // Same type+selection left as separate Fetches (or already multi-path).
-      next.push(child);
+      // Same type+selection: collapse to one multi-path Fetch (duplicate
+      // inventory hops from topProducts vs nested reviews→product).
+      if (group.length >= 2 && group[0] === child) {
+        const pathKeys = new Set<string>();
+        const mergedPaths: PathSegment[][] = [];
+        for (const g of group) {
+          for (const p of fetchFlattenPaths(g)) {
+            const key = p.join('\0');
+            if (!pathKeys.has(key)) {
+              pathKeys.add(key);
+              mergedPaths.push(p);
+            }
+          }
+          consumed.add(g);
+        }
+        next.push({
+          ...child,
+          flattenPath: mergedPaths[0],
+          flattenPaths: mergedPaths,
+        });
+      }
       continue;
     }
     // Only BatchFetch when every alias lives under a distinct root field

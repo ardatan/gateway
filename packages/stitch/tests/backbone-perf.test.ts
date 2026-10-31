@@ -1,5 +1,6 @@
 import { createDefaultExecutor } from '@graphql-tools/delegate';
 import { makeExecutableSchema } from '@graphql-tools/schema';
+import type { ExecutionResult } from '@graphql-tools/utils';
 import { parse } from 'graphql';
 import { describe, expect, it } from 'vitest';
 import { createBackboneExecutor } from '../src/backbone/index';
@@ -120,8 +121,8 @@ describe('backbone performance smoke', () => {
     );
 
     // Sanity: both return the same shape
-    const a = await schemaExec(request);
-    const b = await planned(request);
+    const a = (await schemaExec(request)) as ExecutionResult;
+    const b = (await planned(request)) as ExecutionResult;
     expect(b.data).toEqual(a.data);
 
     // Planned path should not be dramatically slower than schema on this

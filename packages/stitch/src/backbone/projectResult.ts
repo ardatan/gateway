@@ -63,7 +63,7 @@ function projectValue(
   schema: GraphQLSchema,
   fragments: Record<string, FragmentDefinitionNode>,
   variableValues: Record<string, any>,
-  runtimeType: ReturnType<typeof getNamedType> | undefined,
+  runtimeType: import('graphql').GraphQLNamedType | undefined,
   fieldNodes: FieldNode[],
   value: any,
 ): any {
@@ -206,7 +206,7 @@ function projectInterfaceObjectValue(
   const applyField = (fieldNode: FieldNode) => {
     const responseKey = fieldNode.alias?.value ?? fieldNode.name.value;
     if (fieldNode.name.value === '__typename') {
-      projected[responseKey] = value.__typename ?? abstractType.name;
+      projected[responseKey] = value['__typename'] ?? abstractType.name;
       return;
     }
     if (!(responseKey in value) && !(fieldNode.name.value in value)) {
@@ -219,7 +219,11 @@ function projectInterfaceObjectValue(
       schema,
       fragments,
       variableValues,
-      field ? getNamedType(field.type) : undefined,
+      field
+        ? (getNamedType(field.type as any) as
+            | import('graphql').GraphQLNamedType
+            | undefined)
+        : undefined,
       [fieldNode],
       raw,
     );
@@ -236,13 +240,13 @@ function projectInterfaceObjectValue(
             applyField(nested);
           }
         }
-      } else if (value.__typename === cond) {
+      } else if (value['__typename'] === cond) {
         for (const nested of sel.selectionSet.selections) {
           if (nested.kind === Kind.FIELD) {
             applyField(nested);
           }
         }
-      } else if (!value.__typename && cond) {
+      } else if (!value['__typename'] && cond) {
         // Subgraph omitted __typename; still project concrete-fragment fields
         // that are present on the value (union intersection / provides cases).
         const concrete = schema.getType(cond);
@@ -269,13 +273,13 @@ function projectInterfaceObjectValue(
         continue;
       }
       const cond = fragment.typeCondition.name.value;
-      if (cond === abstractType.name || value.__typename === cond) {
+      if (cond === abstractType.name || value['__typename'] === cond) {
         for (const nested of fragment.selectionSet.selections) {
           if (nested.kind === Kind.FIELD) {
             applyField(nested);
           }
         }
-      } else if (!value.__typename) {
+      } else if (!value['__typename']) {
         const concrete = schema.getType(cond);
         if (
           isObjectType(concrete) &&

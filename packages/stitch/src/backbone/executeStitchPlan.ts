@@ -77,9 +77,13 @@ function awaitMaybePromises(
     return;
   }
   if (promises.length === 1) {
-    return promises[0] as PromiseLike<void>;
+    return Promise.resolve(promises[0]!).then(() => {
+      /* drain */
+    });
   }
-  return Promise.all(promises) as PromiseLike<void>;
+  return Promise.all(promises).then(() => {
+    /* drain */
+  });
 }
 
 /**
@@ -110,6 +114,36 @@ function allMaybePromises<T>(
     }
     return results;
   });
+}
+
+function isIsolationStripTransform(t: { constructor?: { name?: string } }) {
+  const name = t?.constructor?.name;
+  return name === 'TransformCompositeFields' || name === 'FilterTypes';
+}
+
+/**
+ * Drop isolation-only transforms that would empty a root/entity selection
+ * under delegateToSchema, while keeping rename/encapsulate transforms.
+ */
+function subschemaWithoutIsolationStripTransforms(
+  subschema: Subschema,
+): Subschema {
+  const transforms = subschema.transforms;
+  if (!transforms?.length) {
+    return subschema;
+  }
+  const kept = transforms.filter((t) => !isIsolationStripTransform(t as any));
+  if (kept.length === transforms.length) {
+    return subschema;
+  }
+  return Object.assign(
+    Object.create(Object.getPrototypeOf(subschema)),
+    subschema,
+    {
+      transforms: kept,
+      _transformedSchema: undefined,
+    },
+  ) as Subschema;
 }
 
 /**
@@ -153,20 +187,15 @@ function subschemaForBackboneEntityHop(
   if (!needsUnstripped) {
     return subschema;
   }
-  const kept = transforms.filter(
-    (t) => (t as any)?.constructor?.name !== 'TransformCompositeFields',
+  return subschemaWithoutIsolationStripTransforms(subschema);
+}
+
+/** True when subschema has transforms other than isolation strippers (rename…). */
+function hasNonIsolationTransforms(subschema: Subschema): boolean {
+  return (
+    subschema.transforms?.some((t) => !isIsolationStripTransform(t as any)) ===
+    true
   );
-  if (kept.length === transforms.length) {
-    return subschema;
-  }
-  return Object.assign(
-    Object.create(Object.getPrototypeOf(subschema)),
-    subschema,
-    {
-      transforms: kept,
-      _transformedSchema: undefined,
-    },
-  ) as Subschema;
 }
 
 /** Stamp subschema symbols without Object.defineProperties. */
@@ -298,9 +327,10 @@ function finalizeRootResult(
       continue;
     }
     const responseKey = sel.alias?.value ?? fieldName;
-    const hasFieldError = ctx.errors.some(
-      (e) => !e.path?.length || e.path[0] === responseKey,
-    );
+    const hasFieldError = ctx.errors.some((e) => {
+      const path = (e as GraphQLError).path;
+      return !path?.length || path[0] === responseKey;
+    });
     const missing = !(responseKey in data) || data[responseKey] === undefined;
     if (missing && hasFieldError) {
       if (!isNullableType(field.type)) {
@@ -493,38 +523,6 @@ function mergeRootValues(existing: any, incoming: any): any {
 }
 
 /** Drop @skip/@include — already evaluated at plan time. */
-function stripSkipInclude(selection: SelectionNode): SelectionNode {
-  if (selection.kind === Kind.FIELD) {
-    const directives = selection.directives?.filter(
-      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
-    );
-    const selectionSet = selection.selectionSet
-      ? {
-          ...selection.selectionSet,
-          selections: selection.selectionSet.selections.map(stripSkipInclude),
-        }
-      : undefined;
-    return {
-      ...selection,
-      directives: directives?.length ? directives : undefined,
-      selectionSet,
-    };
-  }
-  if (selection.kind === Kind.INLINE_FRAGMENT) {
-    const directives = selection.directives?.filter(
-      (d) => d.name.value !== 'skip' && d.name.value !== 'include',
-    );
-    return {
-      ...selection,
-      directives: directives?.length ? directives : undefined,
-      selectionSet: {
-        ...selection.selectionSet,
-        selections: selection.selectionSet.selections.map(stripSkipInclude),
-      },
-    };
-  }
-  return selection;
-}
 
 function collectUsedVariableNames(node: SelectionNode): Set<string> {
   const used = new Set<string>();
@@ -779,7 +777,12 @@ function executeFetchNode(
 
     // Rename / encapsulate transforms need Transformer — prebuilt documents
     // use gateway field names and would miss subgraph renames (authorWithBooks).
-    if (node.subschema.transforms?.length) {
+    // Isolation-only TransformCompositeFields/FilterTypes must NOT force
+    // delegateToSchema: they strip root fields and yield empty operations.
+    if (hasNonIsolationTransforms(node.subschema)) {
+      const hopSubschema = subschemaWithoutIsolationStripTransforms(
+        node.subschema,
+      );
       const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
       const fieldDef = rootType.getFields()[rootFieldNode.name.value];
       const args = fieldDef
@@ -801,7 +804,7 @@ function executeFetchNode(
       return handleMaybePromise(
         () =>
           delegateToSchema({
-            schema: node.subschema,
+            schema: hopSubschema,
             operation: ctx.operation.operation,
             fieldName: rootFieldNode.name.value,
             args,
@@ -1174,7 +1177,7 @@ function tryExecuteEntitiesBatch(
           variables: args,
           context: ctx.contextValue,
           rootValue: ctx.rootValue,
-          operationType: 'query' as OperationTypeNode,
+          operationType: OperationTypeNode.QUERY,
           signal: ctx.signal,
           subgraphName: hopSubschema.name,
         } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
@@ -1191,7 +1194,7 @@ function tryExecuteEntitiesBatch(
     () =>
       delegateToSchema({
         schema: hopSubschema,
-        operation: 'query',
+        operation: OperationTypeNode.QUERY,
         fieldName: '_entities',
         returnType: new GraphQLList(type),
         args: entry.argsFromKeys!(keys),
@@ -1492,7 +1495,8 @@ function hopCompletesIds(hop: ExecutableHop): string[] {
  * Barrier-free dataflow: fire every Fetch/BatchFetch as soon as its
  * `dependsOn` ids are complete — Sequence wave barriers are ignored.
  */
-function executeDataflowPlan(
+/** Reserved: barrier-free execute once fetchDependsOn covers provides/abstract. */
+export function executeDataflowPlan(
   root: StitchPlanNode,
   ctx: BackboneExecutionContext,
 ): MaybePromise<void> {
@@ -1759,7 +1763,7 @@ function executeBatchFetchNode(
             variables,
             context: ctx.contextValue,
             rootValue: ctx.rootValue,
-            operationType: 'query' as OperationTypeNode,
+            operationType: OperationTypeNode.QUERY,
             signal: ctx.signal,
             subgraphName: node.subschema.name,
           } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,

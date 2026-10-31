@@ -18,8 +18,13 @@ function countFetches(node: StitchPlanNode): {
     } else if (n.kind === 'Island') {
       acc.island++;
       if (n.continue) walk(n.continue);
-    } else {
+    } else if (n.kind === 'Sequence' || n.kind === 'Parallel') {
       for (const c of n.nodes) walk(c);
+    } else if (n.kind === 'Condition') {
+      if (n.ifClause) walk(n.ifClause);
+      if (n.elseClause) walk(n.elseClause);
+    } else if (n.kind === 'BatchFetch') {
+      acc.entity += n.aliases.length;
     }
   };
   walk(node);
@@ -36,8 +41,11 @@ function listFetches(node: StitchPlanNode): string[] {
     } else if (n.kind === 'Island') {
       out.push(`island:${n.fieldNode.name.value}`);
       if (n.continue) walk(n.continue);
-    } else {
+    } else if (n.kind === 'Sequence' || n.kind === 'Parallel') {
       for (const c of n.nodes) walk(c);
+    } else if (n.kind === 'Condition') {
+      if (n.ifClause) walk(n.ifClause);
+      if (n.elseClause) walk(n.elseClause);
     }
   };
   walk(node);
