@@ -25,6 +25,10 @@ const TYPENAME_FIELD: FieldNode = {
  * Hive QP strips selections to what the target subgraph can resolve — at plan
  * time. Recurse into nested selections; inject `__typename` for later entity
  * matching. Fragment spreads become inline fragments when the type exists.
+ *
+ * When a field is absent from the subgraph but `fieldNodesByField` lists key
+ * deps that *are* present (e.g. Book.author @resolveTo → authorId), those deps
+ * are injected so nested Islands can read their keys.
  */
 export function filterSelectionSetForSubschema(
   selectionSet: SelectionSetNode,
@@ -37,6 +41,7 @@ export function filterSelectionSetForSubschema(
       selectionSet: SelectionSetNode;
     }
   >,
+  fieldNodesByField?: Record<string, Record<string, FieldNode[]>>,
 ): SelectionSetNode {
   const type = schema.getType(typeName);
   if (!type || !('getFields' in type)) {
@@ -47,30 +52,53 @@ export function filterSelectionSetForSubschema(
   ).getFields();
   const next: SelectionNode[] = [];
   let hasTypename = false;
+  const seen = new Set<string>();
+  const pushField = (sel: FieldNode) => {
+    const key = sel.alias?.value ?? sel.name.value;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    next.push(sel);
+  };
   for (const sel of selectionSet.selections) {
     if (sel.kind === Kind.FIELD) {
       const name = sel.name.value;
       if (name === '__typename') {
         hasTypename = true;
-        next.push(sel);
+        pushField(sel);
         continue;
       }
       const field = fields[name];
       if (!field) {
+        // Gateway-local field stripped here — still pull its key deps
+        // (authorId for Book.author) so nested Islands can resolve.
+        const deps = fieldNodesByField?.[typeName]?.[name];
+        if (deps?.length) {
+          for (const dep of deps) {
+            if (dep.name.value === '__typename') {
+              continue;
+            }
+            if (fields[dep.name.value]) {
+              pushField(dep);
+            }
+          }
+        }
         continue;
       }
       if (!sel.selectionSet) {
-        next.push(sel);
+        pushField(sel);
         continue;
       }
       const childType = getNamedType(field.type);
-      next.push({
+      pushField({
         ...sel,
         selectionSet: filterSelectionSetForSubschema(
           sel.selectionSet,
           childType.name,
           schema,
           fragments,
+          fieldNodesByField,
         ),
       });
       continue;
@@ -93,6 +121,7 @@ export function filterSelectionSetForSubschema(
         on,
         schema,
         fragments,
+        fieldNodesByField,
       );
       if (filtered.selections.length) {
         next.push({ ...sel, selectionSet: filtered });
@@ -113,6 +142,7 @@ export function filterSelectionSetForSubschema(
         on,
         schema,
         fragments,
+        fieldNodesByField,
       );
       if (filtered.selections.length) {
         next.push({
@@ -441,6 +471,8 @@ function buildRootFetchDocument(
 export interface PreparePlanDocumentsOptions {
   operation: OperationDefinitionNode;
   fragments: Record<string, any>;
+  /** Used to inject key deps for gateway-local fields stripped from subgraph docs. */
+  fieldNodesByField?: Record<string, Record<string, FieldNode[]>>;
 }
 
 /**
@@ -451,7 +483,7 @@ export function preparePlanDocuments(
   root: StitchPlanNode,
   options: PreparePlanDocumentsOptions,
 ): StitchPlanNode {
-  const { operation, fragments } = options;
+  const { operation, fragments, fieldNodesByField } = options;
   if (root.kind === 'Sequence' || root.kind === 'Parallel') {
     return {
       kind: root.kind,
@@ -497,6 +529,7 @@ export function preparePlanDocuments(
       root.entityTypeName,
       schema,
       fragments,
+      fieldNodesByField,
     );
     return {
       ...root,
@@ -517,6 +550,7 @@ export function preparePlanDocuments(
           a.entityTypeName,
           schema,
           fragments,
+          fieldNodesByField,
         ),
       })),
     );

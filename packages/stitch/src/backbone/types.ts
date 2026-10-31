@@ -77,6 +77,16 @@ export type StitchPlanNode =
       kind: 'Island';
       parentTypeName: string;
       fieldNode: FieldNode;
+      /**
+       * Nested Island: resolve the local field on every object at this path
+       * (e.g. `Book.author` under `books`). Omit for root Islands.
+       */
+      flattenPath?: PathSegment[];
+      /**
+       * Same-selection Island applied at multiple flatten paths (list fan-out
+       * siblings). When set, overrides `flattenPath`.
+       */
+      flattenPaths?: PathSegment[][];
       /** Federated follow-up after the local resolver returns a merge key. */
       continue?: StitchPlanNode;
     }

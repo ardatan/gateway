@@ -270,4 +270,131 @@ describe('stitching backbone', () => {
     expect(result.errors).toBeUndefined();
     expect(result.data).toEqual({ __typename: 'Query' });
   });
+
+  it('plans nested additionalResolvers as Island under a Fetch path', async () => {
+    const books = makeExecutableSchema({
+      typeDefs: /* GraphQL */ `
+        type Book {
+          id: ID!
+          title: String
+          authorId: ID!
+        }
+        type Query {
+          books: [Book]
+        }
+      `,
+      resolvers: {
+        Query: {
+          books: () => [
+            { id: 'b1', title: 'Dune', authorId: 'a1' },
+            { id: 'b2', title: 'Neuromancer', authorId: 'a2' },
+          ],
+        },
+      },
+    });
+    const authors = makeExecutableSchema({
+      typeDefs: /* GraphQL */ `
+        type Author {
+          id: ID!
+          name: String
+        }
+        type Query {
+          authors(ids: [ID!]!): [Author]!
+        }
+      `,
+      resolvers: {
+        Query: {
+          authors: (_: unknown, { ids }: { ids: string[] }) =>
+            ids.map((id) => ({ id, name: `Author ${id}` })),
+        },
+      },
+    });
+    const schema = stitchSchemas({
+      subschemas: [
+        {
+          schema: books,
+          executor: createDefaultExecutor(books),
+        },
+        {
+          schema: authors,
+          executor: createDefaultExecutor(authors),
+          merge: {
+            Author: {
+              fieldName: 'authors',
+              selectionSet: '{ id }',
+              key: ({ id }: { id: string }) => id,
+              argsFromKeys: (ids: string[]) => ({ ids }),
+            },
+          },
+          batch: true,
+        },
+      ],
+      typeDefs: /* GraphQL */ `
+        extend type Book {
+          author: Author
+        }
+      `,
+      resolvers: {
+        Book: {
+          author: {
+            selectionSet: '{ authorId }',
+            resolve: (book: { authorId: string }) => ({ id: book.authorId }),
+          },
+        },
+      },
+    });
+
+    const stitchingInfo = schema.extensions?.['stitchingInfo'] as StitchingInfo;
+    expect(stitchingInfo.localFields.get('Book')?.has('author')).toBe(true);
+
+    const document = parse(/* GraphQL */ `
+      {
+        books {
+          title
+          author {
+            id
+            name
+          }
+        }
+      }
+    `);
+    const plan = buildStitchPlan(
+      schema,
+      document.definitions[0] as any,
+      {},
+      {},
+    );
+    expect(plan.incompleteReasons).toEqual([]);
+
+    const hasNestedAuthorIsland = (n: any): boolean => {
+      if (!n) return false;
+      if (
+        n.kind === 'Island' &&
+        n.parentTypeName === 'Book' &&
+        n.fieldNode?.name?.value === 'author' &&
+        Array.isArray(n.flattenPath)
+      ) {
+        return true;
+      }
+      if (n.nodes) return n.nodes.some(hasNestedAuthorIsland);
+      if (n.continue) return hasNestedAuthorIsland(n.continue);
+      if (n.ifClause || n.elseClause) {
+        return (
+          hasNestedAuthorIsland(n.ifClause) || hasNestedAuthorIsland(n.elseClause)
+        );
+      }
+      return false;
+    };
+    expect(hasNestedAuthorIsland(plan.root)).toBe(true);
+
+    const executor = createBackboneExecutor(schema);
+    const result = await executor({ document, context: {} });
+    expect(result.errors).toBeUndefined();
+    expect(result.data).toEqual({
+      books: [
+        { title: 'Dune', author: { id: 'a1', name: 'Author a1' } },
+        { title: 'Neuromancer', author: { id: 'a2', name: 'Author a2' } },
+      ],
+    });
+  });
 });

@@ -400,8 +400,7 @@ describe.skipIf(usingHiveRouterRuntime())('onDelegationPlanHook', () => {
     expect(onDelegationPlanPayload.variables).toMatchInlineSnapshot(`{}`);
     expect(print(onDelegationPlanPayload.fieldNodes[0]!)).toMatchInlineSnapshot(
       `
-      "author {
-        id
+      "User {
         name
       }"
     `,

@@ -760,15 +760,43 @@ function partitionSelectionsForSubschema(
     return true;
   };
 
+  const availableNames = new Set<string>();
+  const pushAvailable = (sel: SelectionNode) => {
+    if (sel.kind === Kind.FIELD) {
+      const key = sel.alias?.value ?? sel.name.value;
+      if (availableNames.has(key)) {
+        return;
+      }
+      availableNames.add(key);
+    }
+    available.push(sel);
+  };
+
   const visit = (selections: readonly SelectionNode[]) => {
     for (const selection of selections) {
       if (selection.kind === Kind.FIELD) {
         if (!fetchable(selection.name.value)) {
           unavailable.push(selection);
+          // Gateway-local / foreign field: still pull key deps that *are*
+          // fetchable here (Book.author → authorId) so nested Islands can run.
+          const deps =
+            stitchingInfo?.fieldNodesByField?.[typeName]?.[
+              selection.name.value
+            ];
+          if (deps?.length) {
+            for (const dep of deps) {
+              if (
+                dep.name.value !== '__typename' &&
+                fetchable(dep.name.value)
+              ) {
+                pushAvailable(dep);
+              }
+            }
+          }
           continue;
         }
         if (!selection.selectionSet) {
-          available.push(selection);
+          pushAvailable(selection);
           continue;
         }
         // Recurse into nested selections so union/interface fragments for
@@ -831,7 +859,7 @@ function partitionSelectionsForSubschema(
             (isObjectType(nestedReturn) || isAbstractType(nestedReturn))
               ? ensureTypename(selectionSetOf(nested.available))
               : selectionSetOf(nested.available);
-          available.push({
+          pushAvailable({
             ...selection,
             selectionSet: nestedSs,
           });
@@ -839,7 +867,7 @@ function partitionSelectionsForSubschema(
           // Field exists here but no nested selection applies (e.g. aMedia
           // with only `... on Movie` on graph A) — keep a stub so the key
           // still appears as {} in the response.
-          available.push({
+          pushAvailable({
             ...selection,
             selectionSet: selectionSetOf([
               {
@@ -1365,10 +1393,27 @@ function injectSelectionsIntoRootFetches(
     if (!toInject.length) {
       return node;
     }
-    const selectionSet = selectionSetOf([
-      ...(node.rootField.selectionSet?.selections ?? []),
-      ...toInject,
-    ]);
+    const existing = node.rootField.selectionSet?.selections ?? [];
+    const present = new Set(
+      existing
+        .filter((s): s is FieldNode => s.kind === Kind.FIELD)
+        .map((s) => s.alias?.value ?? s.name.value),
+    );
+    const uniqueExtras = toInject.filter((s) => {
+      if (s.kind !== Kind.FIELD) {
+        return true;
+      }
+      const key = s.alias?.value ?? s.name.value;
+      if (present.has(key)) {
+        return false;
+      }
+      present.add(key);
+      return true;
+    });
+    if (!uniqueExtras.length) {
+      return node;
+    }
+    const selectionSet = selectionSetOf([...existing, ...uniqueExtras]);
     return {
       ...node,
       selectionSet,
@@ -1456,6 +1501,137 @@ function collectFieldsForConcreteType(
 
   visit(selectionSet.selections, false);
   return fields;
+}
+
+/**
+ * Gateway-local field (additionalResolvers / @resolveTo) → Island, with an
+ * optional merge `continue` when the return type is federated, and nested
+ * Islands for local fields on the return type (Foo.bar → Bar.foo).
+ */
+function planLocalFieldIsland(
+  schema: GraphQLSchema,
+  stitchingInfo: StitchingInfo,
+  parentTypeName: string,
+  fieldNode: FieldNode,
+  fragments: Record<string, FragmentDefinitionNode>,
+  variableValues: Record<string, any>,
+  flattenPath: PathSegment[],
+  incompleteReasons: string[],
+): StitchPlanNode {
+  let continuePlan: StitchPlanNode | undefined;
+  const parentType = schema.getType(parentTypeName);
+  const field =
+    parentType &&
+    (isObjectType(parentType) || isInterfaceType(parentType))
+      ? parentType.getFields()[fieldNode.name.value]
+      : undefined;
+  if (field && fieldNode.selectionSet) {
+    const returnType = getNamedType(field.type);
+    const responseKey = fieldNode.alias?.value ?? fieldNode.name.value;
+    const childPath = [...flattenPath, responseKey];
+    const nestedFields = flattenToFieldNodes(
+      fieldNode.selectionSet.selections,
+      fragments,
+    );
+    if (
+      (isObjectType(returnType) || isAbstractType(returnType)) &&
+      stitchingInfo.mergedTypes[returnType.name]
+    ) {
+      const merged = stitchingInfo.mergedTypes[returnType.name]!;
+      const someSource = merged.targetSubschemas.keys().next().value as
+        | Subschema
+        | undefined;
+      if (someSource) {
+        // appendNestedForFields inside also emits nested local-field Islands.
+        continuePlan =
+          planMergedTypeFollowUps(
+            schema,
+            stitchingInfo,
+            returnType.name,
+            someSource,
+            nestedFields,
+            fragments,
+            variableValues,
+            childPath,
+            incompleteReasons,
+          ) ?? undefined;
+      }
+    }
+
+    // Non-merged return (Foo.bar → Bar): still plan nested local Islands
+    // (Bar.foo). Skip when merge continue already covered nested locals.
+    if (
+      !continuePlan &&
+      (isObjectType(returnType) || isInterfaceType(returnType))
+    ) {
+      const nestedIslands = planLocalFieldIslands(
+        schema,
+        stitchingInfo,
+        returnType.name,
+        nestedFields,
+        fragments,
+        variableValues,
+        childPath,
+        incompleteReasons,
+      );
+      if (nestedIslands.length === 1) {
+        continuePlan = nestedIslands[0];
+      } else if (nestedIslands.length > 1) {
+        continuePlan = { kind: 'Sequence', nodes: nestedIslands };
+      }
+    }
+  }
+  return {
+    kind: 'Island',
+    parentTypeName,
+    fieldNode,
+    flattenPath,
+    continue: continuePlan,
+  };
+}
+
+/**
+ * Emit Islands for gateway-local fields among `fieldNodes` on `parentTypeName`.
+ * Used for nested `@resolveTo` / additionalResolvers under a Fetch path.
+ */
+function planLocalFieldIslands(
+  schema: GraphQLSchema,
+  stitchingInfo: StitchingInfo,
+  parentTypeName: string,
+  fieldNodes: readonly FieldNode[],
+  fragments: Record<string, FragmentDefinitionNode>,
+  variableValues: Record<string, any>,
+  flattenPath: PathSegment[],
+  incompleteReasons: string[],
+): StitchPlanNode[] {
+  const islands: StitchPlanNode[] = [];
+  for (const fieldNode of fieldNodes) {
+    if (fieldNode.name.value === '__typename') {
+      continue;
+    }
+    if (
+      !isLocalField(
+        stitchingInfo.localFields,
+        parentTypeName,
+        fieldNode.name.value,
+      )
+    ) {
+      continue;
+    }
+    islands.push(
+      planLocalFieldIsland(
+        schema,
+        stitchingInfo,
+        parentTypeName,
+        fieldNode,
+        fragments,
+        variableValues,
+        flattenPath,
+        incompleteReasons,
+      ),
+    );
+  }
+  return islands;
 }
 
 function planMergedTypeFollowUps(
@@ -1560,7 +1736,32 @@ function planMergedTypeFollowUps(
     }
     const uniqueOwner = mergedTypeInfo.uniqueFields;
     for (const fieldNode of fields) {
-      if (!fieldNode.selectionSet || fieldNode.name.value === '__typename') {
+      if (fieldNode.name.value === '__typename') {
+        continue;
+      }
+      // Gateway-local (@resolveTo / additionalResolvers) before entity hops.
+      if (
+        isLocalField(
+          stitchingInfo.localFields,
+          typeName,
+          fieldNode.name.value,
+        )
+      ) {
+        stages.push(
+          planLocalFieldIsland(
+            schema,
+            stitchingInfo,
+            typeName,
+            fieldNode,
+            fragments,
+            variableValues,
+            flattenPath,
+            incompleteReasons,
+          ),
+        );
+        continue;
+      }
+      if (!fieldNode.selectionSet) {
         continue;
       }
       const field = (parentType as GraphQLObjectType).getFields()[
@@ -1643,17 +1844,32 @@ function planMergedTypeFollowUps(
       }
 
       const childTypeName = namedReturn.name;
+      const nestedFieldNodes = flattenToFieldNodes(
+        fieldNode.selectionSet.selections,
+        fragments,
+      );
+      // Non-merged nested type (Book under Author.books): still plan Islands
+      // for gateway-local fields like Book.author @resolveTo.
       if (!stitchingInfo.mergedTypes[childTypeName]) {
+        const localIslands = planLocalFieldIslands(
+          schema,
+          stitchingInfo,
+          childTypeName,
+          nestedFieldNodes,
+          fragments,
+          variableValues,
+          childPath,
+          incompleteReasons,
+        );
+        for (const island of localIslands) {
+          stages.push(island);
+        }
         continue;
       }
       const key = nestedKey(childTypeName, childPath);
       if (plannedNestedKeys.has(key)) {
         continue;
       }
-      const nestedFieldNodes = flattenToFieldNodes(
-        fieldNode.selectionSet.selections,
-        fragments,
-      );
       let childPlan: StitchPlanNode | null = null;
       for (const candidate of sourcesToTry) {
         childPlan = planMergedTypeFollowUps(
@@ -1704,8 +1920,34 @@ function planMergedTypeFollowUps(
         }
       }
     }
-    const leftoverByTarget = new Map<Subschema, FieldNode[]>();
+    // Gateway-local leftovers → Island (not an entity Fetch).
+    const fetchableLeftovers: FieldNode[] = [];
     for (const fieldNode of leftOver.unproxiableFieldNodes) {
+      if (
+        isLocalField(
+          stitchingInfo.localFields,
+          typeName,
+          fieldNode.name.value,
+        )
+      ) {
+        stages.push(
+          planLocalFieldIsland(
+            schema,
+            stitchingInfo,
+            typeName,
+            fieldNode,
+            fragments,
+            variableValues,
+            flattenPath,
+            incompleteReasons,
+          ),
+        );
+      } else {
+        fetchableLeftovers.push(fieldNode);
+      }
+    }
+    const leftoverByTarget = new Map<Subschema, FieldNode[]>();
+    for (const fieldNode of fetchableLeftovers) {
       const fieldName = fieldNode.name.value;
       const unique = mergedTypeInfo.uniqueFields[fieldName];
       const targets = unique
@@ -1912,11 +2154,37 @@ function planRootField(
     };
   }
 
-  const owners = findOwningSubschemasForRootField(
+  const allOwners = findOwningSubschemasForRootField(
     stitchingInfo,
     operation.operation,
     fieldName,
   );
+  // Progressive override on the root field (Query.feed @override(label:)):
+  // drop owners whose override handler says the field is inactive.
+  const owners =
+    planningContext == null
+      ? allOwners
+      : allOwners.filter((owner) => {
+          const overrideHandler =
+            owner.merge?.[rootType.name]?.fields?.[fieldName]?.override;
+          if (overrideHandler == null) {
+            return true;
+          }
+          const info = {
+            schema,
+            parentType: rootType,
+            fieldName,
+            fieldNodes: [fieldNode],
+            fragments: {},
+            variableValues,
+            path: { key: fieldName, typename: rootType.name, prev: undefined },
+          } as any;
+          return handleOverrideByDelegation(
+            info,
+            planningContext,
+            overrideHandler,
+          );
+        });
   if (!owners.length) {
     incompleteReasons.push(`No subschema owns root field ${fieldName}`);
     return {
@@ -1938,6 +2206,27 @@ function planRootField(
     returnTypeName && requested.length
       ? expandFieldDependencies(stitchingInfo, returnTypeName, requested)
       : requested;
+
+  // Preserve inline-fragment @skip/@include wrappers for subgraph evaluation.
+  // Flattening into field nodes would drop those directives (provides-scope).
+  const selectionSetForPartition: SelectionSetNode | undefined =
+    fieldNode.selectionSet && returnTypeName
+      ? (() => {
+          const original = [...fieldNode.selectionSet.selections];
+          const present = new Set(
+            flattenToFieldNodes(original, fragments).map(fieldNodeKey),
+          );
+          const extras: FieldNode[] = [];
+          for (const dep of withDeps) {
+            const key = fieldNodeKey(dep);
+            if (!present.has(key)) {
+              present.add(key);
+              extras.push(dep);
+            }
+          }
+          return selectionSetOf([...original, ...extras]);
+        })()
+      : undefined;
 
   // Per-owner partition: schema fields + @provides on this root field.
   type OwnerPartition = {
@@ -2113,7 +2402,7 @@ function planRootField(
     const partitioned = partitionSelectionsForSubschema(
       owner,
       returnTypeName,
-      selectionSetFromFieldNodes(withDeps),
+      selectionSetForPartition ?? selectionSetFromFieldNodes(withDeps),
       fragments,
       provided,
       stitchingInfo,
@@ -2404,7 +2693,35 @@ function planRootField(
           }
           continue;
         }
-        if (sel.kind !== Kind.FIELD || !sel.selectionSet) {
+        if (sel.kind !== Kind.FIELD) {
+          continue;
+        }
+        const rootKey = fieldNode.alias?.value ?? fieldNode.name.value;
+        // Completely unavailable gateway-local field (Book.author @resolveTo).
+        if (
+          returnTypeName &&
+          !availNames.has(sel.name.value) &&
+          isLocalField(
+            stitchingInfo.localFields,
+            returnTypeName,
+            sel.name.value,
+          )
+        ) {
+          partialUnavailableFollowUps.push(
+            planLocalFieldIsland(
+              schema,
+              stitchingInfo,
+              returnTypeName,
+              sel,
+              fragments,
+              variableValues,
+              [rootKey],
+              incompleteReasons,
+            ),
+          );
+          continue;
+        }
+        if (!sel.selectionSet) {
           continue;
         }
         if (!availNames.has(sel.name.value)) {
@@ -2423,7 +2740,6 @@ function planRootField(
           continue;
         }
         const nestedResponseKey = sel.alias?.value ?? sel.name.value;
-        const rootKey = fieldNode.alias?.value ?? fieldNode.name.value;
         if (isAbstractType(namedReturn)) {
           // @interfaceObject parent (Media on C): hop on the interface type
           // first — concrete Video has no edge from C, but Media → A does.
@@ -5056,7 +5372,11 @@ function buildCompletePlan(
               ),
               stitchingInfo,
             ),
-            { operation, fragments },
+            {
+              operation,
+              fragments,
+              fieldNodesByField: stitchingInfo.fieldNodesByField,
+            },
           ),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
