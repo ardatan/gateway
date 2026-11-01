@@ -16,8 +16,8 @@ import { mergeTypeDefs } from '@graphql-tools/merge';
 import {
   attachBackboneExecutor,
   createMergedTypeResolver,
+  defaultMergedResolver,
   getBackboneExecutor,
-  stitchedDefaultFieldResolver,
 } from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
@@ -469,8 +469,7 @@ export const handleFederationSupergraph = function ({
           pubsubPublish: PubSubOperationOptions;
         }>(fieldConfig, executableUnifiedGraph);
         if (directiveExtensions.pubsubPublish?.length) {
-          const originalResolve =
-            fieldConfig.resolve || stitchedDefaultFieldResolver;
+          const originalResolve = fieldConfig.resolve || defaultMergedResolver;
           fieldConfig.resolve = function (
             root,
             args,
