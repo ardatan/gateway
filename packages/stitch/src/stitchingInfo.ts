@@ -318,9 +318,19 @@ function createMergedTypes<
         > = new Map();
         if (sourceSubschemas) {
           for (const subschema of sourceSubschemas) {
-            const filteredSubschemas = targetSubschemas.filter(
-              (s) => s !== subschema,
-            );
+            // Isolation clones gave computed fields a second Subschema
+            // identity so source !== target. Without clones, a subschema that
+            // owns computed / field-@requires fields must be allowed as its
+            // own merge target so shippingEstimate can re-enter after deps
+            // land. Field-level DPB defers unmet requires so this is not a
+            // tight loop.
+            const ownsComputedOrRequires = fieldSelectionSets
+              .get(subschema)
+              ? Object.keys(fieldSelectionSets.get(subschema)!).length > 0
+              : false;
+            const filteredSubschemas = ownsComputedOrRequires
+              ? targetSubschemas
+              : targetSubschemas.filter((s) => s !== subschema);
             if (filteredSubschemas.length) {
               targetSubschemasBySubschema.set(subschema, filteredSubschemas);
             }

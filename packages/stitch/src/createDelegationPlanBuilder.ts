@@ -57,14 +57,15 @@ function calculateDelegationStage(
   const { selectionSets, fieldSelectionSets, uniqueFields, nonUniqueFields } =
     mergedTypeInfo;
 
-  // 1.  calculate if possible to delegate to given subschema
+  // 1. Type-level merge-key proxiability only. Field-level @requires /
+  // computed selectionSets are checked per field below so one unmet
+  // shippingEstimate does not block the whole inventory target (clone-less).
 
   const proxiableSubschemas: Array<Subschema> = [];
   const nonProxiableSubschemas: Array<Subschema> = [];
 
   for (const t of targetSubschemas) {
     const selectionSet = selectionSets.get(t);
-    const fieldSelectionSetsMap = fieldSelectionSets.get(t);
     if (
       selectionSet != null &&
       !subschemaTypesContainSelectionSet(
@@ -75,29 +76,33 @@ function calculateDelegationStage(
     ) {
       nonProxiableSubschemas.push(t);
     } else {
-      if (
-        fieldSelectionSetsMap == null ||
-        fieldNodes.every((fieldNode) => {
-          const fieldName = fieldNode.name.value;
-          const fieldSelectionSet = fieldSelectionSetsMap[fieldName];
-          return (
-            fieldSelectionSet == null ||
-            subschemaTypesContainSelectionSet(
-              mergedTypeInfo,
-              sourceSubschemas,
-              fieldSelectionSet,
-            )
-          );
-        })
-      ) {
-        proxiableSubschemas.push(t);
-      } else {
-        nonProxiableSubschemas.push(t);
-      }
+      proxiableSubschemas.push(t);
     }
   }
 
   const unproxiableFieldNodes: Array<FieldNode> = [];
+
+  function fieldRequiresSatisfied(
+    target: Subschema,
+    fieldName: string,
+  ): boolean {
+    const fieldSelectionSet = fieldSelectionSets.get(target)?.[fieldName];
+    return (
+      fieldSelectionSet == null ||
+      subschemaTypesContainSelectionSet(
+        mergedTypeInfo,
+        sourceSubschemas,
+        fieldSelectionSet,
+      )
+    );
+  }
+
+  function deferField(fieldNode: FieldNode, target?: Subschema): void {
+    unproxiableFieldNodes.push(fieldNode);
+    if (target != null && !nonProxiableSubschemas.includes(target)) {
+      nonProxiableSubschemas.push(target);
+    }
+  }
 
   // 2. for each selection:
 
@@ -109,7 +114,8 @@ function calculateDelegationStage(
       continue;
     }
 
-    // check dependencies for computed fields are available in the source schemas
+    // Circular @requires: when every source still has unsatisfied field
+    // deps for this field, defer and retry via leftover (requires-circular).
     const sourcesWithUnsatisfiedDependencies = sourceSubschemas.filter(
       (s) =>
         fieldSelectionSets.get(s) != null &&
@@ -135,7 +141,11 @@ function calculateDelegationStage(
     const uniqueSubschema = uniqueFields[fieldName];
     if (uniqueSubschema != null) {
       if (!proxiableSubschemas.includes(uniqueSubschema)) {
-        unproxiableFieldNodes.push(fieldNode);
+        deferField(fieldNode, uniqueSubschema);
+        continue;
+      }
+      if (!fieldRequiresSatisfied(uniqueSubschema, fieldName)) {
+        deferField(fieldNode, uniqueSubschema);
         continue;
       }
 
@@ -161,11 +171,26 @@ function calculateDelegationStage(
       continue;
     }
 
-    nonUniqueSubschemas = nonUniqueSubschemas.filter((s) =>
-      proxiableSubschemas.includes(s),
+    nonUniqueSubschemas = nonUniqueSubschemas.filter(
+      (s) =>
+        proxiableSubschemas.includes(s) && fieldRequiresSatisfied(s, fieldName),
     );
     if (!nonUniqueSubschemas.length) {
-      unproxiableFieldNodes.push(fieldNode);
+      // Candidates that failed only on field-requires stay non-proxiable so a
+      // later stage can retry after deps land (self-target computed re-entry).
+      const requireDeferred = nonUniqueFields[fieldNode.name.value]!.filter(
+        (s) => proxiableSubschemas.includes(s),
+      );
+      if (requireDeferred.length) {
+        unproxiableFieldNodes.push(fieldNode);
+        for (const t of requireDeferred) {
+          if (!nonProxiableSubschemas.includes(t)) {
+            nonProxiableSubschemas.push(t);
+          }
+        }
+      } else {
+        unproxiableFieldNodes.push(fieldNode);
+      }
       continue;
     }
 

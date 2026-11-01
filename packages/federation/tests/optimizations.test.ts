@@ -130,7 +130,9 @@ describe('Optimizations', () => {
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
       // inventory: 1, (when computed fields definition removed)
-      inventory: 2,
+      // Clone-less computed deferral (no isolation Subschema split) needs one
+      // extra inventory hop for shippingEstimate self-reentry after price/weight.
+      inventory: 3,
       products: 2,
       reviews: 2,
     });
