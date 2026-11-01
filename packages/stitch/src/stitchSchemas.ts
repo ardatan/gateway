@@ -1,4 +1,5 @@
 import {
+  defaultMergedResolver as classicDefaultMergedResolver,
   isSubschemaConfig,
   StitchingInfo,
   Subschema,
@@ -21,6 +22,7 @@ import {
   extendSchema,
   getNamedType,
   GraphQLDirective,
+  type GraphQLFieldResolver,
   GraphQLNamedType,
   GraphQLObjectType,
   GraphQLSchema,
@@ -32,8 +34,9 @@ import {
   specifiedDirectives,
 } from 'graphql';
 import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
+import { isClassicStitchingEnabled } from './backbone/classicStitching.js';
 import { BACKBONE_EXECUTING } from './backbone/rootProxyingResolvers.js';
-import { defaultMergedResolver } from './defaultMergedResolver.js';
+import { defaultMergedResolver as backboneDefaultMergedResolver } from './defaultMergedResolver.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
 import {
   addStitchingInfo,
@@ -122,14 +125,26 @@ export function stitchSchemas<
 
   stitchingInfo = completeStitchingInfo(stitchingInfo, finalResolvers, schema);
 
-  addLocalFieldResolvers(schema, finalResolvers, stitchingInfo, typeCandidates);
+  const classicStitching = isClassicStitchingEnabled({
+    classicStitching: options.classicStitching,
+  });
+  // Classic: resolve-time mergeFields via delegate defaultMergedResolver.
+  // Backbone: slim stitch defaultMergedResolver (plan owns entity hops).
+  const gatewayDefaultFieldResolver = classicStitching
+    ? classicDefaultMergedResolver
+    : backboneDefaultMergedResolver;
 
-  // Backbone owns Query/Mutation + entity hops. Nested leaves use stitch's
-  // defaultMergedResolver (alias/error-aware + resolveLocalFieldResult) —
-  // not the classic leftover merge plan in @graphql-tools/delegate.
+  addLocalFieldResolvers(
+    schema,
+    finalResolvers,
+    stitchingInfo,
+    typeCandidates,
+    gatewayDefaultFieldResolver,
+  );
+
   schema = addResolversToSchema({
     schema,
-    defaultFieldResolver: defaultMergedResolver,
+    defaultFieldResolver: gatewayDefaultFieldResolver,
     resolvers: finalResolvers,
     resolverValidationOptions,
     inheritResolversFromInterfaces: false,
@@ -262,6 +277,7 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
   resolvers: IResolvers,
   stitchingInfo: StitchingInfo<TContext>,
   typeCandidates: Record<string, Array<MergeTypeCandidate<TContext>>>,
+  gatewayDefaultFieldResolver: GraphQLFieldResolver<any, any>,
 ): void {
   const subschemaFields = new Set<string>();
   const localFields = new Map<string, Set<string>>();
@@ -334,7 +350,7 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
       }
       const originalResolve =
         typeof existing === 'function' ? existing : existing?.resolve;
-      // Property-only locals use schema defaultMergedResolver (includes
+      // Property-only locals use schema defaultFieldResolver (includes
       // resolveLocalFieldResult). Only wrap real user resolvers.
       if (originalResolve == null) {
         continue;
@@ -349,8 +365,8 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
             )
           : undefined;
       // After Island hydration, graphql-js re-walks and would re-invoke user
-      // resolvers without selectionSet deps — short-circuit via
-      // defaultMergedResolver. Otherwise run the user resolve then hydrate.
+      // resolvers without selectionSet deps — short-circuit via the gateway
+      // default. Otherwise run the user resolve then hydrate.
       const wrappedResolve = (
         parent: any,
         args: any,
@@ -373,7 +389,7 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
             responseKey != null &&
             Object.prototype.hasOwnProperty.call(parent, responseKey)
           ) {
-            return defaultMergedResolver(parent, args, context, info);
+            return gatewayDefaultFieldResolver(parent, args, context, info);
           }
         }
         return handleMaybePromise(
