@@ -9,7 +9,7 @@ import {
   isAsyncIterable,
 } from '@graphql-tools/utils';
 import { handleMaybePromise } from '@whatwg-node/promise-helpers';
-import { GraphQLSchema, Kind, OperationDefinitionNode } from 'graphql';
+import { GraphQLSchema, Kind } from 'graphql';
 import {
   buildStitchPlan,
   coerceOperationVariables,
@@ -68,39 +68,6 @@ function documentHasDeferOrStream(request: ExecutionRequest): boolean {
   return false;
 }
 
-function operationHasSkipOrIncludeFast(
-  operation: OperationDefinitionNode,
-): boolean {
-  const stack = [...operation.selectionSet.selections];
-  while (stack.length) {
-    const sel = stack.pop()!;
-    if (
-      'directives' in sel &&
-      sel.directives?.some(
-        (d) => d.name.value === 'skip' || d.name.value === 'include',
-      )
-    ) {
-      return true;
-    }
-    if (
-      (sel.kind === Kind.FIELD || sel.kind === Kind.INLINE_FRAGMENT) &&
-      sel.selectionSet
-    ) {
-      stack.push(...sel.selectionSet.selections);
-    }
-  }
-  return false;
-}
-
-function stableStringify(value: Record<string, any>): string {
-  const keys = Object.keys(value).sort();
-  const sorted: Record<string, any> = {};
-  for (const k of keys) {
-    sorted[k] = value[k];
-  }
-  return JSON.stringify(sorted);
-}
-
 /**
  * Stitching backbone executor — plan once (cached) and run Fetch/Parallel/
  * Sequence/Island/Condition. Subscriptions, SDL introspection (`__schema` /
@@ -118,12 +85,13 @@ export function createBackboneExecutor(
     Map<string | null, StitchPlan>
   >();
 
-  // graphql-js execute on this schema → same backbone (Query/Mutation roots).
-  if (options.installRootTrampoline !== false) {
-    installRootTrampoline(schema, (request) =>
-      stitchingBackboneExecutor(request),
-    );
-  }
+  // Stock graphql-js `execute(schema, …)` must hit the same backbone as the
+  // returned Executor. Installed here (not in stitchSchemas) because federation
+  // still mapSchema-wraps the schema after stitch (e.g. @pubsubPublish) — the
+  // trampoline has to bind the final schema + this executor closure.
+  installRootTrampoline(schema, (request) =>
+    stitchingBackboneExecutor(request),
+  );
 
   function getCachedPlan(request: ExecutionRequest): StitchPlan {
     const operation = getOperationASTFromRequest(request);
@@ -141,10 +109,7 @@ export function createBackboneExecutor(
       operation,
       request.variables ?? {},
     );
-    // Condition nodes → one plan per document. Legacy peel still keys by vars.
-    const hasSkipInclude = operationHasSkipOrIncludeFast(operation);
-    // Default on (Hive-style). Opt out with `useConditionNodes: false`.
-    const useConditionPlans = options.useConditionNodes !== false;
+    // Condition nodes → one plan per document (no per-variable specialization).
     let overrideKey = '';
     if (options.overrideLabels && request.context != null) {
       const labels = [...options.overrideLabels];
@@ -170,14 +135,7 @@ export function createBackboneExecutor(
         overrideKey += `::ov:${enabled.sort().join(',')}`;
       }
     }
-    const cacheKey =
-      (operation.name?.value ?? '') +
-      (useConditionPlans
-        ? ''
-        : hasSkipInclude
-          ? `::${stableStringify(coerced)}`
-          : '') +
-      overrideKey;
+    const cacheKey = (operation.name?.value ?? '') + overrideKey;
     let byName = planCache.get(request.document);
     if (byName) {
       const cached = byName.get(cacheKey);
@@ -191,7 +149,8 @@ export function createBackboneExecutor(
     let plan: StitchPlan;
     try {
       plan = buildStitchPlan(schema, operation, fragments, coerced, {
-        ...options,
+        handleProgressiveOverride: options.handleProgressiveOverride,
+        overrideLabels: options.overrideLabels,
         context: request.context,
       });
     } catch (err) {
