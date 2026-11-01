@@ -116,90 +116,6 @@ function allMaybePromises<T>(
   });
 }
 
-function isIsolationStripTransform(t: { constructor?: { name?: string } }) {
-  const name = t?.constructor?.name;
-  return name === 'TransformCompositeFields' || name === 'FilterTypes';
-}
-
-/**
- * Drop isolation-only transforms that would empty a root/entity selection
- * under delegateToSchema, while keeping rename/encapsulate transforms.
- * No-op under default clone-less deferral; kept for opt-in
- * isolateComputedFieldsTransformer callers.
- */
-function subschemaWithoutIsolationStripTransforms(
-  subschema: Subschema,
-): Subschema {
-  const transforms = subschema.transforms;
-  if (!transforms?.length) {
-    return subschema;
-  }
-  const kept = transforms.filter((t) => !isIsolationStripTransform(t as any));
-  if (kept.length === transforms.length) {
-    return subschema;
-  }
-  return Object.assign(
-    Object.create(Object.getPrototypeOf(subschema)),
-    subschema,
-    {
-      transforms: kept,
-      _transformedSchema: undefined,
-    },
-  ) as Subschema;
-}
-
-/**
- * Computed-field isolation installs TransformCompositeFields that strip
- * sibling fields (inStock vs shippingEstimate) onto separate Subschema clones.
- * When a backbone Fetch unions fields from both clones, drop the strip
- * transforms so the shared executor receives the full selection while keeping
- * merge.fields for @requires. Leave transforms intact for single-clone hops
- * (requires-circular / requires-with-argument must stay isolated).
- */
-function subschemaForBackboneEntityHop(
-  subschema: Subschema,
-  entityTypeName: string,
-  selectionSet: SelectionSetNode,
-): Subschema {
-  const transforms = subschema.transforms;
-  if (!transforms?.length) {
-    return subschema;
-  }
-  const mergeFields = subschema.merge?.[entityTypeName]?.fields;
-  if (!mergeFields) {
-    return subschema;
-  }
-  // Only rewrite when the selection asks for a non-merge, non-typename field
-  // that isolation would strip (e.g. inStock alongside shippingEstimate).
-  let needsUnstripped = false;
-  for (const sel of selectionSet.selections) {
-    if (sel.kind !== Kind.FIELD) {
-      continue;
-    }
-    const name = sel.name.value;
-    if (name === '__typename') {
-      continue;
-    }
-    if (mergeFields[name]) {
-      continue;
-    }
-    needsUnstripped = true;
-    break;
-  }
-  if (!needsUnstripped) {
-    return subschema;
-  }
-  return subschemaWithoutIsolationStripTransforms(subschema);
-}
-
-/** True when subschema has transforms other than isolation strippers (rename…). */
-function hasNonIsolationTransforms(subschema: Subschema): boolean {
-  return (
-    subschema.transforms?.some((t) => !isIsolationStripTransform(t as any)) ===
-    true
-  );
-}
-
 /** Stamp subschema symbols without Object.defineProperties. */
 function stampSubschema(
   object: Record<string, any>,
@@ -783,14 +699,10 @@ function executeFetchNode(
       }
     };
 
-    // Rename / encapsulate transforms need Transformer — prebuilt documents
-    // use gateway field names and would miss subgraph renames (authorWithBooks).
-    // Isolation-only TransformCompositeFields/FilterTypes must NOT force
-    // delegateToSchema: they strip root fields and yield empty operations.
-    if (hasNonIsolationTransforms(node.subschema)) {
-      const hopSubschema = subschemaWithoutIsolationStripTransforms(
-        node.subschema,
-      );
+    // Rename / encapsulate / defer transforms need Transformer — prebuilt
+    // documents use gateway field names and would miss subgraph renames.
+    if (node.subschema.transforms?.length) {
+      const hopSubschema = node.subschema;
       const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
       const fieldDef = rootType.getFields()[rootFieldNode.name.value];
       const args = fieldDef
@@ -1030,11 +942,7 @@ function executeFetchNode(
     },
   };
 
-  const hopSubschema = subschemaForBackboneEntityHop(
-    node.subschema,
-    node.entityTypeName,
-    node.selectionSet,
-  );
+  const hopSubschema = node.subschema;
 
   // Hive-style: one batched _entities hop for all parents (single
   // batchDelegateToSchema / DataLoader batch instead of N resolver entries).
@@ -1797,11 +1705,7 @@ function executeBatchFetchNode(
         variables[varName] = [];
         continue;
       }
-      const hopSubschema = subschemaForBackboneEntityHop(
-        node.subschema,
-        a.entityTypeName,
-        a.selectionSet,
-      );
+      const hopSubschema = node.subschema;
       const projected = projectRepresentations(
         parents,
         hopSubschema,
