@@ -19,9 +19,9 @@ type PubSubLike = {
 };
 
 /**
- * Backbone execute bypasses schema root resolvers (and the fusion-runtime
- * `@pubsubPublish` wrappers installed on them). Re-apply publish side effects
- * from Mutation result payloads so EDFS / NATS mutations still fan out.
+ * Backbone execute bypasses schema root resolvers. Re-apply `@pubsubPublish`
+ * side effects from Mutation result payloads so EDFS / NATS mutations still
+ * fan out (same role router-runtime's pubsub visitor plays for classic execute).
  */
 export function applyPubsubPublishToResult(
   schema: GraphQLSchema,

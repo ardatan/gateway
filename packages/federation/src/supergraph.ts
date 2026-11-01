@@ -2373,7 +2373,8 @@ export function getStitchedSchemaFromSupergraphSdl(
     markChangedRootResolvesAsLocal(supergraphSchema, rootResolvesBefore);
   }
   // Persist progressive-override plan-cache opts on schema.extensions so a
-  // later mapSchema + bare re-attach (fusion @pubsubPublish) needs no options bag.
+  // later mapSchema + bare re-attach (e.g. filterInternalFieldsAndTypes) needs
+  // no options bag.
   return attachBackboneExecutor(supergraphSchema, {
     handleProgressiveOverride: opts.handleProgressiveOverride,
   });

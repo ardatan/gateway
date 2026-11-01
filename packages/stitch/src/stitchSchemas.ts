@@ -158,7 +158,7 @@ export function stitchSchemas<
   }
 
   // Backbone executor + root proxying resolvers on the stitched schema. Callers that
-  // mapSchema afterward (federation filter, @pubsubPublish) must re-attach.
+  // mapSchema afterward (e.g. federation filter) must re-attach on the new instance.
   return attachBackboneExecutor(schema);
 }
 
