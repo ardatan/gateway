@@ -157,9 +157,12 @@ export function stitchSchemas<
     applyExtensions(schema, mergedSchemaExtensions);
   }
 
-  // Backbone executor + root proxying resolvers on the stitched schema. Callers that
-  // mapSchema afterward (e.g. federation filter) must re-attach on the new instance.
-  return attachBackboneExecutor(schema);
+  // Backbone executor + root proxying resolvers on the stitched schema (unless
+  // classicStitching / GRAPHQL_TOOLS_CLASSIC_STITCHING). Callers that mapSchema
+  // afterward (e.g. federation filter) must re-attach on the new instance.
+  return attachBackboneExecutor(schema, {
+    classicStitching: options.classicStitching,
+  });
 }
 
 function stripCustomDirectiveUsages(types: GraphQLNamedType[]): void {

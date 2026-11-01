@@ -6,10 +6,11 @@ import {
   PubSubOperationOptions,
   resolveAdditionalResolversWithoutImport,
 } from '@graphql-mesh/utils';
-import type {
-  DelegationPlanBuilder,
-  StitchingInfo,
-  SubschemaConfig,
+import {
+  createDefaultExecutor,
+  type DelegationPlanBuilder,
+  type StitchingInfo,
+  type SubschemaConfig,
 } from '@graphql-tools/delegate';
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
@@ -452,11 +453,14 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  // Gateway runs this executor; root proxying already targets the backbone —
-  // only wrap the returned handle for @pubsubPublish, don't rebind proxying.
+  // Gateway runs this executor. Classic stitching leaves no backboneExecutor —
+  // fall back to schema execute (root resolvers / mergeFields).
+  const backboneOrClassic =
+    getBackboneExecutor(executableUnifiedGraph) ??
+    createDefaultExecutor(executableUnifiedGraph);
   const executor = wrapExecutorWithPubsubPublish(
     executableUnifiedGraph,
-    getBackboneExecutor(executableUnifiedGraph)!,
+    backboneOrClassic,
   );
 
   return {

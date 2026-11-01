@@ -71,6 +71,12 @@ export interface IStitchSchemasOptions<
   mergeTypes?: boolean | Array<string> | MergeTypeFilter<TContext>;
   typeMergingOptions?: TypeMergingOptions<TContext>;
   subschemaConfigTransforms?: Array<SubschemaConfigTransform<TContext>>;
+  /**
+   * Use classic resolve-time stitching instead of the planned backbone.
+   * Overrides / is overridden by `GRAPHQL_TOOLS_CLASSIC_STITCHING` only when
+   * left unset — explicit `true`/`false` wins. Default: backbone.
+   */
+  classicStitching?: boolean;
 }
 
 export type SubschemaConfigTransform<TContext = Record<string, any>> = (

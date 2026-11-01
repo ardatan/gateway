@@ -186,6 +186,12 @@ export interface GetStitchingOptionsFromSupergraphSdlOpts {
   handleProgressiveOverride?: ProgressiveOverrideHandler;
 
   getRng?: () => number;
+
+  /**
+   * Classic resolve-time stitching instead of backbone. Also
+   * `GRAPHQL_TOOLS_CLASSIC_STITCHING=1`. Explicit value wins over env.
+   */
+  classicStitching?: boolean;
 }
 
 export interface ProgressiveOverrideInfo {
@@ -2346,6 +2352,7 @@ export function getStitchingOptionsFromSupergraphSdl(
       fieldConfigMerger,
     },
     schemaExtensions,
+    classicStitching: opts.classicStitching,
   };
 }
 
@@ -2382,6 +2389,7 @@ export function getStitchedSchemaFromSupergraphSdl(
       ? (label, context) =>
           opts.handleProgressiveOverride!(label, context, undefined as any)
       : undefined,
+    classicStitching: opts.classicStitching,
   });
 }
 
