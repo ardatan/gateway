@@ -1277,10 +1277,9 @@ function executeIslandNode(
         },
       );
     });
-    return handleMaybePromise(
-      () => awaitMaybePromises(jobs),
-      () => (node.continue ? executePlanNode(node.continue, ctx) : undefined),
-    );
+    // `continue` is a separate dataflow hop gated on this Island's id —
+    // do not tree-walk it here (would double-execute).
+    return awaitMaybePromises(jobs);
   }
 
   // Root Island: write into ctx.data[responseKey].
@@ -1302,162 +1301,9 @@ function executeIslandNode(
     () => field.resolve!(ctx.rootValue, args, ctx.contextValue, info),
     (result) => {
       ctx.data[responseKey] = result;
-      if (node.continue) {
-        return executePlanNode(node.continue, ctx);
-      }
+      // continue: dataflow hop, not tree execute
     },
   );
-}
-
-function executePlanNode(
-  node: StitchPlanNode,
-  ctx: BackboneExecutionContext,
-): MaybePromise<void> {
-  switch (node.kind) {
-    case 'Sequence': {
-      let chain: MaybePromise<void> = undefined;
-      for (const child of node.nodes) {
-        chain = handleMaybePromise(
-          () => chain,
-          () => executePlanNode(child, ctx),
-        );
-      }
-      return chain;
-    }
-    case 'Parallel': {
-      // Shared-root Parallel: multiple root Fetches write the same responseKey.
-      // Run them in isolated data bags then merge so concurrent writes don't race.
-      const rootFetches = node.nodes.filter(
-        (n): n is Extract<StitchPlanNode, { kind: 'Fetch' }> =>
-          n.kind === 'Fetch' && Boolean(n.rootField),
-      );
-      const sameKey =
-        rootFetches.length === node.nodes.length &&
-        rootFetches.length > 1 &&
-        rootFetches.every((n) => {
-          const a = rootFetches[0]!.rootField!;
-          const b = n.rootField!;
-          const keyA = a.alias?.value ?? a.name.value;
-          const keyB = b.alias?.value ?? b.name.value;
-          return keyA === keyB;
-        });
-      if (sameKey) {
-        const responseKey =
-          rootFetches[0]!.rootField!.alias?.value ??
-          rootFetches[0]!.rootField!.name.value;
-        // Isolate per-fetch errors: provides / union intersection often hit a
-        // subgraph that intentionally errors while another returns the data.
-        const jobs = rootFetches.map((child) => {
-          const childErrors: any[] = [];
-          const childCtx: BackboneExecutionContext = {
-            ...ctx,
-            data: {},
-            errors: childErrors,
-          };
-          return handleMaybePromise(
-            () => executeFetchNode(child, childCtx),
-            () => ({
-              data: childCtx.data[responseKey],
-              errors: childErrors,
-            }),
-          );
-        });
-        return handleMaybePromise(
-          () => allMaybePromises(jobs),
-          (parts: Array<{ data: any; errors: any[] }>) => {
-            let merged: any = undefined;
-            let anyData = false;
-            for (const part of parts) {
-              if (part.data !== undefined) {
-                anyData = true;
-                merged = mergeRootValues(merged, part.data);
-              }
-            }
-            if (merged !== undefined) {
-              ctx.data[responseKey] = merged;
-            }
-            // Promote sibling errors only when every fetch failed to return data.
-            if (!anyData) {
-              for (const part of parts) {
-                ctx.errors.push(...part.errors);
-              }
-            }
-          },
-        );
-      }
-      // Entity Fetches that share a flattenPath mutate the same parent objects.
-      // Serialize only when selected fields overlap (true merge races). Disjoint
-      // hops (inventory {inStock} ∥ reviews {reviews}) run in parallel like Hive.
-      const entityFetches = node.nodes.filter(
-        (n): n is Extract<StitchPlanNode, { kind: 'Fetch' }> =>
-          n.kind === 'Fetch' && Boolean(n.entityTypeName),
-      );
-      const sharedEntityPath =
-        entityFetches.length === node.nodes.length &&
-        entityFetches.length > 1 &&
-        entityFetches.every(
-          (n) =>
-            JSON.stringify(n.flattenPath ?? n.flattenPaths) ===
-            JSON.stringify(
-              entityFetches[0]!.flattenPath ?? entityFetches[0]!.flattenPaths,
-            ),
-        );
-      if (sharedEntityPath) {
-        const fieldSets = entityFetches.map((f) => {
-          const names = new Set<string>();
-          for (const sel of f.selectionSet.selections) {
-            if (sel.kind === Kind.FIELD && sel.name.value !== '__typename') {
-              names.add(sel.name.value);
-            }
-          }
-          return names;
-        });
-        let overlapping = false;
-        for (let i = 0; i < fieldSets.length && !overlapping; i++) {
-          for (let j = i + 1; j < fieldSets.length; j++) {
-            for (const name of fieldSets[i]!) {
-              if (fieldSets[j]!.has(name)) {
-                overlapping = true;
-                break;
-              }
-            }
-            if (overlapping) {
-              break;
-            }
-          }
-        }
-        if (overlapping) {
-          let chain: ReturnType<typeof executePlanNode> = undefined;
-          for (const child of node.nodes) {
-            chain = handleMaybePromise(
-              () => chain,
-              () => executePlanNode(child, ctx),
-            );
-          }
-          return chain;
-        }
-      }
-      const jobs = node.nodes.map((child) => executePlanNode(child, ctx));
-      return awaitMaybePromises(jobs);
-    }
-    case 'Fetch':
-      return executeFetchNode(node, ctx);
-    case 'BatchFetch':
-      return executeBatchFetchNode(node, ctx);
-    case 'Island':
-      return executeIslandNode(node, ctx);
-    case 'Condition': {
-      const value = ctx.variableValues?.[node.condition];
-      if (value === true) {
-        return node.ifClause ? executePlanNode(node.ifClause, ctx) : undefined;
-      }
-      return node.elseClause
-        ? executePlanNode(node.elseClause, ctx)
-        : undefined;
-    }
-    default:
-      return;
-  }
 }
 
 type ExecutableHop =
@@ -1620,9 +1466,11 @@ export function executeDataflowPlan(
   if (!hops.length) {
     return;
   }
-  // Fall back when planner didn't attach deps (legacy / incomplete annotate).
+  // Planner must annotate every hop — no tree-execute fallback.
   if (!hops.every((h) => h.id != null && h.dependsOn != null)) {
-    return executePlanNode(root, ctx);
+    throw new Error(
+      'Stitch plan hops missing id/dependsOn; annotateFetchDeps required',
+    );
   }
 
   const done = new Set<string>();
@@ -2088,8 +1936,7 @@ export function executeStitchPlan(
     infoStub: {},
   };
 
-  // Barrier-free dataflow (shared-root merge + Condition/Island aware).
-  // Falls back to tree execute when hops lack id/dependsOn annotations.
+  // Dataflow only — Sequence/Parallel are plan shape; schedule is dependsOn.
   return handleMaybePromise(
     () => executeDataflowPlan(plan.root, ctx),
     () => {
