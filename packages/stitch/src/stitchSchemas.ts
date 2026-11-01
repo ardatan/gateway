@@ -33,8 +33,8 @@ import {
 } from 'graphql';
 import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
 import { BACKBONE_EXECUTING } from './backbone/rootTrampoline.js';
+import { defaultMergedResolver } from './defaultMergedResolver.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
-import { stitchedDefaultFieldResolver } from './stitchedDefaultFieldResolver.js';
 import {
   addStitchingInfo,
   completeStitchingInfo,
@@ -124,13 +124,12 @@ export function stitchSchemas<
 
   addLocalFieldResolvers(schema, finalResolvers, stitchingInfo, typeCandidates);
 
-  // Backbone owns Query/Mutation + entity hops. Nested leaves use
-  // stitchedDefaultFieldResolver (alias/error-aware property access) — not
-  // defaultMergedResolver's leftover merge plan. Island hydration uses
-  // resolveLocalFieldResult → stitchingInfo mergedType resolvers.
+  // Backbone owns Query/Mutation + entity hops. Nested leaves use stitch's
+  // defaultMergedResolver (alias/error-aware + resolveLocalFieldResult) —
+  // not the classic leftover merge plan in @graphql-tools/delegate.
   schema = addResolversToSchema({
     schema,
-    defaultFieldResolver: stitchedDefaultFieldResolver,
+    defaultFieldResolver: defaultMergedResolver,
     resolvers: finalResolvers,
     resolverValidationOptions,
     inheritResolversFromInterfaces: false,
@@ -330,6 +329,13 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
       if (stitchingInfo.mergedTypes[namedType.name] == null) {
         continue;
       }
+      const originalResolve =
+        typeof existing === 'function' ? existing : existing?.resolve;
+      // Property-only locals use schema defaultMergedResolver (includes
+      // resolveLocalFieldResult). Only wrap real user resolvers.
+      if (originalResolve == null) {
+        continue;
+      }
       const namedTypeResolvers = resolvers[namedType.name];
       const providedFields =
         namedTypeResolvers != null && typeof namedTypeResolvers === 'object'
@@ -339,24 +345,16 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
               ),
             )
           : undefined;
-      const originalResolve =
-        typeof existing === 'function' ? existing : existing?.resolve;
-      // Local resolver (or alias-aware property access). Missing entity fields
-      // are filled by resolveLocalFieldResult → stitchingInfo resolvers.
-      const baseResolve = originalResolve ?? stitchedDefaultFieldResolver;
+      // After Island hydration, graphql-js re-walks and would re-invoke user
+      // resolvers without selectionSet deps — short-circuit via
+      // defaultMergedResolver. Otherwise run the user resolve then hydrate.
       const wrappedResolve = (
         parent: any,
         args: any,
         context: any,
         info: any,
       ) => {
-        // User resolvers (DataLoader, …): backbone Island already hydrated the
-        // field; graphql-js still walks and would re-invoke without selectionSet
-        // deps. Prefer the cached value. Property-only locals (no originalResolve)
-        // must still run stitchedDefaultFieldResolver so ExternalObject parents
-        // get resolveExternalValue (alias annotation for Debt.installmentPlan).
         if (
-          originalResolve != null &&
           parent != null &&
           typeof parent === 'object' &&
           info != null &&
@@ -372,17 +370,11 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
             responseKey != null &&
             Object.prototype.hasOwnProperty.call(parent, responseKey)
           ) {
-            return resolveLocalFieldResult(
-              parent[responseKey],
-              context,
-              info,
-              stitchingInfo,
-              providedFields,
-            );
+            return defaultMergedResolver(parent, args, context, info);
           }
         }
         return handleMaybePromise(
-          () => baseResolve(parent, args, context, info),
+          () => originalResolve(parent, args, context, info),
           (result) =>
             resolveLocalFieldResult(
               result,

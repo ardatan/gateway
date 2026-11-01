@@ -1,7 +1,7 @@
 export { stitchSchemas } from './stitchSchemas.js';
 export { createMergedTypeResolver } from './createMergedTypeResolver.js';
 export { forwardArgsToSelectionSet } from './selectionSetArgs.js';
-export { stitchedDefaultFieldResolver } from './stitchedDefaultFieldResolver.js';
+export { defaultMergedResolver } from './defaultMergedResolver.js';
 
 export * from './subschemaConfigTransforms/index.js';
 export * from './types.js';
