@@ -2372,7 +2372,11 @@ export function getStitchedSchemaFromSupergraphSdl(
     // Late root resolver overrides (Query.me → local) must plan as Islands.
     markChangedRootResolvesAsLocal(supergraphSchema, rootResolvesBefore);
   }
-  return attachBackboneExecutor(supergraphSchema);
+  // Persist progressive-override plan-cache opts on schema.extensions so a
+  // later mapSchema + bare re-attach (fusion @pubsubPublish) needs no options bag.
+  return attachBackboneExecutor(supergraphSchema, {
+    handleProgressiveOverride: opts.handleProgressiveOverride,
+  });
 }
 
 const anyTypeDefinitionNode: ScalarTypeDefinitionNode = {
