@@ -486,14 +486,10 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  // Re-attach after @pubsubPublish mapSchema (new schema object) and bind
-  // progressive-override plan-cache options.
-  attachBackboneExecutor(executableUnifiedGraph, {
-    handleProgressiveOverride,
-    overrideLabels: executableUnifiedGraph.extensions?.['overrideLabels'] as
-      | Iterable<string>
-      | undefined,
-  });
+  // mapSchema (@pubsubPublish) yields a new schema object — re-bind proxying
+  // resolvers. Progressive-override opts already live on schema.extensions
+  // from getStitchedSchemaFromSupergraphSdl's attach.
+  attachBackboneExecutor(executableUnifiedGraph);
   const executor = getBackboneExecutor(executableUnifiedGraph)!;
 
   return {

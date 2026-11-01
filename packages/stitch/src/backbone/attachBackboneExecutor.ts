@@ -6,7 +6,10 @@ import {
   type GraphQLSchema,
 } from 'graphql';
 import { createBackboneExecutor } from './createBackboneExecutor.js';
-import type { BackboneExecutorOptions } from './types.js';
+import {
+  BACKBONE_EXECUTOR_OPTIONS_EXTENSION,
+  type BackboneExecutorOptions,
+} from './types.js';
 
 /** Schema extension key for the operation-level backbone executor. */
 export const BACKBONE_EXECUTOR_EXTENSION = 'backboneExecutor';
@@ -73,20 +76,45 @@ export function markChangedRootResolvesAsLocal(
 }
 
 /**
+ * Merge explicit attach options with values already on the schema
+ * (`backboneExecutorOptions`, `overrideLabels`) so re-attach after `mapSchema`
+ * can be optionless.
+ */
+export function resolveBackboneExecutorOptions(
+  schema: GraphQLSchema,
+  options: BackboneExecutorOptions = {},
+): BackboneExecutorOptions {
+  const stored = schema.extensions?.[BACKBONE_EXECUTOR_OPTIONS_EXTENSION] as
+    | BackboneExecutorOptions
+    | undefined;
+  return {
+    handleProgressiveOverride:
+      options.handleProgressiveOverride ?? stored?.handleProgressiveOverride,
+    overrideLabels:
+      options.overrideLabels ??
+      stored?.overrideLabels ??
+      (schema.extensions?.['overrideLabels'] as Iterable<string> | undefined),
+  };
+}
+
+/**
  * Install the stitching backbone on a schema:
  * - root Query/Mutation proxying resolvers (stock `graphql-js` execute → backbone)
  * - `schema.extensions.backboneExecutor` for gateway / direct execute
  *
  * Call on the **final** schema after any `mapSchema` transforms (federation
- * filter, `@pubsubPublish` wraps). Safe to call again to rebind.
+ * filter, `@pubsubPublish` wraps). Safe to call again to rebind; progressive
+ * override opts persist on `schema.extensions` so later re-attaches need no bag.
  */
 export function attachBackboneExecutor(
   schema: GraphQLSchema,
   options: BackboneExecutorOptions = {},
 ): GraphQLSchema {
-  const executor = createBackboneExecutor(schema, options);
+  const resolved = resolveBackboneExecutorOptions(schema, options);
+  const executor = createBackboneExecutor(schema, resolved);
   schema.extensions = {
     ...schema.extensions,
+    [BACKBONE_EXECUTOR_OPTIONS_EXTENSION]: resolved,
     [BACKBONE_EXECUTOR_EXTENSION]: executor,
   };
   return schema;

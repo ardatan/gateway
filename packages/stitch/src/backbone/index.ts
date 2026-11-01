@@ -3,6 +3,7 @@ export {
   BACKBONE_EXECUTOR_EXTENSION,
   getBackboneExecutor,
   markChangedRootResolvesAsLocal,
+  resolveBackboneExecutorOptions,
   snapshotRootFieldResolves,
 } from './attachBackboneExecutor.js';
 export { buildStitchPlan } from './buildStitchPlan.js';
@@ -15,9 +16,10 @@ export {
   getOriginalRootResolve,
   installRootProxyingResolvers,
 } from './rootProxyingResolvers.js';
-export type {
-  BackboneExecutorOptions,
-  BuildStitchPlanOptions,
-  StitchPlan,
-  StitchPlanNode,
+export {
+  BACKBONE_EXECUTOR_OPTIONS_EXTENSION,
+  type BackboneExecutorOptions,
+  type BuildStitchPlanOptions,
+  type StitchPlan,
+  type StitchPlanNode,
 } from './types.js';

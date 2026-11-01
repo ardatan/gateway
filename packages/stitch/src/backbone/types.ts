@@ -124,6 +124,8 @@ export interface BackboneExecutorOptions {
   /**
    * Progressive override label handler (gateway `progressiveOverride`).
    * Used for plan-cache keying when `overrideLabels` is also set.
+   * Persisted on `schema.extensions` so a post-`mapSchema` re-attach needs
+   * no options bag.
    */
   handleProgressiveOverride?: (
     label: string,
@@ -132,9 +134,13 @@ export interface BackboneExecutorOptions {
   /**
    * Known progressive-override labels from the supergraph. Combined with
    * `handleProgressiveOverride` + request context to cache plans per enabled set.
+   * Falls back to `schema.extensions.overrideLabels` when omitted.
    */
   overrideLabels?: Iterable<string>;
 }
+
+/** `schema.extensions` key for last-attached {@link BackboneExecutorOptions}. */
+export const BACKBONE_EXECUTOR_OPTIONS_EXTENSION = 'backboneExecutorOptions';
 
 /** Per-call inputs for `buildStitchPlan` (static opts + request context). */
 export interface BuildStitchPlanOptions extends BackboneExecutorOptions {
