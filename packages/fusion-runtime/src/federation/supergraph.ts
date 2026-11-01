@@ -29,7 +29,6 @@ import {
   TypeSource,
 } from '@graphql-tools/utils';
 import {
-  isEnumType,
   Kind,
   parse,
   visit,
@@ -37,11 +36,12 @@ import {
   type GraphQLSchema,
   type ObjectTypeDefinitionNode,
 } from 'graphql';
+import { wrapExecutorWithPubsubPublish } from '../pubsubPublish.js';
+import { getRealSubgraphNameMap } from '../realSubgraphNameMap.js';
 import type {
   UnifiedGraphHandlerOpts,
   UnifiedGraphHandlerResult,
 } from '../unifiedGraphManager';
-import { wrapExecutorWithPubsubPublish } from '../pubsubPublish.js';
 import {
   compareSubgraphNames,
   OnDelegationPlanDoneHook,
@@ -141,13 +141,6 @@ export function isSubgraphDeferEnabled(
   return false;
 }
 
-interface EnumDirectives {
-  [key: string]: any;
-  join__graph?: {
-    name: string;
-  };
-}
-
 // the @resolveTo directive definition, needed when additionalTypeDefs with @resolveTo are
 // provided only at the gateway level and were never composed into the supergraph SDL
 // TODO: same definition is also present in mesh, deduplicate and use the one from mesh
@@ -240,23 +233,7 @@ export const handleFederationSupergraph = function ({
   let subschemas: SubschemaConfig[] = [];
   const stitchingDirectivesTransformer =
     getStitchingDirectivesTransformerForSubschema();
-  // Workaround to get the real name of the subschema
-  const realSubgraphNameMap = new Map<string, string>();
-  const joinGraphType = unifiedGraph.getType('join__Graph');
-  if (isEnumType(joinGraphType)) {
-    for (const enumValue of joinGraphType.getValues()) {
-      const enumValueDirectives =
-        getDirectiveExtensions<EnumDirectives>(enumValue);
-      const joinGraphDirectives = enumValueDirectives?.join__graph;
-      if (joinGraphDirectives?.length) {
-        for (const joinGraphDirective of joinGraphDirectives) {
-          if (joinGraphDirective) {
-            realSubgraphNameMap.set(enumValue.name, joinGraphDirective.name);
-          }
-        }
-      }
-    }
-  }
+  const realSubgraphNameMap = getRealSubgraphNameMap(unifiedGraph);
 
   // register pubsub resolvers before stitching so local merged-type results get wrapped for hydration
   const subscriptionType = unifiedGraph.getSubscriptionType();

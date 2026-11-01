@@ -2,101 +2,132 @@ import {
   ExecutionRequest,
   ExecutionResult,
   Executor,
-  getDirectiveExtensions,
+  getDirectiveInExtensions,
   getOperationASTFromRequest,
   isAsyncIterable,
+  memoize2,
+  ResultVisitorMap,
+  ValueVisitor,
+  visitResult,
 } from '@graphql-tools/utils';
-import { handleMaybePromise, isPromise } from '@whatwg-node/promise-helpers';
-import {
-  GraphQLSchema,
-  isObjectType,
-  Kind,
-  type FieldNode,
-  type GraphQLField,
-} from 'graphql';
+import { handleMaybePromise } from '@whatwg-node/promise-helpers';
+import { getNamedType, GraphQLSchema, type SelectionSetNode } from 'graphql';
 
-type PubSubPublishArgs = { pubsubTopic: string };
+export interface PubsubPublishMetadata {
+  pubsubTopic: string;
+  entityInfo?: Record<string, SelectionSetNode>;
+}
 
 type PubSubLike = {
   publish: (topic: string, payload: unknown) => void | Promise<void>;
 };
 
 /**
- * Re-apply `@pubsubPublish` from Mutation result payloads. Backbone / direct
- * execute skips schema root resolvers, so publish must run as an executor
- * side effect (same role router-runtime's pubsub visitor plays).
+ * Collect `@pubsubPublish` fields. Optional `entityResolutionMap` attaches
+ * key selection sets (router query-plan path) for publish hydration.
  */
-export function applyPubsubPublishToResult(
+export function getPubsubPublishMetadata(
   schema: GraphQLSchema,
-  request: ExecutionRequest,
-  result: ExecutionResult,
-): ExecutionResult | Promise<ExecutionResult> {
-  if (result.data == null || result.data === undefined) {
-    return result;
-  }
-  const context = request.context as { pubsub?: PubSubLike } | undefined;
-  const pubsub = context?.pubsub;
-  if (!pubsub?.publish) {
-    return result;
-  }
-  if (!schema.getDirective('pubsubPublish')) {
-    return result;
-  }
-
-  const mutationType = schema.getMutationType();
-  if (!mutationType || !isObjectType(mutationType)) {
-    return result;
-  }
-
-  const operation = request.document.definitions.find(
-    (d) => d.kind === Kind.OPERATION_DEFINITION && d.operation === 'mutation',
-  );
-  if (!operation || operation.kind !== Kind.OPERATION_DEFINITION) {
-    return result;
-  }
-
-  const fields = mutationType.getFields();
-  const jobs: Array<Promise<void>> = [];
-
-  for (const sel of operation.selectionSet.selections) {
-    if (sel.kind !== Kind.FIELD || sel.name.value.startsWith('__')) {
+  entityResolutionMap: Map<
+    string,
+    Record<string, SelectionSetNode>
+  > = new Map(),
+) {
+  const pubsubPublishMetadataMap: Map<
+    string,
+    Map<string, PubsubPublishMetadata>
+  > = new Map();
+  for (const typeName in schema.getTypeMap()) {
+    const type = schema.getType(typeName);
+    if (type == null || !('getFields' in type)) {
       continue;
     }
-    const field: GraphQLField<any, any> | undefined = fields[sel.name.value];
-    if (!field) {
-      continue;
-    }
-    const directives = getDirectiveExtensions<{
-      pubsubPublish: PubSubPublishArgs;
-    }>(field, schema);
-    const publishes = directives.pubsubPublish;
-    if (!publishes?.length) {
-      continue;
-    }
-    const responseKey = fieldResponseKey(sel);
-    const payload = (result.data as Record<string, unknown>)[responseKey];
-    if (payload === undefined) {
-      continue;
-    }
-    for (const args of publishes) {
-      const job = pubsub.publish(args.pubsubTopic, payload);
-      if (isPromise(job)) {
-        jobs.push(
-          job.catch(() => {
-            // Swallow publish errors (same as router-runtime visitor).
-          }),
-        );
+    const fields = type.getFields();
+    for (const fieldName in fields) {
+      const fieldDef = fields[fieldName];
+      if (!fieldDef) {
+        continue;
+      }
+      const pubsubPublishes = getDirectiveInExtensions(
+        fieldDef,
+        'pubsubPublish',
+      );
+      if (!pubsubPublishes) {
+        continue;
+      }
+      for (const { pubsubTopic } of pubsubPublishes) {
+        let typeMap = pubsubPublishMetadataMap.get(typeName);
+        if (!typeMap) {
+          typeMap = new Map<string, PubsubPublishMetadata>();
+          pubsubPublishMetadataMap.set(typeName, typeMap);
+        }
+        const returnTypeName = getNamedType(fieldDef.type).name;
+        const entityInfo = entityResolutionMap.get(returnTypeName);
+        typeMap.set(fieldName, { pubsubTopic, entityInfo });
       }
     }
   }
+  return pubsubPublishMetadataMap;
+}
 
-  if (!jobs.length) {
+const getPubsubPublishVisitor = memoize2(function getPubsubPublishFields(
+  metadata: Map<string, Map<string, PubsubPublishMetadata>>,
+  pubsub: PubSubLike,
+) {
+  if (!metadata.size) {
+    return false as const;
+  }
+  const pubsubPublishVisitor: ResultVisitorMap = {};
+  for (const [typeName, fieldsMap] of metadata) {
+    const typeVisitor = (pubsubPublishVisitor[typeName] ||= {}) as Record<
+      string,
+      ValueVisitor
+    >;
+    for (const [fieldName, { pubsubTopic }] of fieldsMap) {
+      typeVisitor[fieldName] = (value) => {
+        const maybePromise = pubsub.publish(pubsubTopic, value);
+        if (
+          maybePromise &&
+          typeof (maybePromise as Promise<void>).catch === 'function'
+        ) {
+          (maybePromise as Promise<void>).catch(() => {
+            // Swallow publish errors to avoid unhandled promise rejections.
+          });
+        }
+        return value;
+      };
+    }
+  }
+  return pubsubPublishVisitor;
+});
+
+function isMutationRequest(request: ExecutionRequest): boolean {
+  if (request.operationType === 'mutation') {
+    return true;
+  }
+  return getOperationASTFromRequest(request)?.operation === 'mutation';
+}
+
+/**
+ * Walk a Mutation result and fire `@pubsubPublish` (visitResult over annotated
+ * fields). Used by fusion's executor wrap and router-runtime's plan path.
+ */
+export function handleResultWithPubSubPublish(
+  schema: GraphQLSchema,
+  metadata: Map<string, Map<string, PubsubPublishMetadata>>,
+  request: ExecutionRequest,
+  result: ExecutionResult,
+) {
+  const pubsub = (request.context as { pubsub?: PubSubLike } | undefined)
+    ?.pubsub;
+  if (!isMutationRequest(request) || result.data == null || pubsub == null) {
     return result;
   }
-  return handleMaybePromise(
-    () => Promise.all(jobs),
-    () => result,
-  );
+  const pubsubPublishVisitor = getPubsubPublishVisitor(metadata, pubsub);
+  if (pubsubPublishVisitor) {
+    return visitResult(result, request, schema, pubsubPublishVisitor);
+  }
+  return result;
 }
 
 /**
@@ -110,6 +141,7 @@ export function wrapExecutorWithPubsubPublish(
   if (!schema.getDirective('pubsubPublish')) {
     return executor;
   }
+  const metadata = getPubsubPublishMetadata(schema);
   return function pubsubPublishExecutor(request) {
     return handleMaybePromise(
       () => executor(request),
@@ -117,16 +149,8 @@ export function wrapExecutorWithPubsubPublish(
         if (isAsyncIterable(result)) {
           return result;
         }
-        const op = getOperationASTFromRequest(request);
-        if (op?.operation !== 'mutation') {
-          return result;
-        }
-        return applyPubsubPublishToResult(schema, request, result);
+        return handleResultWithPubSubPublish(schema, metadata, request, result);
       },
     );
   };
-}
-
-function fieldResponseKey(field: FieldNode): string {
-  return field.alias?.value ?? field.name.value;
 }
