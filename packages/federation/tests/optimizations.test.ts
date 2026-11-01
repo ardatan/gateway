@@ -133,9 +133,9 @@ describe('Optimizations', () => {
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
       // inventory: 1, (when computed fields definition removed)
-      // Classic keeps isolation clones → 2 hops. Backbone clone-less deferral
-      // needs one extra inventory hop for shippingEstimate self-reentry.
-      inventory: classic ? 2 : 3,
+      // Clone-less deferral needs an extra inventory hop for shippingEstimate
+      // self-reentry (both classic and backbone).
+      inventory: 3,
       products: 2,
       reviews: 2,
     });
