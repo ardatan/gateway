@@ -1,10 +1,9 @@
 import type { StitchingInfo, Subschema } from '@graphql-tools/delegate';
 import {
-  getVariableValues,
   handleOverrideByDelegation,
   leftOverByDelegationPlan,
 } from '@graphql-tools/delegate';
-import { collectFields, getDefinedRootType } from '@graphql-tools/utils';
+import { getDefinedRootType } from '@graphql-tools/utils';
 import {
   FieldNode,
   FragmentDefinitionNode,
@@ -27,7 +26,7 @@ import {
 import { isLocalField } from './localFields.js';
 import { preparePlanDocuments } from './preparePlanDocuments.js';
 import type {
-  BackboneExecutorOptions,
+  BuildStitchPlanOptions,
   PathSegment,
   StitchPlan,
   StitchPlanNode,
@@ -3492,7 +3491,7 @@ export function buildStitchPlan(
   operation: OperationDefinitionNode,
   fragments: Record<string, FragmentDefinitionNode>,
   variableValues: Record<string, any>,
-  options: BackboneExecutorOptions = {},
+  options: BuildStitchPlanOptions = {},
 ): StitchPlan {
   const incompleteReasons: string[] = [];
   const stitchingInfo = schema.extensions?.['stitchingInfo'] as
@@ -3512,15 +3511,11 @@ export function buildStitchPlan(
   // Subscriptions are routed to schema execute in createBackboneExecutor
   // (classic subscribe + type merging). Planning them here is unused.
 
-  const rootType = getDefinedRootType(schema, operation.operation);
-
   // Abstract / interface / union selections are planned (inline fragments on
   // root + entity hops on concrete members). Do not mark incomplete solely for
   // abstracts — Cast/Flatten gaps must fail at execute so we fix plan quality.
 
-  // Apply variable defaults so @skip/@include + collectFields evaluate safely.
-  // Plans that depend on directive variables are cached per coerced variable map
-  // in createBackboneExecutor.
+  // Apply variable defaults so @skip/@include evaluate safely.
   const coercedVariables = coerceOperationVariables(operation, variableValues);
 
   const previousPlanningContext = planningContext;
@@ -3535,8 +3530,6 @@ export function buildStitchPlan(
           operation,
           fragments,
           coercedVariables,
-          options,
-          rootType,
           incompleteReasons,
         );
       } catch {
@@ -3556,8 +3549,6 @@ export function buildStitchPlan(
       operation,
       fragments,
       coercedVariables,
-      options,
-      rootType,
       incompleteReasons,
     );
   } finally {
@@ -5582,85 +5573,44 @@ function buildCompletePlan(
   operation: OperationDefinitionNode,
   fragments: Record<string, FragmentDefinitionNode>,
   variableValues: Record<string, any>,
-  options: BackboneExecutorOptions,
-  rootType: GraphQLObjectType,
   incompleteReasons: string[],
 ): StitchPlan {
-  // Default on: one plan per document with Condition nodes. Opt out via
-  // `useConditionNodes: false` to keep legacy collectFields peel + var cache.
-  const useConditionNodes = options.useConditionNodes !== false;
-
   const rootNodes: StitchPlanNode[] = [];
 
-  if (useConditionNodes) {
-    // Include all skip/include selections while planning so the cached plan is
-    // valid for every variable map; subgraphs still see the directives.
-    const planVars = variablesForcingSkipIncludePresent(
-      operation,
-      fragments,
-      variableValues,
-    );
-    for (const fieldNode of collectRootFieldNodesPreservingSkipInclude(
-      operation.selectionSet,
-      fragments,
-    )) {
-      if (
-        fieldNode.name.value === '__schema' ||
-        fieldNode.name.value === '__type'
-      ) {
-        incompleteReasons.push('Introspection requires schema execute');
-        continue;
-      }
-      if (isUnconditionallyOmittedBySkipInclude(fieldNode)) {
-        continue;
-      }
-      // Condition decides the root field; strip only own directives so nested
-      // @skip/@include remain for subgraph evaluation / provides-scope.
-      const cleaned = stripOwnSkipIncludeDirectives(fieldNode);
-      const planned = planRootField(
-        schema,
-        stitchingInfo,
-        operation,
-        cleaned,
-        fragments,
-        planVars,
-        incompleteReasons,
-      );
-      rootNodes.push(wrapRootFieldWithConditions(fieldNode, planned));
+  // One plan per document: Condition nodes for `@skip`/`@include`. Include all
+  // conditional selections while planning; subgraphs still see the directives.
+  const planVars = variablesForcingSkipIncludePresent(
+    operation,
+    fragments,
+    variableValues,
+  );
+  for (const fieldNode of collectRootFieldNodesPreservingSkipInclude(
+    operation.selectionSet,
+    fragments,
+  )) {
+    if (
+      fieldNode.name.value === '__schema' ||
+      fieldNode.name.value === '__type'
+    ) {
+      incompleteReasons.push('Introspection requires schema execute');
+      continue;
     }
-  } else {
-    const { fields } = collectFields(
+    if (isUnconditionallyOmittedBySkipInclude(fieldNode)) {
+      continue;
+    }
+    // Condition decides the root field; strip only own directives so nested
+    // @skip/@include remain for subgraph evaluation / provides-scope.
+    const cleaned = stripOwnSkipIncludeDirectives(fieldNode);
+    const planned = planRootField(
       schema,
+      stitchingInfo,
+      operation,
+      cleaned,
       fragments,
-      getVariableValues(variableValues),
-      rootType,
-      operation.selectionSet,
+      planVars,
+      incompleteReasons,
     );
-
-    for (const [, fieldNodes] of fields) {
-      const fieldNode = fieldNodes[0];
-      if (!fieldNode) {
-        continue;
-      }
-      if (
-        fieldNode.name.value === '__schema' ||
-        fieldNode.name.value === '__type'
-      ) {
-        incompleteReasons.push('Introspection requires schema execute');
-        continue;
-      }
-      rootNodes.push(
-        planRootField(
-          schema,
-          stitchingInfo,
-          operation,
-          fieldNode,
-          fragments,
-          variableValues,
-          incompleteReasons,
-        ),
-      );
-    }
+    rootNodes.push(wrapRootFieldWithConditions(fieldNode, planned));
   }
 
   if (!rootNodes.length && incompleteReasons.length === 0) {

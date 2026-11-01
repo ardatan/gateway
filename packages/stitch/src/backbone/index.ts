@@ -6,6 +6,7 @@ export { projectDataToOperation } from './projectResult.js';
 export { BACKBONE_EXECUTING, installRootTrampoline } from './rootTrampoline.js';
 export type {
   BackboneExecutorOptions,
+  BuildStitchPlanOptions,
   StitchPlan,
   StitchPlanNode,
 } from './types.js';

@@ -297,8 +297,7 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
       fields.add(fieldName);
     }
   }
-  // Persist for the backbone planner (Island nodes) — no need to pass via
-  // createBackboneExecutor options.
+  // Persist for the backbone planner (Island nodes).
   stitchingInfo.localFields = localFields;
 
   for (const [typeName, fieldNames] of localFields) {
