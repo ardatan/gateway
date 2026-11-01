@@ -14,10 +14,8 @@ import type {
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
 import {
-  BACKBONE_EXECUTOR_EXTENSION,
   createMergedTypeResolver,
   getBackboneExecutor,
-  installRootProxyingResolvers,
 } from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
@@ -449,19 +447,12 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  const backboneExecutor = getBackboneExecutor(executableUnifiedGraph)!;
+  // Gateway runs this executor; root proxying already targets the backbone —
+  // only wrap the returned handle for @pubsubPublish, don't rebind proxying.
   const executor = wrapExecutorWithPubsubPublish(
     executableUnifiedGraph,
-    backboneExecutor,
+    getBackboneExecutor(executableUnifiedGraph)!,
   );
-  if (executor !== backboneExecutor) {
-    // Keep schema.execute (root proxying) and extensions on the same wrap.
-    executableUnifiedGraph.extensions = {
-      ...executableUnifiedGraph.extensions,
-      [BACKBONE_EXECUTOR_EXTENSION]: executor,
-    };
-    installRootProxyingResolvers(executableUnifiedGraph, executor);
-  }
 
   return {
     unifiedGraph: executableUnifiedGraph,
