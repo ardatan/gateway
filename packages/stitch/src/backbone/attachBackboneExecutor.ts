@@ -102,9 +102,11 @@ export function resolveBackboneExecutorOptions(
  * - root Query/Mutation proxying resolvers (stock `graphql-js` execute → backbone)
  * - `schema.extensions.backboneExecutor` for gateway / direct execute
  *
- * Call on the **final** schema after any `mapSchema` transforms (federation
- * filter, `@pubsubPublish` wraps). Safe to call again to rebind; progressive
- * override opts persist on `schema.extensions` so later re-attaches need no bag.
+ * Call on the **final** schema after any `mapSchema` transforms that yield a
+ * new schema instance (e.g. federation filter). Safe to call again to rebind;
+ * progressive override opts persist on `schema.extensions` so later
+ * re-attaches need no bag. Prefer backbone `applyPubsubPublishToResult` over
+ * wrapping Mutation fields with another `mapSchema`.
  */
 export function attachBackboneExecutor(
   schema: GraphQLSchema,

@@ -1,5 +1,5 @@
 import { LegacyLogger, Logger } from '@graphql-hive/logger';
-import { HivePubSub, type YamlConfig } from '@graphql-mesh/types';
+import type { YamlConfig } from '@graphql-mesh/types';
 import {
   getInContextSDK,
   getResolverForPubSubOperation,
@@ -14,9 +14,7 @@ import type {
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
 import {
-  attachBackboneExecutor,
   createMergedTypeResolver,
-  defaultMergedResolver,
   getBackboneExecutor,
 } from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
@@ -30,7 +28,6 @@ import {
   memoize1,
   TypeSource,
 } from '@graphql-tools/utils';
-import { handleMaybePromise, isPromise } from '@whatwg-node/promise-helpers';
 import {
   isEnumType,
   Kind,
@@ -434,45 +431,9 @@ export const handleFederationSupergraph = function ({
       }
     }
   }
-  if (executableUnifiedGraph.getDirective('pubsubPublish')) {
-    executableUnifiedGraph = mapSchema(executableUnifiedGraph, {
-      [MapperKind.ROOT_FIELD](fieldConfig) {
-        const directiveExtensions = getDirectiveExtensions<{
-          pubsubPublish: PubSubOperationOptions;
-        }>(fieldConfig, executableUnifiedGraph);
-        if (directiveExtensions.pubsubPublish?.length) {
-          const originalResolve = fieldConfig.resolve || defaultMergedResolver;
-          fieldConfig.resolve = function (
-            root,
-            args,
-            context: { pubsub?: HivePubSub },
-            info,
-          ) {
-            return handleMaybePromise(
-              () => originalResolve(root, args, context, info),
-              (payload) => {
-                const jobs: Promise<void>[] = [];
-                for (const pubsubPublishArgs of directiveExtensions.pubsubPublish!) {
-                  const job = context.pubsub?.publish(
-                    pubsubPublishArgs.pubsubTopic,
-                    payload,
-                  );
-                  if (isPromise(job)) {
-                    jobs.push(job);
-                  }
-                }
-                if (jobs.length) {
-                  return Promise.all(jobs).then(() => payload);
-                }
-                return payload;
-              },
-            );
-          };
-        }
-        return fieldConfig;
-      },
-    });
-  }
+  // @pubsubPublish side effects run in the backbone via applyPubsubPublishToResult
+  // (direct execute skips root resolvers). Do not mapSchema-wrap Mutation fields
+  // here — that replaces the schema object and drops the attached executor.
   function getSubschema(subgraphName: string): SubschemaConfig {
     const subgraph = subschemas.find(
       (s) => s.name && compareSubgraphNames(s.name, subgraphName),
@@ -486,10 +447,6 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  // mapSchema (@pubsubPublish) yields a new schema object — re-bind proxying
-  // resolvers. Progressive-override opts already live on schema.extensions
-  // from getStitchedSchemaFromSupergraphSdl's attach.
-  attachBackboneExecutor(executableUnifiedGraph);
   const executor = getBackboneExecutor(executableUnifiedGraph)!;
 
   return {
