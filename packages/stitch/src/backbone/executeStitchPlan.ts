@@ -44,7 +44,7 @@ import {
   VariableDefinitionNode,
   visit,
 } from 'graphql';
-import { BACKBONE_EXECUTING } from './rootTrampoline.js';
+import { BACKBONE_EXECUTING } from './rootProxyingResolvers.js';
 import type {
   BackboneExecutionContext,
   PathSegment,
@@ -1919,7 +1919,7 @@ export function executeStitchPlan(
     request.context != null && typeof request.context === 'object'
       ? request.context
       : Object.create(null);
-  // Let root trampoline know Island resolvers must use original resolves.
+  // Let root proxying resolvers know Island resolvers must use originals.
   (contextValue as any)[BACKBONE_EXECUTING] = true;
 
   const ctx: BackboneExecutionContext = {

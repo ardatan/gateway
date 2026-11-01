@@ -74,7 +74,7 @@ export function markChangedRootResolvesAsLocal(
 
 /**
  * Install the stitching backbone on a schema:
- * - root Query/Mutation trampoline (stock `graphql-js` execute → backbone)
+ * - root Query/Mutation proxying resolvers (stock `graphql-js` execute → backbone)
  * - `schema.extensions.backboneExecutor` for gateway / direct execute
  *
  * Call on the **final** schema after any `mapSchema` transforms (federation

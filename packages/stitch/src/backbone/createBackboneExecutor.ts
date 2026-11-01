@@ -17,7 +17,7 @@ import {
 import { executeStitchPlan } from './executeStitchPlan.js';
 import { projectDataToOperation } from './projectResult.js';
 import { applyPubsubPublishToResult } from './pubsubPublish.js';
-import { installRootTrampoline } from './rootTrampoline.js';
+import { installRootProxyingResolvers } from './rootProxyingResolvers.js';
 import type { BackboneExecutorOptions, StitchPlan } from './types.js';
 
 /** Full SDL introspection — schema execute (Hive also special-cases these). */
@@ -85,10 +85,10 @@ export function createBackboneExecutor(
     Map<string | null, StitchPlan>
   >();
 
-  // Trampoline: stock graphql-js execute → this executor. Prefer
+  // Root proxying resolvers: stock graphql-js execute → this executor. Prefer
   // `attachBackboneExecutor` so the executor also lands on schema.extensions;
   // safe to call again after mapSchema on the final schema object.
-  installRootTrampoline(schema, (request) =>
+  installRootProxyingResolvers(schema, (request) =>
     stitchingBackboneExecutor(request),
   );
 

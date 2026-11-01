@@ -32,7 +32,7 @@ import {
   specifiedDirectives,
 } from 'graphql';
 import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
-import { BACKBONE_EXECUTING } from './backbone/rootTrampoline.js';
+import { BACKBONE_EXECUTING } from './backbone/rootProxyingResolvers.js';
 import { defaultMergedResolver } from './defaultMergedResolver.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
 import {
@@ -157,7 +157,7 @@ export function stitchSchemas<
     applyExtensions(schema, mergedSchemaExtensions);
   }
 
-  // Backbone executor + root trampoline on the stitched schema. Callers that
+  // Backbone executor + root proxying resolvers on the stitched schema. Callers that
   // mapSchema afterward (federation filter, @pubsubPublish) must re-attach.
   return attachBackboneExecutor(schema);
 }
