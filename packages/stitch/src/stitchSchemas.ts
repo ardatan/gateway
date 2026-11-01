@@ -414,9 +414,7 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
   }
 }
 
-// Clone-less computed deferral + entrypoint split for both classic and
-// backbone. Isolation clones (isolateComputedFieldsTransformer) remain
-// available for callers that opt in via subschemaConfigTransforms.
+// Clone-less computed deferral + entrypoint split (isolation clones removed).
 const computedFieldPresets: Array<SubschemaConfigTransform<any>> = [
   deferComputedFieldsTransformer,
   splitMergedTypeEntryPointsTransformer,
@@ -493,11 +491,6 @@ function prepareStitchingData<TContext extends Record<string, any>>(
   const subschemaMap = new Map();
   const originalSubschemaMap = new Map();
 
-  // Clone-less deferral + field-level @requires (fetched-fields gate) for
-  // both classic and backbone. Classic leftover drain settles unsatisfiable
-  // deferreds; see requires-with-fragments.
-  const cloneLessComputed = true;
-
   for (const subschema of subschemas) {
     for (const transformedSubschemaConfig of applySubschemaConfigTransforms(
       subschemaConfigTransforms,
@@ -531,7 +524,6 @@ function prepareStitchingData<TContext extends Record<string, any>>(
     subschemaMap,
     typeCandidates,
     mergeTypes,
-    { cloneLessComputed },
   );
 
   const { typeMap: newTypeMap, directives: newDirectives } = buildTypes({

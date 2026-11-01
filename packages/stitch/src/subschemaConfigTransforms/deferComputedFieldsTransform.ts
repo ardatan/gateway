@@ -31,8 +31,7 @@ import {
  *
  * When a computed field is stripped, inject the type's merge-key fields
  * (`@key` / `selectionSet`) so the parent still carries identity for later
- * leftover hops — isolation used to get this via prepareGatewayDocument's
- * unsatisfied-selection path.
+ * leftover hops.
  */
 export class DeferComputedFieldsTransform<TContext = Record<string, any>>
   implements Transform<Record<string, any>, TContext>

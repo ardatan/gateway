@@ -31,13 +31,8 @@ import {
   optimizeDelegationMap,
 } from './delegationPlanOptimize.js';
 import { getFieldsNotInSubschema } from './getFieldsNotInSubschema.js';
-import { memoize5of7 } from './memoize5of7.js';
 
-export {
-  optimizeDelegationMap,
-  subschemaForUnionedIsolationHop,
-  subschemaWithoutIsolationStripTransforms,
-} from './delegationPlanOptimize.js';
+export { optimizeDelegationMap } from './delegationPlanOptimize.js';
 
 function calculateDelegationStage(
   mergedTypeInfo: MergedTypeInfo,
@@ -48,10 +43,9 @@ function calculateDelegationStage(
   context: any | undefined,
   info: GraphQLResolveInfo | undefined,
   stitchingInfo: StitchingInfo | undefined,
-  fieldLevelRequires: boolean,
   /**
-   * Initial sources for this plan. Under clone-less, their full schemas count
-   * as available. Later-stage sources only contribute fields listed in
+   * Initial sources for this plan. Their full schemas count as available.
+   * Later-stage sources only contribute fields listed in
    * `fetchedFieldsByType` (what prior stages actually selected).
    */
   initialSourceSubschemas: Array<Subschema> = sourceSubschemas,
@@ -65,16 +59,12 @@ function calculateDelegationStage(
   const { selectionSets, fieldSelectionSets, uniqueFields, nonUniqueFields } =
     mergedTypeInfo;
 
-  // 1. calculate if possible to delegate to given subschema
-  // Clone-less: type-level merge-key only; field @requires checked per field.
-  // Classic/isolation: also gate on whole-subschema fieldSelectionSets.
-
+  // Type-level merge-key only; field @requires checked per field below.
   const proxiableSubschemas: Array<Subschema> = [];
   const nonProxiableSubschemas: Array<Subschema> = [];
 
   for (const t of targetSubschemas) {
     const selectionSet = selectionSets.get(t);
-    const fieldSelectionSetsMap = fieldSelectionSets.get(t);
     if (
       selectionSet != null &&
       !subschemaTypesContainSelectionSet(
@@ -82,23 +72,6 @@ function calculateDelegationStage(
         sourceSubschemas,
         selectionSet,
       )
-    ) {
-      nonProxiableSubschemas.push(t);
-    } else if (
-      !fieldLevelRequires &&
-      fieldSelectionSetsMap != null &&
-      !fieldNodes.every((fieldNode) => {
-        const fieldName = fieldNode.name.value;
-        const fieldSelectionSet = fieldSelectionSetsMap[fieldName];
-        return (
-          fieldSelectionSet == null ||
-          subschemaTypesContainSelectionSet(
-            mergedTypeInfo,
-            sourceSubschemas,
-            fieldSelectionSet,
-          )
-        );
-      })
     ) {
       nonProxiableSubschemas.push(t);
     } else {
@@ -112,15 +85,10 @@ function calculateDelegationStage(
     target: Subschema,
     fieldName: string,
   ): boolean {
-    if (!fieldLevelRequires) {
-      return true;
-    }
     const fieldSelectionSet = fieldSelectionSets.get(target)?.[fieldName];
     if (fieldSelectionSet == null) {
       return true;
     }
-    // Isolation clones: schema membership of growing sources ≈ availability.
-    // Clone-less: only initial-source schemas + fields prior stages selected.
     return selectionSetAvailableCloneLess(
       mergedTypeInfo,
       initialSourceSubschemas,
@@ -241,16 +209,14 @@ function calculateDelegationStage(
       continue;
     }
 
-    // Circular @requires: when every source still has unsatisfied field
-    // deps for this field, defer and retry via leftover (requires-circular).
-    const sourcesWithUnsatisfiedDependencies = (
-      fieldLevelRequires ? initialSourceSubschemas : sourceSubschemas
-    ).filter((s) => {
-      const req = fieldSelectionSets.get(s)?.[fieldName];
-      if (req == null) {
-        return false;
-      }
-      if (fieldLevelRequires) {
+    // Circular @requires: when every initial source still has unsatisfied
+    // field deps for this field, defer and retry via leftover.
+    const sourcesWithUnsatisfiedDependencies = initialSourceSubschemas.filter(
+      (s) => {
+        const req = fieldSelectionSets.get(s)?.[fieldName];
+        if (req == null) {
+          return false;
+        }
         return !selectionSetAvailableCloneLess(
           mergedTypeInfo,
           initialSourceSubschemas,
@@ -258,13 +224,8 @@ function calculateDelegationStage(
           req,
           mergedTypeInfo.typeName,
         );
-      }
-      return !subschemaTypesContainSelectionSet(
-        mergedTypeInfo,
-        sourceSubschemas,
-        req,
-      );
-    });
+      },
+    );
     if (sourcesWithUnsatisfiedDependencies.length === sourceSubschemas.length) {
       unproxiableFieldNodes.push(fieldNode);
       for (const source of sourcesWithUnsatisfiedDependencies) {
@@ -316,26 +277,20 @@ function calculateDelegationStage(
         proxiableSubschemas.includes(s) && fieldRequiresSatisfied(s, fieldName),
     );
     if (!nonUniqueSubschemas.length) {
-      if (fieldLevelRequires) {
-        // Candidates that failed only on field-requires stay non-proxiable so a
-        // later stage can retry after deps land (self-target computed re-entry).
-        const requireDeferred = nonUniqueFields[fieldNode.name.value]!.filter(
-          (s) => proxiableSubschemas.includes(s),
-        );
-        if (requireDeferred.length) {
-          for (const t of requireDeferred) {
-            scheduleRequiresFetch(t, fieldName);
-            if (!nonProxiableSubschemas.includes(t)) {
-              nonProxiableSubschemas.push(t);
-            }
+      // Candidates that failed only on field-requires stay non-proxiable so a
+      // later stage can retry after deps land (self-target computed re-entry).
+      const requireDeferred = nonUniqueFields[fieldNode.name.value]!.filter(
+        (s) => proxiableSubschemas.includes(s),
+      );
+      if (requireDeferred.length) {
+        for (const t of requireDeferred) {
+          scheduleRequiresFetch(t, fieldName);
+          if (!nonProxiableSubschemas.includes(t)) {
+            nonProxiableSubschemas.push(t);
           }
-          unproxiableFieldNodes.push(fieldNode);
-        } else {
-          unproxiableFieldNodes.push(fieldNode);
         }
-      } else {
-        unproxiableFieldNodes.push(fieldNode);
       }
+      unproxiableFieldNodes.push(fieldNode);
       continue;
     }
 
@@ -525,9 +480,7 @@ function getStitchingInfo(schema: GraphQLSchema): StitchingInfo {
 
 export function createDelegationPlanBuilder(
   mergedTypeInfo: MergedTypeInfo,
-  options?: { fieldLevelRequires?: boolean },
 ): DelegationPlanBuilder {
-  const fieldLevelRequires = options?.fieldLevelRequires === true;
   mergedTypeInfo.nonMemoizedDelegationPlanBuilder =
     function delegationPlanBuilder(
       schema: GraphQLSchema,
@@ -587,9 +540,8 @@ export function createDelegationPlanBuilder(
       let sourceSubschemas = createSubschemas(sourceSubschema);
       const initialSourceSubschemas = sourceSubschemas;
       const fetchedFieldsByType: Map<string, Set<string>> = new Map();
-      // Resolve-time mergeFields: fields already on the ExternalObject (e.g.
-      // requires deps injected into an earlier root hop) count as fetched.
-      if (fieldLevelRequires && parent != null) {
+      // Fields already on the ExternalObject count as fetched.
+      if (parent != null) {
         seedFetchedFieldsFromParent(
           fetchedFieldsByType,
           typeName,
@@ -599,7 +551,8 @@ export function createDelegationPlanBuilder(
         );
       }
 
-      let delegationStage = calculateDelegationStage(        mergedTypeInfo,
+      let delegationStage = calculateDelegationStage(
+        mergedTypeInfo,
         sourceSubschemas,
         targetSubschemas,
         fieldsNotInSubschema,
@@ -607,7 +560,6 @@ export function createDelegationPlanBuilder(
         context,
         info,
         stitchingInfo,
-        fieldLevelRequires,
         initialSourceSubschemas,
         fetchedFieldsByType,
       );
@@ -643,7 +595,6 @@ export function createDelegationPlanBuilder(
           context,
           info,
           stitchingInfo,
-          fieldLevelRequires,
           initialSourceSubschemas,
           fetchedFieldsByType,
         );
@@ -741,29 +692,8 @@ export function createDelegationPlanBuilder(
       }
       return delegationMaps;
     };
-  const memoized = memoize5of7(function wrappedDelegationPlanBuilder(
-    schema: GraphQLSchema,
-    sourceSubschema: Subschema<any, any, any, any>,
-    variableValues: Record<string, any>,
-    fragments: Record<string, FragmentDefinitionNode>,
-    fieldNodes: FieldNode[],
-    context?: any,
-    info?: GraphQLResolveInfo,
-  ) {
-    return mergedTypeInfo.nonMemoizedDelegationPlanBuilder(
-      schema,
-      sourceSubschema,
-      variableValues,
-      fragments,
-      fieldNodes,
-      context,
-      info,
-    );
-  });
-  // Clone-less plans depend on parent field presence; never memoize.
-  return fieldLevelRequires
-    ? mergedTypeInfo.nonMemoizedDelegationPlanBuilder
-    : memoized;
+  // Plans depend on parent field presence; never memoize.
+  return mergedTypeInfo.nonMemoizedDelegationPlanBuilder;
 }
 
 function seedFetchedFieldsFromParent(
@@ -975,7 +905,7 @@ function typesContainSelectionSet(
  * Clone-less @requires availability: fields on the *initial* source schemas
  * count as present (object came from there), plus fields prior plan stages
  * actually selected. Later-stage sibling fields on the same Subschema do not
- * count until fetched — that is what isolation clones used to enforce.
+ * count until fetched.
  */
 function selectionSetAvailableCloneLess(
   mergedTypeInfo: MergedTypeInfo,

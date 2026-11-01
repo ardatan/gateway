@@ -45,13 +45,8 @@ export function createStitchingInfo<
   >,
   typeCandidates: Record<string, Array<MergeTypeCandidate<TContext>>>,
   mergeTypes?: boolean | Array<string> | MergeTypeFilter<TContext>,
-  options?: { cloneLessComputed?: boolean },
 ): StitchingInfo<TContext> {
-  const mergedTypes = createMergedTypes(
-    typeCandidates,
-    mergeTypes,
-    options?.cloneLessComputed === true,
-  );
+  const mergedTypes = createMergedTypes(typeCandidates, mergeTypes);
 
   return {
     subschemaMap,
@@ -68,7 +63,6 @@ function createMergedTypes<
 >(
   typeCandidates: Record<string, Array<MergeTypeCandidate<TContext>>>,
   mergeTypes?: boolean | Array<string> | MergeTypeFilter<TContext>,
-  cloneLessComputed = false,
 ): Record<string, MergedTypeInfo<TContext>> {
   const mergedTypes: Record<string, MergedTypeInfo<TContext>> = Object.create(
     null,
@@ -324,13 +318,10 @@ function createMergedTypes<
         > = new Map();
         if (sourceSubschemas) {
           for (const subschema of sourceSubschemas) {
-            // Clone-less: a subschema that owns computed / field-@requires
-            // fields must be allowed as its own merge target so
-            // shippingEstimate can re-enter after deps land. Isolation clones
-            // already provide a second identity, so classic keeps the
-            // source !== target filter.
+            // Subschemas that own computed / field-@requires fields must be
+            // allowed as their own merge target so shippingEstimate can
+            // re-enter after deps land.
             const ownsComputedOrRequires =
-              cloneLessComputed &&
               fieldSelectionSets.get(subschema) != null &&
               Object.keys(fieldSelectionSets.get(subschema)!).length > 0;
             const filteredSubschemas = ownsComputedOrRequires
@@ -358,7 +349,6 @@ function createMergedTypes<
 
         mergedTypeConfig.delegationPlanBuilder = createDelegationPlanBuilder(
           mergedTypeConfig as MergedTypeInfo,
-          { fieldLevelRequires: cloneLessComputed },
         );
 
         if (hasOverrides) {

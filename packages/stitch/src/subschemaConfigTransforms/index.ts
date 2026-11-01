@@ -1,4 +1,3 @@
-export { isolateComputedFieldsTransformer } from './isolateComputedFieldsTransformer.js';
 export {
   deferComputedFieldsTransformer,
   DeferComputedFieldsTransform,

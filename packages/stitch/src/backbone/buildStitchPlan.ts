@@ -131,8 +131,8 @@ function rootTypeOf(
 }
 
 /**
- * Every Subschema clone known to stitching — `subschemaMap` only holds the
- * first isolation clone (computed), while base clones live on mergedTypes.
+ * Every Subschema known to stitching — `subschemaMap` holds the primary
+ * entry; entry-point splits also appear on mergedTypes.
  */
 function allKnownSubschemas(stitchingInfo: StitchingInfo): Subschema[] {
   const seen = new Set<Subschema>();
@@ -187,11 +187,8 @@ function findOwningSubschemasForRootField(
       transformedOwners.push(subschema);
       return;
     }
-    // Isolation clones keep the field on the raw schema while stripping it
-    // from transformedSchema. Prefer transformed owners when any exist so we
-    // do not root-Fetch through a computed-only clone (empty op after
-    // delegateToSchema). Fall back to raw for rare cases where transforms
-    // drop a still-executable root field (e.g. @interfaceObject).
+    // Fall back to raw when transforms drop a still-executable root field
+    // (e.g. @interfaceObject).
     const rawRoot = rootTypeOf(subschema.schema, operation);
     if (rawRoot?.getFields()[fieldName] != null) {
       rawOnlyOwners.push(subschema);
@@ -203,8 +200,7 @@ function findOwningSubschemasForRootField(
   if (transformedOwners.length) {
     return transformedOwners;
   }
-  // `subschemaMap` only stores the first isolation clone (computed). When that
-  // clone has no transformed root field, scan mergedTypes for the base clone.
+  // Entry-point splits may live only on mergedTypes — scan those next.
   const seen = new Set(stitchingInfo.subschemaMap.values());
   for (const subschema of allKnownSubschemas(stitchingInfo)) {
     if (seen.has(subschema)) {
@@ -233,8 +229,7 @@ function fieldAvailableOnSubschema(
   if (providedFieldNames?.has(fieldName)) {
     return true;
   }
-  // Prefer transformedSchema. Only fall back to raw when the *type* is absent
-  // there (not when the field is stripped by isolation clones).
+  // Prefer transformedSchema; fall back to raw when the type is absent there.
   const transformed = subschema.transformedSchema.getType(typeName);
   if (transformed && 'getFields' in transformed) {
     return (transformed as GraphQLObjectType).getFields()[fieldName] != null;
@@ -3641,10 +3636,7 @@ function pathsEqual(a: PathSegment[], b: PathSegment[]): boolean {
   return a.length === b.length && a.every((seg, i) => seg === b[i]);
 }
 
-/**
- * Locate merge field config across computed-isolation Subschema clones that
- * share a name but split `merge.fields` (e.g. shippingEstimate vs EUR).
- */
+/** Locate merge field config on this subschema (or same-name entry splits). */
 function findMergeFieldConfig(
   stitchingInfo: StitchingInfo,
   subschema: Subschema,
@@ -3937,9 +3929,8 @@ function tryUnionEntityFetches(
 }
 
 /**
- * Pick the Subschema clone whose merge.fields covers computed/@requires
- * fields in the unioned selection (isolateComputedFieldsTransformer splits
- * these onto a dedicated clone).
+ * Pick the Subschema whose merge.fields covers computed/@requires fields in
+ * the unioned selection (same-name entry-point splits).
  */
 function resolveSubschemaForUnion(
   stitchingInfo: StitchingInfo,
@@ -6082,8 +6073,7 @@ function groupParallelBatchFetches(
     return { kind: 'Parallel', nodes: children };
   }
 
-  // Group by subgraph name so isolation clones (inStock vs shippingEstimate)
-  // of the same upstream collapse together.
+  // Group by subgraph name so same-upstream hops collapse together.
   const bySub = new Map<string, typeof entityFetches>();
   for (const f of entityFetches) {
     const key = f.subschema.name ?? String(entityTypeKey(f));
