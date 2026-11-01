@@ -12,11 +12,11 @@ import {
   type SelectionNode,
 } from 'graphql';
 
-const TRAMPOLINE_INSTALLED = Symbol.for(
-  'graphql-tools.stitch.backboneTrampoline',
+const PROXYING_INSTALLED = Symbol.for(
+  'graphql-tools.stitch.backboneRootProxying',
 );
 
-/** Set on context while backbone execute runs so root Islands skip trampoline. */
+/** Set on context while backbone execute runs so root Islands skip proxying. */
 export const BACKBONE_EXECUTING = Symbol.for(
   'graphql-tools.stitch.backboneExecuting',
 );
@@ -50,20 +50,22 @@ function selectionHasDeferOrStream(
 }
 
 /**
- * Replace Query/Mutation root field resolvers so stock graphql-js `execute`
- * runs the backbone plan once per operation, then returns cached root values.
+ * Install root Query/Mutation proxying resolvers so stock graphql-js `execute`
+ * proxies once into the backbone plan, then returns cached root values —
+ * same idea as wrapSchema's proxying resolvers, but the target is the
+ * backbone executor rather than a single subgraph.
  * Subscription roots are left alone (schema subscribe / backbone schema path).
  */
-export function installRootTrampoline(
+export function installRootProxyingResolvers(
   schema: GraphQLSchema,
   runBackbone: Executor,
 ): void {
-  // Idempotent re-attach: after mapSchema / option changes, rebind trampoline
-  // to the new executor without nesting (always wrap the pre-trampoline resolve).
-  (schema as any)[TRAMPOLINE_INSTALLED] = true;
+  // Idempotent re-attach: after mapSchema / option changes, rebind proxying
+  // to the new executor without nesting (always wrap the pre-proxy resolve).
+  (schema as any)[PROXYING_INSTALLED] = true;
 
-  const CONTEXT_PLAN_RESULT = Symbol('backboneTrampolineResult');
-  const CONTEXT_PLAN_PROMISE = Symbol('backboneTrampolinePromise');
+  const CONTEXT_PLAN_RESULT = Symbol('backboneRootProxyResult');
+  const CONTEXT_PLAN_PROMISE = Symbol('backboneRootProxyPromise');
 
   for (const op of ['query', 'mutation'] as const) {
     const rootType =
@@ -79,7 +81,7 @@ export function installRootTrampoline(
         field.resolve ??
         defaultFieldResolver;
       (field as any)[ORIGINAL_RESOLVE] = previousResolve;
-      field.resolve = function backboneRootTrampoline(
+      field.resolve = function backboneRootProxyingResolver(
         root,
         args,
         context,
@@ -95,7 +97,7 @@ export function installRootTrampoline(
         }
         // @defer/@stream: classic incremental execute. The backbone executor
         // falls back to schemaExecutor for these, which would re-enter this
-        // trampoline and recurse forever if we ran the plan here.
+        // proxy and recurse forever if we ran the plan here.
         if (
           info?.operation?.selectionSet &&
           (selectionHasDeferOrStream(info.operation.selectionSet.selections) ||
@@ -159,7 +161,7 @@ export function installRootTrampoline(
   }
 }
 
-/** Original root resolver before trampoline (for tests / debugging). */
+/** Original root resolver before backbone proxying (for tests / debugging). */
 export function getOriginalRootResolve(field: {
   resolve?: GraphQLFieldResolver<any, any>;
 }): GraphQLFieldResolver<any, any> | undefined {
