@@ -6,11 +6,10 @@ import {
   PubSubOperationOptions,
   resolveAdditionalResolversWithoutImport,
 } from '@graphql-mesh/utils';
-import {
-  defaultMergedResolver,
-  type DelegationPlanBuilder,
-  type StitchingInfo,
-  type SubschemaConfig,
+import type {
+  DelegationPlanBuilder,
+  StitchingInfo,
+  SubschemaConfig,
 } from '@graphql-tools/delegate';
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
@@ -18,6 +17,7 @@ import {
   attachBackboneExecutor,
   createMergedTypeResolver,
   getBackboneExecutor,
+  stitchedDefaultFieldResolver,
 } from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
@@ -441,7 +441,8 @@ export const handleFederationSupergraph = function ({
           pubsubPublish: PubSubOperationOptions;
         }>(fieldConfig, executableUnifiedGraph);
         if (directiveExtensions.pubsubPublish?.length) {
-          const originalResolve = fieldConfig.resolve || defaultMergedResolver;
+          const originalResolve =
+            fieldConfig.resolve || stitchedDefaultFieldResolver;
           fieldConfig.resolve = function (
             root,
             args,
