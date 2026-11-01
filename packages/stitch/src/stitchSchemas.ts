@@ -45,7 +45,6 @@ import {
 } from './stitchingInfo.js';
 import {
   deferComputedFieldsTransformer,
-  isolateComputedFieldsTransformer,
   splitMergedTypeEntryPointsTransformer,
 } from './subschemaConfigTransforms/index.js';
 import { buildTypeCandidates, buildTypes } from './typeCandidates.js';
@@ -415,15 +414,11 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
   }
 }
 
-// Backbone (default): clone-less computed deferral + entrypoint split.
-// Classic: keep isolation clones — resolve-time mergeFields leftovers still
-// need a second Subschema identity for circular / nested @requires.
-const backboneComputedPresets: Array<SubschemaConfigTransform<any>> = [
+// Clone-less computed deferral + entrypoint split for both classic and
+// backbone. Isolation clones (isolateComputedFieldsTransformer) remain
+// available for callers that opt in via subschemaConfigTransforms.
+const computedFieldPresets: Array<SubschemaConfigTransform<any>> = [
   deferComputedFieldsTransformer,
-  splitMergedTypeEntryPointsTransformer,
-];
-const classicComputedPresets: Array<SubschemaConfigTransform<any>> = [
-  isolateComputedFieldsTransformer,
   splitMergedTypeEntryPointsTransformer,
 ];
 
@@ -440,7 +435,6 @@ function applySubschemaConfigTransforms<TContext = Record<string, any>>(
     Subschema<any, any, any, TContext>,
     GraphQLSchema | SubschemaConfig<any, any, any, TContext>
   >,
-  cloneLessComputed: boolean,
 ): Array<Subschema<any, any, any, TContext>> {
   let subschemaConfig: SubschemaConfig<any, any, any, TContext>;
   if (isSubschemaConfig(subschemaOrSubschemaConfig)) {
@@ -453,11 +447,8 @@ function applySubschemaConfigTransforms<TContext = Record<string, any>>(
     );
   }
 
-  const presets = cloneLessComputed
-    ? backboneComputedPresets
-    : classicComputedPresets;
   const transformedSubschemaConfigs = subschemaConfigTransforms
-    .concat(presets)
+    .concat(computedFieldPresets)
     .reduce(
       (transformedSubschemaConfigs, subschemaConfigTransform) =>
         transformedSubschemaConfigs.flatMap((ssConfig) =>
@@ -502,10 +493,9 @@ function prepareStitchingData<TContext extends Record<string, any>>(
   const subschemaMap = new Map();
   const originalSubschemaMap = new Map();
 
-  // Both modes: clone-less deferral + field-level @requires (fetched-fields
-  // gate). Classic resolve-time leftover relies on delegate leftover drain
-  // (unsatisfiable deferreds settle instead of hanging) for fragment-heavy
-  // @requires such as requires-with-fragments.
+  // Clone-less deferral + field-level @requires (fetched-fields gate) for
+  // both classic and backbone. Classic leftover drain settles unsatisfiable
+  // deferreds; see requires-with-fragments.
   const cloneLessComputed = true;
 
   for (const subschema of subschemas) {
@@ -514,7 +504,6 @@ function prepareStitchingData<TContext extends Record<string, any>>(
       subschema,
       subschemaMap,
       originalSubschemaMap,
-      cloneLessComputed,
     )) {
       transformedSubschemas.push(transformedSubschemaConfig);
     }

@@ -124,6 +124,8 @@ function isIsolationStripTransform(t: { constructor?: { name?: string } }) {
 /**
  * Drop isolation-only transforms that would empty a root/entity selection
  * under delegateToSchema, while keeping rename/encapsulate transforms.
+ * No-op under default clone-less deferral; kept for opt-in
+ * isolateComputedFieldsTransformer callers.
  */
 function subschemaWithoutIsolationStripTransforms(
   subschema: Subschema,
