@@ -502,12 +502,11 @@ function prepareStitchingData<TContext extends Record<string, any>>(
   const subschemaMap = new Map();
   const originalSubschemaMap = new Map();
 
-  // Backbone owns computed/@requires hops in the plan → clone-less deferral.
-  // Classic resolve-time mergeFields still needs isolation clones for
-  // circular/nested @requires leftovers.
-  const cloneLessComputed = !isClassicStitchingEnabled({
-    classicStitching: options.classicStitching,
-  });
+  // Both modes: clone-less deferral + field-level @requires (fetched-fields
+  // gate). Classic resolve-time leftover relies on delegate leftover drain
+  // (unsatisfiable deferreds settle instead of hanging) for fragment-heavy
+  // @requires such as requires-with-fragments.
+  const cloneLessComputed = true;
 
   for (const subschema of subschemas) {
     for (const transformedSubschemaConfig of applySubschemaConfigTransforms(

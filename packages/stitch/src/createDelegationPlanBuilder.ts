@@ -17,6 +17,8 @@ import {
   GraphQLSchema,
   InlineFragmentNode,
   isAbstractType,
+  isInterfaceType,
+  isObjectType,
   Kind,
   SelectionNode,
   SelectionSetNode,
@@ -44,6 +46,13 @@ function calculateDelegationStage(
   info: GraphQLResolveInfo | undefined,
   stitchingInfo: StitchingInfo | undefined,
   fieldLevelRequires: boolean,
+  /**
+   * Initial sources for this plan. Under clone-less, their full schemas count
+   * as available. Later-stage sources only contribute fields listed in
+   * `fetchedFieldsByType` (what prior stages actually selected).
+   */
+  initialSourceSubschemas: Array<Subschema> = sourceSubschemas,
+  fetchedFieldsByType: Map<string, Set<string>> = new Map(),
 ): {
   delegationMap: Map<Subschema, SelectionSetNode>;
   proxiableSubschemas: Array<Subschema>;
@@ -104,13 +113,17 @@ function calculateDelegationStage(
       return true;
     }
     const fieldSelectionSet = fieldSelectionSets.get(target)?.[fieldName];
-    return (
-      fieldSelectionSet == null ||
-      subschemaTypesContainSelectionSet(
-        mergedTypeInfo,
-        sourceSubschemas,
-        fieldSelectionSet,
-      )
+    if (fieldSelectionSet == null) {
+      return true;
+    }
+    // Isolation clones: schema membership of growing sources ≈ availability.
+    // Clone-less: only initial-source schemas + fields prior stages selected.
+    return selectionSetAvailableCloneLess(
+      mergedTypeInfo,
+      initialSourceSubschemas,
+      fetchedFieldsByType,
+      fieldSelectionSet,
+      mergedTypeInfo.typeName,
     );
   }
 
@@ -133,16 +146,28 @@ function calculateDelegationStage(
 
     // Circular @requires: when every source still has unsatisfied field
     // deps for this field, defer and retry via leftover (requires-circular).
-    const sourcesWithUnsatisfiedDependencies = sourceSubschemas.filter(
-      (s) =>
-        fieldSelectionSets.get(s) != null &&
-        fieldSelectionSets.get(s)![fieldName] != null &&
-        !subschemaTypesContainSelectionSet(
+    const sourcesWithUnsatisfiedDependencies = (
+      fieldLevelRequires ? initialSourceSubschemas : sourceSubschemas
+    ).filter((s) => {
+      const req = fieldSelectionSets.get(s)?.[fieldName];
+      if (req == null) {
+        return false;
+      }
+      if (fieldLevelRequires) {
+        return !selectionSetAvailableCloneLess(
           mergedTypeInfo,
-          sourceSubschemas,
-          fieldSelectionSets.get(s)![fieldName]!,
-        ),
-    );
+          initialSourceSubschemas,
+          fetchedFieldsByType,
+          req,
+          mergedTypeInfo.typeName,
+        );
+      }
+      return !subschemaTypesContainSelectionSet(
+        mergedTypeInfo,
+        sourceSubschemas,
+        req,
+      );
+    });
     if (sourcesWithUnsatisfiedDependencies.length === sourceSubschemas.length) {
       unproxiableFieldNodes.push(fieldNode);
       for (const source of sourcesWithUnsatisfiedDependencies) {
@@ -460,6 +485,8 @@ export function createDelegationPlanBuilder(
 
       let delegationMaps: Array<Map<Subschema, SelectionSetNode>> = [];
       let sourceSubschemas = createSubschemas(sourceSubschema);
+      const initialSourceSubschemas = sourceSubschemas;
+      const fetchedFieldsByType: Map<string, Set<string>> = new Map();
 
       let delegationStage = calculateDelegationStage(
         mergedTypeInfo,
@@ -471,10 +498,18 @@ export function createDelegationPlanBuilder(
         info,
         stitchingInfo,
         fieldLevelRequires,
+        initialSourceSubschemas,
+        fetchedFieldsByType,
       );
       let { delegationMap } = delegationStage;
       while (delegationMap.size) {
         delegationMaps.push(delegationMap);
+        recordFetchedFields(
+          fetchedFieldsByType,
+          mergedTypeInfo.typeName,
+          delegationMap,
+          fragments,
+        );
 
         const {
           proxiableSubschemas,
@@ -497,6 +532,8 @@ export function createDelegationPlanBuilder(
           info,
           stitchingInfo,
           fieldLevelRequires,
+          initialSourceSubschemas,
+          fetchedFieldsByType,
         );
         delegationMap = delegationStage.delegationMap;
       }
@@ -676,4 +713,138 @@ function typesContainSelectionSet(
   }
 
   return true;
+}
+
+/**
+ * Clone-less @requires availability: fields on the *initial* source schemas
+ * count as present (object came from there), plus fields prior plan stages
+ * actually selected. Later-stage sibling fields on the same Subschema do not
+ * count until fetched — that is what isolation clones used to enforce.
+ */
+function selectionSetAvailableCloneLess(
+  mergedTypeInfo: MergedTypeInfo,
+  initialSourceSubschemas: Array<Subschema>,
+  fetchedFieldsByType: Map<string, Set<string>>,
+  selectionSet: SelectionSetNode,
+  typeName: string,
+): boolean {
+  // Initial-source schema fields only count on the plan's root merged type
+  // (the object we started from). Nested requires (author { yearsOfExperience })
+  // must be covered by fetchedFieldsByType — otherwise A's Author schema would
+  // make yearsOfExperience look present before it is fetched.
+  const useInitialSchema = typeName === mergedTypeInfo.typeName;
+  const initialFieldMaps = useInitialSchema
+    ? initialSourceSubschemas.map((s) => {
+        const t = s.transformedSchema.getType(typeName);
+        return isObjectType(t) || isInterfaceType(t) ? t.getFields() : null;
+      })
+    : [];
+  const fetched = fetchedFieldsByType.get(typeName);
+
+  for (const selection of selectionSet.selections) {
+    if (selection.kind !== Kind.FIELD) {
+      if (
+        selection.kind === Kind.INLINE_FRAGMENT &&
+        (selection.typeCondition == null ||
+          selection.typeCondition.name.value === typeName)
+      ) {
+        if (
+          !selectionSetAvailableCloneLess(
+            mergedTypeInfo,
+            initialSourceSubschemas,
+            fetchedFieldsByType,
+            selection.selectionSet,
+            typeName,
+          )
+        ) {
+          return false;
+        }
+      }
+      continue;
+    }
+    const fieldName = selection.name.value;
+    if (fieldName === '__typename') {
+      continue;
+    }
+    const onInitial = initialFieldMaps.some((fm) => fm?.[fieldName] != null);
+    const onFetched = fetched?.has(fieldName) === true;
+    if (!onInitial && !onFetched) {
+      return false;
+    }
+    if (selection.selectionSet != null) {
+      let nestedTypeName: string | undefined;
+      for (const s of initialSourceSubschemas) {
+        const t = s.transformedSchema.getType(typeName);
+        if (!isObjectType(t) && !isInterfaceType(t)) {
+          continue;
+        }
+        const field = t.getFields()[fieldName];
+        if (field) {
+          nestedTypeName = getNamedType(field.type).name;
+          break;
+        }
+      }
+      if (!nestedTypeName) {
+        for (const typeMap of mergedTypeInfo.typeMaps.values()) {
+          const t = typeMap[typeName];
+          if (!isObjectType(t) && !isInterfaceType(t)) {
+            continue;
+          }
+          const field = t.getFields()[fieldName];
+          if (field) {
+            nestedTypeName = getNamedType(field.type).name;
+            break;
+          }
+        }
+      }
+      if (
+        nestedTypeName &&
+        !selectionSetAvailableCloneLess(
+          mergedTypeInfo,
+          initialSourceSubschemas,
+          fetchedFieldsByType,
+          selection.selectionSet,
+          nestedTypeName,
+        )
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function recordFetchedFields(
+  fetchedFieldsByType: Map<string, Set<string>>,
+  typeName: string,
+  delegationMap: Map<Subschema, SelectionSetNode>,
+  fragments: Record<string, FragmentDefinitionNode>,
+): void {
+  let set = fetchedFieldsByType.get(typeName);
+  if (!set) {
+    set = new Set();
+    fetchedFieldsByType.set(typeName, set);
+  }
+  for (const selectionSet of delegationMap.values()) {
+    collectFetchedFieldNames(selectionSet, set, fragments);
+  }
+}
+
+function collectFetchedFieldNames(
+  selectionSet: SelectionSetNode,
+  into: Set<string>,
+  fragments: Record<string, FragmentDefinitionNode>,
+): void {
+  for (const selection of selectionSet.selections) {
+    if (selection.kind === Kind.FIELD) {
+      into.add(selection.name.value);
+    } else if (selection.kind === Kind.INLINE_FRAGMENT) {
+      collectFetchedFieldNames(selection.selectionSet, into, fragments);
+    } else if (selection.kind === Kind.FRAGMENT_SPREAD) {
+      const frag = fragments[selection.name.value];
+      if (frag) {
+        collectFetchedFieldNames(frag.selectionSet, into, fragments);
+      }
+    }
+  }
 }

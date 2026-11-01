@@ -3,13 +3,22 @@ import {
   SubschemaConfig,
   Transform,
 } from '@graphql-tools/delegate';
-import { ExecutionRequest } from '@graphql-tools/utils';
+import {
+  collectFields,
+  ExecutionRequest,
+  parseSelectionSet,
+} from '@graphql-tools/utils';
 import {
   DocumentNode,
   FragmentDefinitionNode,
+  getNamedType,
+  GraphQLSchema,
+  isCompositeType,
   Kind,
   SelectionNode,
+  TypeInfo,
   visit,
+  visitWithTypeInfo,
 } from 'graphql';
 
 /**
@@ -19,18 +28,29 @@ import {
  * `entryPoints[].fieldName`). Initial Query/Mutation hops therefore never
  * resolve computed fields early with missing `@requires` deps; entity /
  * `_products`-style merge hops still receive them.
+ *
+ * When a computed field is stripped, inject the type's merge-key fields
+ * (`@key` / `selectionSet`) so the parent still carries identity for later
+ * leftover hops — isolation used to get this via prepareGatewayDocument's
+ * unsatisfied-selection path.
  */
 export class DeferComputedFieldsTransform<TContext = Record<string, any>>
   implements Transform<Record<string, any>, TContext>
 {
   private readonly computedByType: Map<string, Set<string>>;
+  private readonly keyFieldsByType: Map<string, Set<string>>;
   private readonly mergeEntryFieldNames: Set<string>;
+  private readonly schema: GraphQLSchema;
 
   constructor(
+    schema: GraphQLSchema,
     computedByType: Map<string, Set<string>>,
+    keyFieldsByType: Map<string, Set<string>>,
     mergeEntryFieldNames: Set<string>,
   ) {
+    this.schema = schema;
     this.computedByType = computedByType;
+    this.keyFieldsByType = keyFieldsByType;
     this.mergeEntryFieldNames = mergeEntryFieldNames;
   }
 
@@ -45,7 +65,9 @@ export class DeferComputedFieldsTransform<TContext = Record<string, any>>
       ...originalRequest,
       document: stripComputedFields(
         originalRequest.document,
+        this.schema,
         this.computedByType,
+        this.keyFieldsByType,
       ),
     };
   }
@@ -53,101 +75,58 @@ export class DeferComputedFieldsTransform<TContext = Record<string, any>>
 
 function stripComputedFields(
   document: DocumentNode,
+  schema: GraphQLSchema,
   computedByType: Map<string, Set<string>>,
+  keyFieldsByType: Map<string, Set<string>>,
 ): DocumentNode {
-  const fragments: Record<string, FragmentDefinitionNode> = Object.create(null);
-  for (const def of document.definitions) {
-    if (def.kind === Kind.FRAGMENT_DEFINITION) {
-      fragments[def.name.value] = def;
-    }
-  }
-  void fragments;
-
-  const allComputedNames = unionComputedNames(computedByType);
-  if (!allComputedNames.size) {
+  if (!computedByType.size) {
     return document;
   }
 
-  return visit(document, {
-    [Kind.INLINE_FRAGMENT]: {
-      leave(node) {
-        if (!node.typeCondition) {
-          return filterFieldSelectionSet(node, allComputedNames);
-        }
-        const computed = computedByType.get(node.typeCondition.name.value);
-        if (!computed?.size) {
-          return node;
-        }
-        return filterFieldSelectionSet(node, computed);
+  const typeInfo = new TypeInfo(schema);
+  return visit(
+    document,
+    visitWithTypeInfo(typeInfo, {
+      [Kind.SELECTION_SET]: {
+        leave(node) {
+          const parentType = typeInfo.getParentType();
+          if (parentType == null) {
+            return node;
+          }
+          const typeName = getNamedType(parentType).name;
+          const computed = computedByType.get(typeName);
+          if (!computed?.size) {
+            return node;
+          }
+          const keys = keyFieldsByType.get(typeName);
+          const selections = filterComputedSelections(
+            node.selections,
+            computed,
+            keys,
+          );
+          if (selections === node.selections) {
+            return node;
+          }
+          if (!selections.length) {
+            return null;
+          }
+          return {
+            kind: Kind.SELECTION_SET,
+            selections,
+          };
+        },
       },
-    },
-    [Kind.FRAGMENT_DEFINITION]: {
-      leave(node) {
-        const computed = computedByType.get(node.typeCondition.name.value);
-        if (!computed?.size) {
-          return node;
-        }
-        return filterFieldSelectionSet(node, computed);
-      },
-    },
-    [Kind.FIELD]: {
-      leave(node) {
-        if (!node.selectionSet) {
-          return node;
-        }
-        // Untyped nested selections (concrete return types): strip by global
-        // computed name set. Merge-entry hops skip this transform entirely.
-        return filterFieldSelectionSet(node, allComputedNames);
-      },
-    },
-  });
-}
-
-function filterFieldSelectionSet<
-  T extends {
-    selectionSet?: { kind: Kind.SELECTION_SET; selections: readonly SelectionNode[] };
-  },
->(node: T, computed: Set<string>): T | null {
-  if (!node.selectionSet) {
-    return node;
-  }
-  const selections = filterComputedSelections(
-    node.selectionSet.selections,
-    computed,
+    }),
   );
-  if (selections === node.selectionSet.selections) {
-    return node;
-  }
-  if (!selections.length) {
-    return null;
-  }
-  return {
-    ...node,
-    selectionSet: {
-      kind: Kind.SELECTION_SET,
-      selections,
-    },
-  };
-}
-
-function unionComputedNames(
-  computedByType: Map<string, Set<string>>,
-): Set<string> {
-  const all = new Set<string>();
-  for (const names of computedByType.values()) {
-    for (const name of names) {
-      all.add(name);
-    }
-  }
-  return all;
 }
 
 function filterComputedSelections(
   selections: readonly SelectionNode[],
   computed: Set<string>,
+  keyFields: Set<string> | undefined,
 ): SelectionNode[] {
   let strippedComputed = false;
-  let hasTypename = false;
+  const present = new Set<string>();
   const next: SelectionNode[] = [];
   for (const selection of selections) {
     if (selection.kind === Kind.FIELD) {
@@ -155,30 +134,52 @@ function filterComputedSelections(
         strippedComputed = true;
         continue;
       }
-      if (
-        selection.name.value === '__typename' &&
-        (selection.alias == null || selection.alias.value === '__typename')
-      ) {
-        hasTypename = true;
-      }
+      present.add(selection.name.value);
     }
     next.push(selection);
   }
   if (!strippedComputed) {
     return selections as SelectionNode[];
   }
-  // Isolation clones force the "unsatisfied selection" path in
-  // prepareGatewayDocument, which injects __typename via fieldNodesByField.
-  // With fields kept on the schema, that path is skipped — so when we strip
-  // a computed field here, add __typename so merge keys still carry it for
-  // `_Entity` / union resolveType on the next hop.
-  if (!hasTypename) {
+  // Isolation's schema-strip makes prepareGatewayDocument inject key +
+  // __typename deps. We kept the field on the schema (fast path skips that),
+  // so restore identity fields here when a computed leaf was the only pick.
+  if (!present.has('__typename')) {
     next.unshift({
       kind: Kind.FIELD,
       name: { kind: Kind.NAME, value: '__typename' },
     });
+    present.add('__typename');
+  }
+  if (keyFields) {
+    for (const key of keyFields) {
+      if (!present.has(key) && !computed.has(key)) {
+        next.push({
+          kind: Kind.FIELD,
+          name: { kind: Kind.NAME, value: key },
+        });
+        present.add(key);
+      }
+    }
   }
   return next;
+}
+
+function collectKeyFieldNames(
+  schema: GraphQLSchema,
+  typeName: string,
+  selectionSetStr: string | undefined,
+): string[] {
+  if (!selectionSetStr) {
+    return [];
+  }
+  const type = schema.getType(typeName);
+  if (!type || !isCompositeType(type)) {
+    return [];
+  }
+  const parsed = parseSelectionSet(selectionSetStr, { noLocation: true });
+  const collected = collectFields(schema, {}, {}, type, parsed);
+  return Array.from(collected.fields.keys());
 }
 
 /**
@@ -193,7 +194,9 @@ export function deferComputedFieldsTransformer(
   }
 
   const computedByType = new Map<string, Set<string>>();
+  const keyFieldsByType = new Map<string, Set<string>>();
   const mergeEntryFieldNames = new Set<string>();
+  const schema = subschemaConfig.schema;
 
   for (const typeName in subschemaConfig.merge) {
     const mergedTypeConfig = subschemaConfig.merge[typeName]!;
@@ -205,6 +208,28 @@ export function deferComputedFieldsTransformer(
         mergeEntryFieldNames.add(entry.fieldName);
       }
     }
+
+    const keys = new Set<string>();
+    for (const key of collectKeyFieldNames(
+      schema,
+      typeName,
+      mergedTypeConfig.selectionSet,
+    )) {
+      keys.add(key);
+    }
+    for (const entry of mergedTypeConfig.entryPoints ?? []) {
+      for (const key of collectKeyFieldNames(
+        schema,
+        typeName,
+        entry.selectionSet,
+      )) {
+        keys.add(key);
+      }
+    }
+    if (keys.size) {
+      keyFieldsByType.set(typeName, keys);
+    }
+
     if (!mergedTypeConfig.fields) {
       continue;
     }
@@ -226,7 +251,9 @@ export function deferComputedFieldsTransformer(
   }
 
   const transform = new DeferComputedFieldsTransform(
+    schema,
     computedByType,
+    keyFieldsByType,
     mergeEntryFieldNames,
   );
   return [
