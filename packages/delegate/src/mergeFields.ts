@@ -102,6 +102,7 @@ export function mergeFields<TContext>(
       : fieldNodes,
     context,
     info,
+    object,
   );
 
   const leftOver = leftOverByDelegationPlan.get(delegationMaps);
