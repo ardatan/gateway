@@ -1,3 +1,8 @@
+export {
+  attachBackboneExecutor,
+  BACKBONE_EXECUTOR_EXTENSION,
+  getBackboneExecutor,
+} from './attachBackboneExecutor.js';
 export { buildStitchPlan } from './buildStitchPlan.js';
 export { createBackboneExecutor } from './createBackboneExecutor.js';
 export { executeStitchPlan } from './executeStitchPlan.js';

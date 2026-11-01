@@ -58,9 +58,8 @@ export function installRootTrampoline(
   schema: GraphQLSchema,
   runBackbone: Executor,
 ): void {
-  if ((schema as any)[TRAMPOLINE_INSTALLED]) {
-    return;
-  }
+  // Idempotent re-attach: after mapSchema / option changes, rebind trampoline
+  // to the new executor without nesting (always wrap the pre-trampoline resolve).
   (schema as any)[TRAMPOLINE_INSTALLED] = true;
 
   const CONTEXT_PLAN_RESULT = Symbol('backboneTrampolineResult');
@@ -76,7 +75,9 @@ export function installRootTrampoline(
     for (const fieldName of Object.keys(fields)) {
       const field = fields[fieldName]!;
       const previousResolve: GraphQLFieldResolver<any, any> =
-        field.resolve ?? defaultFieldResolver;
+        (field as any)[ORIGINAL_RESOLVE] ??
+        field.resolve ??
+        defaultFieldResolver;
       (field as any)[ORIGINAL_RESOLVE] = previousResolve;
       field.resolve = function backboneRootTrampoline(
         root,

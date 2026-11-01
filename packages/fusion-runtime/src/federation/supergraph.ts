@@ -15,8 +15,9 @@ import {
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
 import {
-  createBackboneExecutor,
+  attachBackboneExecutor,
   createMergedTypeResolver,
+  getBackboneExecutor,
 } from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
@@ -485,16 +486,15 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  // Backbone executor replaces classic stitching execute: plan once (cached)
-  // and run Fetch/Parallel/Sequence/Island. No schema-execute fallback —
-  // incomplete plans surface as errors until the planner covers them.
-  // Variable defaults for @skip/@include: getExecuteFnFromExecutor.
-  const executor = createBackboneExecutor(executableUnifiedGraph, {
+  // Re-attach after @pubsubPublish mapSchema (new schema object) and bind
+  // progressive-override plan-cache options.
+  attachBackboneExecutor(executableUnifiedGraph, {
     handleProgressiveOverride,
     overrideLabels: executableUnifiedGraph.extensions?.['overrideLabels'] as
       | Iterable<string>
       | undefined,
   });
+  const executor = getBackboneExecutor(executableUnifiedGraph)!;
 
   return {
     unifiedGraph: executableUnifiedGraph,
