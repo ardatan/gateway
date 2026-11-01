@@ -120,6 +120,12 @@ export type DelegationPlanBuilder = (
   fieldNodes: FieldNode[],
   context?: any,
   info?: GraphQLResolveInfo,
+  /**
+   * ExternalObject being merged. Clone-less @requires planning seeds
+   * already-present fields from this parent so resolve-time leftover can
+   * see deps filled by earlier hops.
+   */
+  parent?: any,
 ) => Array<Map<Subschema, SelectionSetNode>>;
 
 export interface MergedTypeInfo<TContext = Record<string, any>> {
