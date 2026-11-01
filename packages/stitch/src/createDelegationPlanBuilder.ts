@@ -47,7 +47,8 @@ function calculateDelegationStage(
   fragments: Record<string, FragmentDefinitionNode>,
   context: any | undefined,
   info: GraphQLResolveInfo | undefined,
-  stitchingInfo?: StitchingInfo,
+  stitchingInfo: StitchingInfo | undefined,
+  fieldLevelRequires: boolean,
 ): {
   delegationMap: Map<Subschema, SelectionSetNode>;
   proxiableSubschemas: Array<Subschema>;
@@ -57,15 +58,16 @@ function calculateDelegationStage(
   const { selectionSets, fieldSelectionSets, uniqueFields, nonUniqueFields } =
     mergedTypeInfo;
 
-  // 1. Type-level merge-key proxiability only. Field-level @requires /
-  // computed selectionSets are checked per field below so one unmet
-  // shippingEstimate does not block the whole inventory target (clone-less).
+  // 1. calculate if possible to delegate to given subschema
+  // Clone-less: type-level merge-key only; field @requires checked per field.
+  // Classic/isolation: also gate on whole-subschema fieldSelectionSets.
 
   const proxiableSubschemas: Array<Subschema> = [];
   const nonProxiableSubschemas: Array<Subschema> = [];
 
   for (const t of targetSubschemas) {
     const selectionSet = selectionSets.get(t);
+    const fieldSelectionSetsMap = fieldSelectionSets.get(t);
     if (
       selectionSet != null &&
       !subschemaTypesContainSelectionSet(
@@ -73,6 +75,23 @@ function calculateDelegationStage(
         sourceSubschemas,
         selectionSet,
       )
+    ) {
+      nonProxiableSubschemas.push(t);
+    } else if (
+      !fieldLevelRequires &&
+      fieldSelectionSetsMap != null &&
+      !fieldNodes.every((fieldNode) => {
+        const fieldName = fieldNode.name.value;
+        const fieldSelectionSet = fieldSelectionSetsMap[fieldName];
+        return (
+          fieldSelectionSet == null ||
+          subschemaTypesContainSelectionSet(
+            mergedTypeInfo,
+            sourceSubschemas,
+            fieldSelectionSet,
+          )
+        );
+      })
     ) {
       nonProxiableSubschemas.push(t);
     } else {
@@ -86,6 +105,9 @@ function calculateDelegationStage(
     target: Subschema,
     fieldName: string,
   ): boolean {
+    if (!fieldLevelRequires) {
+      return true;
+    }
     const fieldSelectionSet = fieldSelectionSets.get(target)?.[fieldName];
     return (
       fieldSelectionSet == null ||
@@ -176,17 +198,21 @@ function calculateDelegationStage(
         proxiableSubschemas.includes(s) && fieldRequiresSatisfied(s, fieldName),
     );
     if (!nonUniqueSubschemas.length) {
-      // Candidates that failed only on field-requires stay non-proxiable so a
-      // later stage can retry after deps land (self-target computed re-entry).
-      const requireDeferred = nonUniqueFields[fieldNode.name.value]!.filter(
-        (s) => proxiableSubschemas.includes(s),
-      );
-      if (requireDeferred.length) {
-        unproxiableFieldNodes.push(fieldNode);
-        for (const t of requireDeferred) {
-          if (!nonProxiableSubschemas.includes(t)) {
-            nonProxiableSubschemas.push(t);
+      if (fieldLevelRequires) {
+        // Candidates that failed only on field-requires stay non-proxiable so a
+        // later stage can retry after deps land (self-target computed re-entry).
+        const requireDeferred = nonUniqueFields[fieldNode.name.value]!.filter(
+          (s) => proxiableSubschemas.includes(s),
+        );
+        if (requireDeferred.length) {
+          unproxiableFieldNodes.push(fieldNode);
+          for (const t of requireDeferred) {
+            if (!nonProxiableSubschemas.includes(t)) {
+              nonProxiableSubschemas.push(t);
+            }
           }
+        } else {
+          unproxiableFieldNodes.push(fieldNode);
         }
       } else {
         unproxiableFieldNodes.push(fieldNode);
@@ -380,7 +406,9 @@ function getStitchingInfo(schema: GraphQLSchema): StitchingInfo {
 
 export function createDelegationPlanBuilder(
   mergedTypeInfo: MergedTypeInfo,
+  options?: { fieldLevelRequires?: boolean },
 ): DelegationPlanBuilder {
+  const fieldLevelRequires = options?.fieldLevelRequires === true;
   mergedTypeInfo.nonMemoizedDelegationPlanBuilder =
     function delegationPlanBuilder(
       schema: GraphQLSchema,
@@ -447,6 +475,7 @@ export function createDelegationPlanBuilder(
         context,
         info,
         stitchingInfo,
+        fieldLevelRequires,
       );
       let { delegationMap } = delegationStage;
       while (delegationMap.size) {
@@ -472,6 +501,7 @@ export function createDelegationPlanBuilder(
           context,
           info,
           stitchingInfo,
+          fieldLevelRequires,
         );
         delegationMap = delegationStage.delegationMap;
       }

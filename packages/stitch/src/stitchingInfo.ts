@@ -45,8 +45,13 @@ export function createStitchingInfo<
   >,
   typeCandidates: Record<string, Array<MergeTypeCandidate<TContext>>>,
   mergeTypes?: boolean | Array<string> | MergeTypeFilter<TContext>,
+  options?: { cloneLessComputed?: boolean },
 ): StitchingInfo<TContext> {
-  const mergedTypes = createMergedTypes(typeCandidates, mergeTypes);
+  const mergedTypes = createMergedTypes(
+    typeCandidates,
+    mergeTypes,
+    options?.cloneLessComputed === true,
+  );
 
   return {
     subschemaMap,
@@ -63,6 +68,7 @@ function createMergedTypes<
 >(
   typeCandidates: Record<string, Array<MergeTypeCandidate<TContext>>>,
   mergeTypes?: boolean | Array<string> | MergeTypeFilter<TContext>,
+  cloneLessComputed = false,
 ): Record<string, MergedTypeInfo<TContext>> {
   const mergedTypes: Record<string, MergedTypeInfo<TContext>> = Object.create(
     null,
@@ -318,16 +324,15 @@ function createMergedTypes<
         > = new Map();
         if (sourceSubschemas) {
           for (const subschema of sourceSubschemas) {
-            // Isolation clones gave computed fields a second Subschema
-            // identity so source !== target. Without clones, a subschema that
-            // owns computed / field-@requires fields must be allowed as its
-            // own merge target so shippingEstimate can re-enter after deps
-            // land. Field-level DPB defers unmet requires so this is not a
-            // tight loop.
-            const ownsComputedOrRequires = fieldSelectionSets
-              .get(subschema)
-              ? Object.keys(fieldSelectionSets.get(subschema)!).length > 0
-              : false;
+            // Clone-less: a subschema that owns computed / field-@requires
+            // fields must be allowed as its own merge target so
+            // shippingEstimate can re-enter after deps land. Isolation clones
+            // already provide a second identity, so classic keeps the
+            // source !== target filter.
+            const ownsComputedOrRequires =
+              cloneLessComputed &&
+              fieldSelectionSets.get(subschema) != null &&
+              Object.keys(fieldSelectionSets.get(subschema)!).length > 0;
             const filteredSubschemas = ownsComputedOrRequires
               ? targetSubschemas
               : targetSubschemas.filter((s) => s !== subschema);
@@ -353,6 +358,7 @@ function createMergedTypes<
 
         mergedTypeConfig.delegationPlanBuilder = createDelegationPlanBuilder(
           mergedTypeConfig as MergedTypeInfo,
+          { fieldLevelRequires: cloneLessComputed },
         );
 
         if (hasOverrides) {
