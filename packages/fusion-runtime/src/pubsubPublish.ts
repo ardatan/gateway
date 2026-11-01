@@ -1,7 +1,10 @@
 import {
   ExecutionRequest,
   ExecutionResult,
+  Executor,
   getDirectiveExtensions,
+  getOperationASTFromRequest,
+  isAsyncIterable,
 } from '@graphql-tools/utils';
 import { handleMaybePromise, isPromise } from '@whatwg-node/promise-helpers';
 import {
@@ -19,9 +22,9 @@ type PubSubLike = {
 };
 
 /**
- * Backbone execute bypasses schema root resolvers. Re-apply `@pubsubPublish`
- * side effects from Mutation result payloads so EDFS / NATS mutations still
- * fan out (same role router-runtime's pubsub visitor plays for classic execute).
+ * Re-apply `@pubsubPublish` from Mutation result payloads. Backbone / direct
+ * execute skips schema root resolvers, so publish must run as an executor
+ * side effect (same role router-runtime's pubsub visitor plays).
  */
 export function applyPubsubPublishToResult(
   schema: GraphQLSchema,
@@ -94,6 +97,34 @@ export function applyPubsubPublishToResult(
     () => Promise.all(jobs),
     () => result,
   );
+}
+
+/**
+ * Wrap a unified-graph executor so Mutation results fire `@pubsubPublish`.
+ * No-op when the schema has no such directive.
+ */
+export function wrapExecutorWithPubsubPublish(
+  schema: GraphQLSchema,
+  executor: Executor,
+): Executor {
+  if (!schema.getDirective('pubsubPublish')) {
+    return executor;
+  }
+  return function pubsubPublishExecutor(request) {
+    return handleMaybePromise(
+      () => executor(request),
+      (result) => {
+        if (isAsyncIterable(result)) {
+          return result;
+        }
+        const op = getOperationASTFromRequest(request);
+        if (op?.operation !== 'mutation') {
+          return result;
+        }
+        return applyPubsubPublishToResult(schema, request, result);
+      },
+    );
+  };
 }
 
 function fieldResponseKey(field: FieldNode): string {

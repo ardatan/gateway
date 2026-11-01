@@ -16,7 +16,6 @@ import {
 } from './buildStitchPlan.js';
 import { executeStitchPlan } from './executeStitchPlan.js';
 import { projectDataToOperation } from './projectResult.js';
-import { applyPubsubPublishToResult } from './pubsubPublish.js';
 import { installRootProxyingResolvers } from './rootProxyingResolvers.js';
 import type { BackboneExecutorOptions, StitchPlan } from './types.js';
 
@@ -205,7 +204,7 @@ export function createBackboneExecutor(
         if (isAsyncIterable(result)) {
           return result;
         }
-        const projected: ExecutionResult = {
+        return {
           ...result,
           data: projectDataToOperation(
             schema,
@@ -215,15 +214,6 @@ export function createBackboneExecutor(
             result.data as any,
           ) as any,
         };
-        // Direct executor skips schema root resolvers — re-fire @pubsubPublish.
-        if (op.operation === 'mutation') {
-          return applyPubsubPublishToResult(
-            schema,
-            requestWithCoercedVars,
-            projected,
-          );
-        }
-        return projected;
       },
     );
   }
