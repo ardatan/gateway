@@ -61,8 +61,8 @@ function valueSatisfiesSelectionSet(
  * - Payloads are raw resolver results keyed by literal field name, so
  *   aliased requests are matched by field name and aliased fields already in
  *   the payload are not fetched again. Hydrated results carry only literal
- *   field names; `defaultMergedResolver` falls back to the field name when
- *   the aliased response key is absent, so incoming query aliases resolve
+ *   field names; `stitchedDefaultFieldResolver` falls back to the field name
+ *   when the aliased response key is absent, so incoming query aliases resolve
  *   with plain graphql-js semantics.
  * - When merge keys of several subschemas are satisfied, a subschema without
  *   computed field dependencies starts the delegation. Type merging stays

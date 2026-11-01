@@ -2088,27 +2088,16 @@ function planMergedTypeFollowUps(
         }
       }
     }
-    // Gateway-local leftovers → Island (not an entity Fetch).
+    // Gateway-local leftovers are not entity-fetchable. Skip them here —
+    // appendNestedForFields(fieldNodes) emits each local Island once.
     const fetchableLeftovers: FieldNode[] = [];
     for (const fieldNode of leftOver.unproxiableFieldNodes) {
       if (
         isLocalField(stitchingInfo.localFields, typeName, fieldNode.name.value)
       ) {
-        stages.push(
-          planLocalFieldIsland(
-            schema,
-            stitchingInfo,
-            typeName,
-            fieldNode,
-            fragments,
-            variableValues,
-            flattenPath,
-            incompleteReasons,
-          ),
-        );
-      } else {
-        fetchableLeftovers.push(fieldNode);
+        continue;
       }
+      fetchableLeftovers.push(fieldNode);
     }
     const leftoverByTarget = new Map<Subschema, FieldNode[]>();
     for (const fieldNode of fetchableLeftovers) {
@@ -2875,6 +2864,9 @@ function planRootField(
         }
         const rootKey = fieldNode.alias?.value ?? fieldNode.name.value;
         // Completely unavailable gateway-local field (Book.author @resolveTo).
+        // Merged return types: planMergedTypeFollowUps → appendNestedForFields
+        // owns these Islands. Emitting here too duplicates the Island (Task.user
+        // dataloader: second batch sees undefined ids).
         if (
           returnTypeName &&
           !availNames.has(sel.name.value) &&
@@ -2884,18 +2876,20 @@ function planRootField(
             sel.name.value,
           )
         ) {
-          partialUnavailableFollowUps.push(
-            planLocalFieldIsland(
-              schema,
-              stitchingInfo,
-              returnTypeName,
-              sel,
-              fragments,
-              variableValues,
-              [rootKey],
-              incompleteReasons,
-            ),
-          );
+          if (!stitchingInfo.mergedTypes[returnTypeName]) {
+            partialUnavailableFollowUps.push(
+              planLocalFieldIsland(
+                schema,
+                stitchingInfo,
+                returnTypeName,
+                sel,
+                fragments,
+                variableValues,
+                [rootKey],
+                incompleteReasons,
+              ),
+            );
+          }
           continue;
         }
         if (!sel.selectionSet) {
@@ -5222,7 +5216,15 @@ function optimizeStitchPlanNode(
     }
     coalesced.push(...rest);
   } else {
+    const seenIslands = new Set<string>();
     for (const child of flat) {
+      if (child.kind === 'Island') {
+        const ik = `${child.parentTypeName}.${child.fieldNode.name.value}::${(child.flattenPath ?? []).join('\0')}::${child.fieldNode.alias?.value ?? ''}`;
+        if (seenIslands.has(ik)) {
+          continue;
+        }
+        seenIslands.add(ik);
+      }
       const prev = coalesced[coalesced.length - 1];
       if (child.kind === 'Fetch' && prev?.kind === 'Fetch') {
         const a = coalesceFetchKey(prev);
