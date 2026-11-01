@@ -2368,7 +2368,12 @@ export function getStitchedSchemaFromSupergraphSdl(
   // later mapSchema + bare re-attach (e.g. filterInternalFieldsAndTypes) needs
   // no options bag.
   return attachBackboneExecutor(supergraphSchema, {
-    handleProgressiveOverride: opts.handleProgressiveOverride,
+    // Plan-cache keying only needs label + context; federation's handler also
+    // accepts resolve info when used as a field override callback.
+    handleProgressiveOverride: opts.handleProgressiveOverride
+      ? (label, context) =>
+          opts.handleProgressiveOverride!(label, context, undefined as any)
+      : undefined,
   });
 }
 
