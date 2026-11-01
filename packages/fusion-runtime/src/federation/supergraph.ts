@@ -14,8 +14,10 @@ import type {
 import { getStitchedSchemaFromSupergraphSdl } from '@graphql-tools/federation';
 import { mergeTypeDefs } from '@graphql-tools/merge';
 import {
+  BACKBONE_EXECUTOR_EXTENSION,
   createMergedTypeResolver,
   getBackboneExecutor,
+  installRootProxyingResolvers,
 } from '@graphql-tools/stitch';
 import { stitchingDirectives } from '@graphql-tools/stitching-directives';
 import {
@@ -41,6 +43,7 @@ import type {
   UnifiedGraphHandlerOpts,
   UnifiedGraphHandlerResult,
 } from '../unifiedGraphManager';
+import { wrapExecutorWithPubsubPublish } from '../pubsubPublish.js';
 import {
   compareSubgraphNames,
   OnDelegationPlanDoneHook,
@@ -431,9 +434,8 @@ export const handleFederationSupergraph = function ({
       }
     }
   }
-  // @pubsubPublish side effects run in the backbone via applyPubsubPublishToResult
-  // (direct execute skips root resolvers). Do not mapSchema-wrap Mutation fields
-  // here — that replaces the schema object and drops the attached executor.
+  // @pubsubPublish is Mesh/fusion concern: wrap the backbone executor (do not
+  // mapSchema Mutation fields — that replaces the schema and drops attach).
   function getSubschema(subgraphName: string): SubschemaConfig {
     const subgraph = subschemas.find(
       (s) => s.name && compareSubgraphNames(s.name, subgraphName),
@@ -447,7 +449,19 @@ export const handleFederationSupergraph = function ({
     'overrideLabels'
   ] as Set<string> | undefined;
 
-  const executor = getBackboneExecutor(executableUnifiedGraph)!;
+  const backboneExecutor = getBackboneExecutor(executableUnifiedGraph)!;
+  const executor = wrapExecutorWithPubsubPublish(
+    executableUnifiedGraph,
+    backboneExecutor,
+  );
+  if (executor !== backboneExecutor) {
+    // Keep schema.execute (root proxying) and extensions on the same wrap.
+    executableUnifiedGraph.extensions = {
+      ...executableUnifiedGraph.extensions,
+      [BACKBONE_EXECUTOR_EXTENSION]: executor,
+    };
+    installRootProxyingResolvers(executableUnifiedGraph, executor);
+  }
 
   return {
     unifiedGraph: executableUnifiedGraph,
