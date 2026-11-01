@@ -1,5 +1,9 @@
 import type { ExecutionRequest, Executor } from '@graphql-tools/utils';
 import {
+  handleMaybePromise,
+  type MaybePromise,
+} from '@whatwg-node/promise-helpers';
+import {
   defaultFieldResolver,
   GraphQLFieldResolver,
   GraphQLSchema,
@@ -113,7 +117,7 @@ export function installRootTrampoline(
         }
 
         let pending = (context as any)[CONTEXT_PLAN_PROMISE] as
-          | PromiseLike<any>
+          | MaybePromise<any>
           | undefined;
         if (!pending) {
           const request: ExecutionRequest = {
@@ -129,18 +133,26 @@ export function installRootTrampoline(
             rootValue: root,
             operationName: info.operation.name?.value,
           };
-          pending = Promise.resolve(runBackbone(request)).then((result) => {
-            (context as any)[CONTEXT_PLAN_RESULT] = result;
-            return result;
-          });
+          // Sync backbone results stay sync (fakePromise) — no Promise.resolve
+          // microtask. Share one MaybePromise across sibling root fields.
+          pending = handleMaybePromise(
+            () => runBackbone(request),
+            (result) => {
+              (context as any)[CONTEXT_PLAN_RESULT] = result;
+              return result;
+            },
+          );
           (context as any)[CONTEXT_PLAN_PROMISE] = pending;
         }
-        return Promise.resolve(pending).then((result) => {
-          if (result?.errors?.length && result.data == null) {
-            throw result.errors[0];
-          }
-          return result?.data?.[responseKey];
-        });
+        return handleMaybePromise(
+          () => pending,
+          (result) => {
+            if (result?.errors?.length && result.data == null) {
+              throw result.errors[0];
+            }
+            return result?.data?.[responseKey];
+          },
+        );
       };
     }
   }
