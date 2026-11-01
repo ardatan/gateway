@@ -5,7 +5,7 @@ import {
   stitchSchemas,
 } from '@graphql-tools/stitch';
 import { afterEach, describe, expect, it } from 'vitest';
-import { defaultMergedResolver as classicDefaultMergedResolver } from '@graphql-tools/delegate';
+import { classicMergedResolver } from '../src/classicMergedResolver.js';
 import { defaultMergedResolver as backboneDefaultMergedResolver } from '../src/defaultMergedResolver.js';
 
 const ENV = 'GRAPHQL_TOOLS_CLASSIC_STITCHING';
@@ -46,7 +46,7 @@ describe('classic vs backbone stitching flag', () => {
     const schema = stitchHello({ classicStitching: true });
     expect(getStitchingExecutionMode(schema)).toBe('classic');
     expect(getBackboneExecutor(schema)).toBeUndefined();
-    expect(classicDefaultMergedResolver).not.toBe(backboneDefaultMergedResolver);
+    expect(classicMergedResolver).not.toBe(backboneDefaultMergedResolver);
   });
 
   it('classicStitching: false wins over env', () => {

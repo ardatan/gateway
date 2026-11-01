@@ -1,10 +1,10 @@
 import {
-  defaultMergedResolver as classicDefaultMergedResolver,
   isSubschemaConfig,
   StitchingInfo,
   Subschema,
   SubschemaConfig,
 } from '@graphql-tools/delegate';
+import { classicMergedResolver } from './classicMergedResolver.js';
 import {
   applyExtensions,
   mergeExtensions,
@@ -44,7 +44,7 @@ import {
   createStitchingInfo,
 } from './stitchingInfo.js';
 import {
-  isolateComputedFieldsTransformer,
+  deferComputedFieldsTransformer,
   splitMergedTypeEntryPointsTransformer,
 } from './subschemaConfigTransforms/index.js';
 import { buildTypeCandidates, buildTypes } from './typeCandidates.js';
@@ -128,10 +128,10 @@ export function stitchSchemas<
   const classicStitching = isClassicStitchingEnabled({
     classicStitching: options.classicStitching,
   });
-  // Classic: resolve-time mergeFields via delegate defaultMergedResolver.
+  // Classic: resolve-time mergeFields (+ local hydration).
   // Backbone: slim stitch defaultMergedResolver (plan owns entity hops).
   const gatewayDefaultFieldResolver = classicStitching
-    ? classicDefaultMergedResolver
+    ? classicMergedResolver
     : backboneDefaultMergedResolver;
 
   addLocalFieldResolvers(
@@ -414,8 +414,11 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
   }
 }
 
+// Clone-less computed deferral (request-strip on non-merge hops) + entrypoint
+// split. Isolation clones are no longer part of the default preset; computed
+// re-entry uses self-target + field-level @requires in the DPB.
 const subschemaConfigTransformerPresets: Array<SubschemaConfigTransform<any>> =
-  [isolateComputedFieldsTransformer, splitMergedTypeEntryPointsTransformer];
+  [deferComputedFieldsTransformer, splitMergedTypeEntryPointsTransformer];
 
 function applySubschemaConfigTransforms<TContext = Record<string, any>>(
   subschemaConfigTransforms: Array<SubschemaConfigTransform<TContext>>,
