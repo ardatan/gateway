@@ -2,6 +2,8 @@ export {
   attachBackboneExecutor,
   BACKBONE_EXECUTOR_EXTENSION,
   getBackboneExecutor,
+  markChangedRootResolvesAsLocal,
+  snapshotRootFieldResolves,
 } from './attachBackboneExecutor.js';
 export { buildStitchPlan } from './buildStitchPlan.js';
 export { createBackboneExecutor } from './createBackboneExecutor.js';
