@@ -1,10 +1,76 @@
+import type { StitchingInfo } from '@graphql-tools/delegate';
 import type { Executor } from '@graphql-tools/utils';
-import type { GraphQLSchema } from 'graphql';
+import {
+  isObjectType,
+  type GraphQLFieldResolver,
+  type GraphQLSchema,
+} from 'graphql';
 import { createBackboneExecutor } from './createBackboneExecutor.js';
 import type { BackboneExecutorOptions } from './types.js';
 
 /** Schema extension key for the operation-level backbone executor. */
 export const BACKBONE_EXECUTOR_EXTENSION = 'backboneExecutor';
+
+type RootResolveSnapshot = Map<
+  string,
+  GraphQLFieldResolver<any, any> | undefined
+>;
+
+/**
+ * Snapshot Query/Mutation field `resolve` refs — compare after
+ * `onStitchedSchema` / late `addResolversToSchema` to find overrides.
+ */
+export function snapshotRootFieldResolves(
+  schema: GraphQLSchema,
+): RootResolveSnapshot {
+  const snap: RootResolveSnapshot = new Map();
+  for (const root of [schema.getQueryType(), schema.getMutationType()]) {
+    if (!root || !isObjectType(root)) {
+      continue;
+    }
+    for (const [fieldName, field] of Object.entries(root.getFields())) {
+      snap.set(`${root.name}.${fieldName}`, field.resolve);
+    }
+  }
+  return snap;
+}
+
+/**
+ * Fields whose `resolve` changed since `before` are gateway overrides (e.g.
+ * ApolloServer test replacing Query.me). Mark them `localFields` so the
+ * planner emits Islands instead of subgraph Fetches.
+ */
+export function markChangedRootResolvesAsLocal(
+  schema: GraphQLSchema,
+  before: RootResolveSnapshot,
+): void {
+  const stitchingInfo = schema.extensions?.['stitchingInfo'] as
+    | StitchingInfo
+    | undefined;
+  if (!stitchingInfo) {
+    return;
+  }
+  if (!stitchingInfo.localFields) {
+    stitchingInfo.localFields = new Map();
+  }
+  for (const root of [schema.getQueryType(), schema.getMutationType()]) {
+    if (!root || !isObjectType(root)) {
+      continue;
+    }
+    let locals = stitchingInfo.localFields.get(root.name);
+    for (const [fieldName, field] of Object.entries(root.getFields())) {
+      const key = `${root.name}.${fieldName}`;
+      if (before.get(key) === field.resolve) {
+        continue;
+      }
+      if (!locals) {
+        locals = new Set();
+        stitchingInfo.localFields.set(root.name, locals);
+      }
+      locals.add(fieldName);
+    }
+  }
+}
 
 /**
  * Install the stitching backbone on a schema:

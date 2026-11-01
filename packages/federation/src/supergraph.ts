@@ -23,7 +23,9 @@ import {
   attachBackboneExecutor,
   calculateSelectionScore,
   getDefaultFieldConfigMerger,
+  markChangedRootResolvesAsLocal,
   MergeFieldConfigCandidate,
+  snapshotRootFieldResolves,
   stitchSchemas,
   TypeMergingOptions,
   ValidationLevel,
@@ -2364,8 +2366,11 @@ export function getStitchedSchemaFromSupergraphSdl(
   // filterInternalFieldsAndTypes mapSchema → new schema; re-bind backbone.
   supergraphSchema = filterInternalFieldsAndTypes(supergraphSchema);
   if (opts.onStitchedSchema) {
+    const rootResolvesBefore = snapshotRootFieldResolves(supergraphSchema);
     supergraphSchema =
       opts.onStitchedSchema(supergraphSchema) || supergraphSchema;
+    // Late root resolver overrides (Query.me → local) must plan as Islands.
+    markChangedRootResolvesAsLocal(supergraphSchema, rootResolvesBefore);
   }
   return attachBackboneExecutor(supergraphSchema);
 }
