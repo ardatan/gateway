@@ -127,12 +127,15 @@ describe('Optimizations', () => {
       schema,
       document: parse(query),
     });
+    const classic =
+      process.env.GRAPHQL_TOOLS_CLASSIC_STITCHING === '1' ||
+      process.env.GRAPHQL_TOOLS_CLASSIC_STITCHING === 'true';
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
       // inventory: 1, (when computed fields definition removed)
-      // Clone-less computed deferral (no isolation Subschema split) needs one
-      // extra inventory hop for shippingEstimate self-reentry after price/weight.
-      inventory: 3,
+      // Classic keeps isolation clones → 2 hops. Backbone clone-less deferral
+      // needs one extra inventory hop for shippingEstimate self-reentry.
+      inventory: classic ? 2 : 3,
       products: 2,
       reviews: 2,
     });
