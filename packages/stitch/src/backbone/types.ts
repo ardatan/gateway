@@ -137,6 +137,12 @@ export interface BackboneExecutorOptions {
    * Falls back to `schema.extensions.overrideLabels` when omitted.
    */
   overrideLabels?: Iterable<string>;
+  /**
+   * When true, skip backbone executor + root proxying and use classic
+   * resolve-time stitching (`mergeFields` / `defaultMergedResolver`).
+   * Also enabled via `GRAPHQL_TOOLS_CLASSIC_STITCHING=1`.
+   */
+  classicStitching?: boolean;
 }
 
 /** `schema.extensions` key for last-attached {@link BackboneExecutorOptions}. */

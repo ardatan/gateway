@@ -5,6 +5,10 @@ import {
   type GraphQLFieldResolver,
   type GraphQLSchema,
 } from 'graphql';
+import {
+  isClassicStitchingEnabled,
+  STITCHING_EXECUTION_MODE_EXTENSION,
+} from './classicStitching.js';
 import { createBackboneExecutor } from './createBackboneExecutor.js';
 import {
   BACKBONE_EXECUTOR_OPTIONS_EXTENSION,
@@ -94,6 +98,7 @@ export function resolveBackboneExecutorOptions(
       options.overrideLabels ??
       stored?.overrideLabels ??
       (schema.extensions?.['overrideLabels'] as Iterable<string> | undefined),
+    classicStitching: options.classicStitching ?? stored?.classicStitching,
   };
 }
 
@@ -101,6 +106,10 @@ export function resolveBackboneExecutorOptions(
  * Install the stitching backbone on a schema:
  * - root Query/Mutation proxying resolvers (stock `graphql-js` execute → backbone)
  * - `schema.extensions.backboneExecutor` for gateway / direct execute
+ *
+ * When classic stitching is enabled (option or
+ * `GRAPHQL_TOOLS_CLASSIC_STITCHING`), skips backbone install so execute uses
+ * resolve-time `mergeFields` / `defaultMergedResolver`.
  *
  * Call on the **final** schema after any `mapSchema` transforms that yield a
  * new schema instance (e.g. federation filter). Safe to call again to rebind;
@@ -113,10 +122,21 @@ export function attachBackboneExecutor(
   options: BackboneExecutorOptions = {},
 ): GraphQLSchema {
   const resolved = resolveBackboneExecutorOptions(schema, options);
+  if (isClassicStitchingEnabled(resolved)) {
+    schema.extensions = {
+      ...schema.extensions,
+      [BACKBONE_EXECUTOR_OPTIONS_EXTENSION]: resolved,
+      [STITCHING_EXECUTION_MODE_EXTENSION]: 'classic',
+      // Drop any prior backbone bind so getBackboneExecutor is undefined.
+      [BACKBONE_EXECUTOR_EXTENSION]: undefined,
+    };
+    return schema;
+  }
   const executor = createBackboneExecutor(schema, resolved);
   schema.extensions = {
     ...schema.extensions,
     [BACKBONE_EXECUTOR_OPTIONS_EXTENSION]: resolved,
+    [STITCHING_EXECUTION_MODE_EXTENSION]: 'backbone',
     [BACKBONE_EXECUTOR_EXTENSION]: executor,
   };
   return schema;

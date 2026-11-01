@@ -6,6 +6,13 @@ export {
   resolveBackboneExecutorOptions,
   snapshotRootFieldResolves,
 } from './attachBackboneExecutor.js';
+export {
+  CLASSIC_STITCHING_ENV,
+  getStitchingExecutionMode,
+  isClassicStitchingEnabled,
+  STITCHING_EXECUTION_MODE_EXTENSION,
+  type StitchingExecutionMode,
+} from './classicStitching.js';
 export { buildStitchPlan } from './buildStitchPlan.js';
 export { createBackboneExecutor } from './createBackboneExecutor.js';
 export { executeStitchPlan } from './executeStitchPlan.js';
