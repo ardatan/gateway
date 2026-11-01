@@ -85,10 +85,9 @@ export function createBackboneExecutor(
     Map<string | null, StitchPlan>
   >();
 
-  // Stock graphql-js `execute(schema, …)` must hit the same backbone as the
-  // returned Executor. Installed here (not in stitchSchemas) because federation
-  // still mapSchema-wraps the schema after stitch (e.g. @pubsubPublish) — the
-  // trampoline has to bind the final schema + this executor closure.
+  // Trampoline: stock graphql-js execute → this executor. Prefer
+  // `attachBackboneExecutor` so the executor also lands on schema.extensions;
+  // safe to call again after mapSchema on the final schema object.
   installRootTrampoline(schema, (request) =>
     stitchingBackboneExecutor(request),
   );

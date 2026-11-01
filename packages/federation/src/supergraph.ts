@@ -20,6 +20,7 @@ import {
   HTTPExecutorOptions,
 } from '@graphql-tools/executor-http';
 import {
+  attachBackboneExecutor,
   calculateSelectionScore,
   getDefaultFieldConfigMerger,
   MergeFieldConfigCandidate,
@@ -2360,12 +2361,13 @@ export function getStitchedSchemaFromSupergraphSdl(
   const stitchSchemasOpts = getStitchingOptionsFromSupergraphSdl(opts);
   opts.onStitchingOptions?.(stitchSchemasOpts);
   let supergraphSchema = stitchSchemas(stitchSchemasOpts);
+  // filterInternalFieldsAndTypes mapSchema → new schema; re-bind backbone.
   supergraphSchema = filterInternalFieldsAndTypes(supergraphSchema);
   if (opts.onStitchedSchema) {
     supergraphSchema =
       opts.onStitchedSchema(supergraphSchema) || supergraphSchema;
   }
-  return supergraphSchema;
+  return attachBackboneExecutor(supergraphSchema);
 }
 
 const anyTypeDefinitionNode: ScalarTypeDefinitionNode = {

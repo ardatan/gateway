@@ -32,6 +32,7 @@ import {
   isSpecifiedDirective,
   specifiedDirectives,
 } from 'graphql';
+import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
 import {
   addStitchingInfo,
@@ -152,7 +153,9 @@ export function stitchSchemas<
     applyExtensions(schema, mergedSchemaExtensions);
   }
 
-  return schema;
+  // Backbone executor + root trampoline on the stitched schema. Callers that
+  // mapSchema afterward (federation filter, @pubsubPublish) must re-attach.
+  return attachBackboneExecutor(schema);
 }
 
 function stripCustomDirectiveUsages(types: GraphQLNamedType[]): void {
