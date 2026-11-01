@@ -5639,29 +5639,34 @@ function buildCompletePlan(
     // Peel independent root heads + BatchFetch same-subschema entity hops
     // inside Parallel waves. annotateFetchDeps + executeDataflowPlan run a
     // barrier-free schedule from fetchDependsOn (path / requires / keys).
-    root:
-      operation.operation === 'mutation'
-        ? packed
-        : preparePlanDocuments(
-            annotateFetchDeps(
-              groupParallelBatchFetches(
-                compressProductsIntoDeepWave(
-                  peelLeadingEntityFetches(
-                    peelRootParallelHeads(packed, stitchingInfo),
-                    stitchingInfo,
-                  ),
+    root: (() => {
+      const isMutation = operation.operation === 'mutation';
+      // Mutations stay document-ordered (Sequence barriers in dependsOn).
+      // Queries peel/batch then dataflow on fetchDependsOn edges only.
+      const annotated = annotateFetchDeps(
+        isMutation
+          ? packed
+          : groupParallelBatchFetches(
+              compressProductsIntoDeepWave(
+                peelLeadingEntityFetches(
+                  peelRootParallelHeads(packed, stitchingInfo),
                   stitchingInfo,
                 ),
                 stitchingInfo,
               ),
               stitchingInfo,
             ),
-            {
-              operation,
-              fragments,
-              fieldNodesByField: stitchingInfo.fieldNodesByField,
-            },
-          ),
+        stitchingInfo,
+        { serializeSequences: isMutation },
+      );
+      return isMutation
+        ? annotated
+        : preparePlanDocuments(annotated, {
+            operation,
+            fragments,
+            fieldNodesByField: stitchingInfo.fieldNodesByField,
+          });
+    })(),
     incomplete: incompleteReasons.length > 0,
     incompleteReasons,
   };
@@ -6183,21 +6188,25 @@ function groupParallelBatchFetches(
 }
 
 /**
- * Attach id/dependsOn for barrier-free execute from `fetchDependsOn` only
- * (path production + @requires). Sequence tree shape stays for readability;
- * execute ignores Sequence barriers and fires hops when dependsOn is met.
+ * Attach id/dependsOn for dataflow execute from `fetchDependsOn` (path /
+ * @requires / keys). Sequence tree shape stays for readability.
  *
- * Islands still gate their `continue` subgraph (local resolve → entity hops).
+ * `serializeSequences`: mutations — later Sequence siblings wait on every hop
+ * completed by earlier siblings (document order / shared subgraph state).
+ * Islands always gate their `continue` subgraph.
  */
 function annotateFetchDeps(
   root: StitchPlanNode,
   stitchingInfo: StitchingInfo,
+  opts: { serializeSequences?: boolean } = {},
 ): StitchPlanNode {
   const fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>> = [];
   collectExecutableFetches(root, fetches);
   if (!fetches.length) {
     // Still annotate Islands when the plan is Island-only.
-    return assignDepsOnly(root, new Map(), stitchingInfo);
+    return assignDepsOnly(root, new Map(), {
+      serializeSequences: opts.serializeSequences === true,
+    });
   }
   const ids = fetches.map((_, i) => `f${i}`);
   const depIds: string[][] = fetches.map(() => []);
@@ -6216,13 +6225,15 @@ function annotateFetchDeps(
   for (let i = 0; i < fetches.length; i++) {
     fetchDepMap.set(i, { id: ids[i]!, dependsOn: [...new Set(depIds[i]!)] });
   }
-  return assignDepsOnly(root, fetchDepMap, stitchingInfo);
+  return assignDepsOnly(root, fetchDepMap, {
+    serializeSequences: opts.serializeSequences === true,
+  });
 }
 
 function assignDepsOnly(
   root: StitchPlanNode,
   fetchDepMap: Map<number, { id: string; dependsOn: string[] }>,
-  _stitchingInfo: StitchingInfo,
+  opts: { serializeSequences: boolean },
 ): StitchPlanNode {
   // First pass: materialize Fetch nodes with ids so Islands can depend on
   // path-producing hops (nested Island under books[] waits for books Fetch).
@@ -6330,13 +6341,66 @@ function assignDepsOnly(
           : undefined,
       };
     }
-    if (node.kind === 'Parallel' || node.kind === 'Sequence') {
+    if (node.kind === 'Parallel') {
       return {
-        kind: node.kind,
+        kind: 'Parallel',
         nodes: node.nodes.map((c) => assign(c, islandBarrier)),
       };
+    }
+    if (node.kind === 'Sequence') {
+      if (!opts.serializeSequences) {
+        return {
+          kind: 'Sequence',
+          nodes: node.nodes.map((c) => assign(c, islandBarrier)),
+        };
+      }
+      // Mutation document order: each sibling waits on prior siblings' hops.
+      const next: StitchPlanNode[] = [];
+      let barrier = islandBarrier;
+      for (const child of node.nodes) {
+        const assigned = assign(child, barrier);
+        next.push(assigned);
+        const completed: string[] = [];
+        collectAnnotatedIds(assigned, completed);
+        if (completed.length) {
+          barrier = [...barrier, ...completed];
+        }
+      }
+      return { kind: 'Sequence', nodes: next };
     }
     return node;
   };
   return assign(root, []);
+}
+
+function collectAnnotatedIds(node: StitchPlanNode, out: string[]): void {
+  if (
+    node.kind === 'Fetch' ||
+    node.kind === 'BatchFetch' ||
+    node.kind === 'Island'
+  ) {
+    if (node.completesIds?.length) {
+      out.push(...node.completesIds);
+    } else if (node.id) {
+      out.push(node.id);
+    }
+    if (node.kind === 'Island' && node.continue) {
+      collectAnnotatedIds(node.continue, out);
+    }
+    return;
+  }
+  if (node.kind === 'Condition') {
+    if (node.ifClause) {
+      collectAnnotatedIds(node.ifClause, out);
+    }
+    if (node.elseClause) {
+      collectAnnotatedIds(node.elseClause, out);
+    }
+    return;
+  }
+  if (node.kind === 'Sequence' || node.kind === 'Parallel') {
+    for (const child of node.nodes) {
+      collectAnnotatedIds(child, out);
+    }
+  }
 }
