@@ -1,7 +1,6 @@
 import {
   DelegationPlanBuilder,
   extractUnavailableFields,
-  extractUnavailableFieldsFromSelectionSet,
   handleOverrideByDelegation,
   leftOverByDelegationPlan,
   MergedTypeInfo,
@@ -27,8 +26,18 @@ import {
   SelectionNode,
   SelectionSetNode,
 } from 'graphql';
+import {
+  coalesceAdjacentDelegationMaps,
+  optimizeDelegationMap,
+} from './delegationPlanOptimize.js';
 import { getFieldsNotInSubschema } from './getFieldsNotInSubschema.js';
 import { memoize5of7 } from './memoize5of7.js';
+
+export {
+  optimizeDelegationMap,
+  subschemaForUnionedIsolationHop,
+  subschemaWithoutIsolationStripTransforms,
+} from './delegationPlanOptimize.js';
 
 function calculateDelegationStage(
   mergedTypeInfo: MergedTypeInfo,
@@ -38,6 +47,7 @@ function calculateDelegationStage(
   fragments: Record<string, FragmentDefinitionNode>,
   context: any | undefined,
   info: GraphQLResolveInfo | undefined,
+  stitchingInfo?: StitchingInfo,
 ): {
   delegationMap: Map<Subschema, SelectionSetNode>;
   proxiableSubschemas: Array<Subschema>;
@@ -279,7 +289,12 @@ function calculateDelegationStage(
   }
 
   if (delegationMap.size > 1 && !overriddenOverall) {
-    optimizeDelegationMap(delegationMap, mergedTypeInfo.typeName, fragments);
+    optimizeDelegationMap(
+      delegationMap,
+      mergedTypeInfo.typeName,
+      fragments,
+      stitchingInfo,
+    );
   }
 
   return {
@@ -395,7 +410,7 @@ export function createDelegationPlanBuilder(
         return [];
       }
 
-      const delegationMaps: Array<Map<Subschema, SelectionSetNode>> = [];
+      let delegationMaps: Array<Map<Subschema, SelectionSetNode>> = [];
       let sourceSubschemas = createSubschemas(sourceSubschema);
 
       let delegationStage = calculateDelegationStage(
@@ -406,6 +421,7 @@ export function createDelegationPlanBuilder(
         fragments,
         context,
         info,
+        stitchingInfo,
       );
       let { delegationMap } = delegationStage;
       while (delegationMap.size) {
@@ -430,6 +446,7 @@ export function createDelegationPlanBuilder(
           fragments,
           context,
           info,
+          stitchingInfo,
         );
         delegationMap = delegationStage.delegationMap;
       }
@@ -505,6 +522,13 @@ export function createDelegationPlanBuilder(
           }
         }
       }
+
+      delegationMaps = coalesceAdjacentDelegationMaps(
+        delegationMaps,
+        typeName,
+        stitchingInfo,
+      );
+
       if (
         delegationStage.unproxiableFieldNodes.length &&
         delegationStage.nonProxiableSubschemas.length
@@ -537,36 +561,6 @@ export function createDelegationPlanBuilder(
       info,
     );
   });
-}
-
-export function optimizeDelegationMap(
-  delegationMap: Map<Subschema, SelectionSetNode>,
-  typeName: string,
-  fragments: Record<string, FragmentDefinitionNode>,
-): Map<Subschema, SelectionSetNode> {
-  for (const [subschema, selectionSet] of delegationMap) {
-    for (const [subschema2, selectionSet2] of delegationMap) {
-      if (subschema === subschema2) {
-        continue;
-      }
-      const unavailableFields = extractUnavailableFieldsFromSelectionSet(
-        subschema2.transformedSchema,
-        // Unfortunately, getType returns GraphQLNamedType, but we already know the type is a GraphQLObjectType, so we can cast it.
-        subschema2.transformedSchema.getType(typeName) as GraphQLObjectType,
-        selectionSet,
-        () => true,
-        fragments,
-      );
-      if (!unavailableFields.length) {
-        delegationMap.set(subschema2, {
-          kind: Kind.SELECTION_SET,
-          selections: [...selectionSet2.selections, ...selectionSet.selections],
-        });
-        delegationMap.delete(subschema);
-      }
-    }
-  }
-  return delegationMap;
 }
 
 const createSubschemas = memoize1(function createSubschemas(
