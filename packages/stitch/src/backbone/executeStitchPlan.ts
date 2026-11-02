@@ -10,7 +10,10 @@ import {
 } from '@graphql-tools/delegate';
 // Annotation uses Symbol keys (JSON-invisible) via direct assign — cheaper than
 // annotateExternalObject's Object.defineProperties on large entity lists.
-import { getFragmentsFromDocument } from '@graphql-tools/executor';
+import {
+  CRITICAL_ERROR,
+  getFragmentsFromDocument,
+} from '@graphql-tools/executor';
 import {
   createGraphQLError,
   ExecutionRequest,
@@ -271,7 +274,19 @@ function finalizeRootResult(ctx: BackboneExecutionContext): ExecutionResult {
     result.data = {};
   }
   if (ctx.errors.length) {
-    result.errors = ctx.errors as any;
+    // CRITICAL_ERROR is an internal invariant (e.g. iface-field filter miss /
+    // corrupted key). When the path still has an object (even empty), do not
+    // leak it — classic never surfaced these next to successful data.
+    const clientErrors = ctx.errors.filter((error) => {
+      if (!(error as GraphQLError).extensions?.[CRITICAL_ERROR]) {
+        return true;
+      }
+      const key = (error as GraphQLError).path?.[0];
+      return key == null || data[key as string] == null;
+    });
+    if (clientErrors.length) {
+      result.errors = clientErrors as any;
+    }
   }
   return result;
 }
@@ -1312,12 +1327,53 @@ function runOneHop(
   return executeFetchNode(hop, ctx);
 }
 
+/** Top-level response keys selected under a root Fetch (skip __typename). */
+function rootFetchTopFields(
+  fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+): string[] {
+  const sels = fetch.rootField?.selectionSet?.selections ?? [];
+  const names: string[] = [];
+  for (const s of sels) {
+    if (s.kind === Kind.FIELD && s.name.value !== '__typename') {
+      names.push(s.alias?.value ?? s.name.value);
+    }
+  }
+  return names;
+}
+
+/**
+ * True when a failed sibling's selection still shows as null/missing on the
+ * merged object (e.g. downed subgraph left `subgraph2: null`). List roots that
+ * another sibling already filled do not count as holes.
+ */
+function failedFetchExplainsHole(
+  fetch: Extract<StitchPlanNode, { kind: 'Fetch' }>,
+  merged: any,
+): boolean {
+  if (merged == null) {
+    return true;
+  }
+  if (Array.isArray(merged)) {
+    return false;
+  }
+  if (typeof merged !== 'object') {
+    return false;
+  }
+  for (const name of rootFetchTopFields(fetch)) {
+    if (merged[name] == null) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Shared-root Parallel: isolate per-subgraph errors then deep-merge (provides /
  * union-intersection — one owner errors while another returns data).
  *
- * Sibling errors must still surface when another owner returns data; otherwise
- * a downed subgraph is silently null-patched with no `errors` entry.
+ * Lift sibling errors only when they explain a hole in the merged object (or
+ * every sibling failed). Drop speculative-subgraph errors when another owner
+ * already filled the selection (@provides / union probes).
  */
 function runSameKeyRootFetches(
   fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
@@ -1349,7 +1405,16 @@ function runSameKeyRootFetches(
         if (part.data != null) {
           merged = mergeRootValues(merged, part.data);
         }
-        if (part.errors.length) {
+      }
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i]!;
+        if (!part.errors.length) {
+          continue;
+        }
+        if (
+          merged === undefined ||
+          failedFetchExplainsHole(fetches[i]!, merged)
+        ) {
           ctx.errors.push(...part.errors);
         }
       }

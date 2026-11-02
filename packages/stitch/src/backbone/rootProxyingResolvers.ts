@@ -2,6 +2,7 @@ import {
   annotateExternalObject,
   UNPATHED_ERRORS_SYMBOL,
 } from '@graphql-tools/delegate';
+import { CRITICAL_ERROR } from '@graphql-tools/executor';
 import type { ExecutionRequest, Executor } from '@graphql-tools/utils';
 import {
   handleMaybePromise,
@@ -93,18 +94,23 @@ function applyBackboneResult(
     typeof value === 'object' &&
     !Array.isArray(value)
   ) {
-    const existing = (value as any)[UNPATHED_ERRORS_SYMBOL] as
-      | GraphQLError[]
-      | undefined;
-    if (existing?.length) {
-      existing.push(...fieldErrors);
-    } else {
-      annotateExternalObject(
-        value,
-        fieldErrors,
-        undefined,
-        Object.create(null),
-      );
+    const clientErrors = fieldErrors.filter(
+      (error) => !error.extensions?.[CRITICAL_ERROR],
+    );
+    if (clientErrors.length) {
+      const existing = (value as any)[UNPATHED_ERRORS_SYMBOL] as
+        | GraphQLError[]
+        | undefined;
+      if (existing?.length) {
+        existing.push(...clientErrors);
+      } else {
+        annotateExternalObject(
+          value,
+          clientErrors,
+          undefined,
+          Object.create(null),
+        );
+      }
     }
   }
   return value;
