@@ -1,7 +1,10 @@
 /**
- * A/B: classic stitching with/without old DPB memoize5of7, plus backbone.
- * Workload: list of N users merged across two subschemas (high memoize hit rate).
+ * Classic stitching DPB memoize microbench.
+ * Workload: list of N users merged across two subschemas (no @requires).
  * Local executors only — amplifies CPU / planner cost vs network.
+ *
+ * Current code selectively memoizes this case; "force non-memoize" rebuilds
+ * the plan every mergeFields call for comparison.
  */
 import { createDefaultExecutor, StitchingInfo } from '@graphql-tools/delegate';
 import { normalizedExecutor } from '@graphql-tools/executor';
@@ -10,7 +13,6 @@ import { stitchSchemas } from '@graphql-tools/stitch';
 import { benchConfig } from '@internal/testing';
 import { parse } from 'graphql';
 import { bench, describe, expect } from 'vitest';
-import { memoize5of7 } from '../../packages/stitch/src/memoize5of7.js';
 
 const ENTITY_COUNT = 100;
 
@@ -86,31 +88,13 @@ function buildSchema(classicStitching: boolean) {
   });
 }
 
-function installOldStyleDpbMemoize(schema: ReturnType<typeof stitchSchemas>) {
+function forceNonMemoizedDpb(schema: ReturnType<typeof stitchSchemas>) {
   const stitchingInfo = schema.extensions?.stitchingInfo as StitchingInfo;
   for (const typeName in stitchingInfo.mergedTypes) {
     const mergedTypeInfo = stitchingInfo.mergedTypes[typeName];
     if (!mergedTypeInfo?.nonMemoizedDelegationPlanBuilder) continue;
-    // Match pre-clone-less wrapper: cache on first 5 args, drop `parent`.
-    mergedTypeInfo.delegationPlanBuilder = memoize5of7(function (
-      schema,
-      sourceSubschema,
-      variableValues,
-      fragments,
-      fieldNodes,
-      context,
-      info,
-    ) {
-      return mergedTypeInfo.nonMemoizedDelegationPlanBuilder(
-        schema,
-        sourceSubschema,
-        variableValues,
-        fragments,
-        fieldNodes,
-        context,
-        info,
-      );
-    });
+    mergedTypeInfo.delegationPlanBuilder =
+      mergedTypeInfo.nonMemoizedDelegationPlanBuilder;
   }
 }
 
@@ -125,17 +109,17 @@ const document = parse(/* GraphQL */ `
   }
 `);
 
-describe('classic stitching DPB memoize A/B', () => {
-  const schemaNoMemo = buildSchema(true);
+describe('classic stitching DPB selective memoize', () => {
   const schemaMemo = buildSchema(true);
-  installOldStyleDpbMemoize(schemaMemo);
+  const schemaNoMemo = buildSchema(true);
+  forceNonMemoizedDpb(schemaNoMemo);
   const schemaBackbone = buildSchema(false);
 
   bench(
-    'classic merge list — no DPB memoize (current)',
+    'classic merge list — selective memoize (current)',
     async () => {
       const result = await normalizedExecutor({
-        schema: schemaNoMemo,
+        schema: schemaMemo,
         document,
       });
       expect(
@@ -146,10 +130,10 @@ describe('classic stitching DPB memoize A/B', () => {
   );
 
   bench(
-    'classic merge list — old memoize5of7 (no parent)',
+    'classic merge list — force non-memoize',
     async () => {
       const result = await normalizedExecutor({
-        schema: schemaMemo,
+        schema: schemaNoMemo,
         document,
       });
       expect(

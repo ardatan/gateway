@@ -31,6 +31,7 @@ import {
   optimizeDelegationMap,
 } from './delegationPlanOptimize.js';
 import { getFieldsNotInSubschema } from './getFieldsNotInSubschema.js';
+import { memoize5of7 } from './memoize5of7.js';
 
 export { optimizeDelegationMap } from './delegationPlanOptimize.js';
 
@@ -692,8 +693,45 @@ export function createDelegationPlanBuilder(
       }
       return delegationMaps;
     };
-  // Plans depend on parent field presence; never memoize.
-  return mergedTypeInfo.nonMemoizedDelegationPlanBuilder;
+
+  // Selective memoize: skip when @requires / computed fieldSelectionSets make
+  // the plan depend on parent field presence. Progressive override still forces
+  // non-memoized via stitchingInfo (context-sensitive).
+  if (mergedTypePlanDependsOnParent(mergedTypeInfo)) {
+    return mergedTypeInfo.nonMemoizedDelegationPlanBuilder;
+  }
+
+  // Same selection shape across many entities → reuse plan (ignore parent).
+  return memoize5of7(function wrappedDelegationPlanBuilder(
+    schema: GraphQLSchema,
+    sourceSubschema: Subschema<any, any, any, any>,
+    variableValues: Record<string, any>,
+    fragments: Record<string, FragmentDefinitionNode>,
+    fieldNodes: FieldNode[],
+    context?: any,
+    info?: GraphQLResolveInfo,
+  ) {
+    return mergedTypeInfo.nonMemoizedDelegationPlanBuilder(
+      schema,
+      sourceSubschema,
+      variableValues,
+      fragments,
+      fieldNodes,
+      context,
+      info,
+    );
+  });
+}
+
+function mergedTypePlanDependsOnParent(
+  mergedTypeInfo: MergedTypeInfo,
+): boolean {
+  for (const fieldMap of mergedTypeInfo.fieldSelectionSets.values()) {
+    if (fieldMap != null && Object.keys(fieldMap).length > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function seedFetchedFieldsFromParent(
