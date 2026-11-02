@@ -47,7 +47,10 @@ import {
   VariableDefinitionNode,
   visit,
 } from 'graphql';
-import { BACKBONE_EXECUTING } from './rootProxyingResolvers.js';
+import {
+  BACKBONE_EXECUTING,
+  getOriginalRootResolve,
+} from './rootProxyingResolvers.js';
 import type {
   BackboneExecutionContext,
   PathSegment,
@@ -1161,6 +1164,12 @@ function executeIslandNode(
   if (!field?.resolve) {
     return;
   }
+  // Root Islands must bypass backboneRootProxyingResolver (would join the
+  // in-flight plan and deadlock). Nested Islands keep field.resolve (wraps).
+  const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
+  const isRootIsland = parentType === rootType;
+  const resolve =
+    (isRootIsland ? getOriginalRootResolve(field) : undefined) ?? field.resolve;
   const args = getArgumentValues(field, node.fieldNode, ctx.variableValues);
 
   const flattenPaths =
@@ -1199,7 +1208,7 @@ function executeIslandNode(
         },
       };
       return handleMaybePromise(
-        () => field.resolve!(parent, args, ctx.contextValue, info),
+        () => resolve!(parent, args, ctx.contextValue, info),
         (result) => {
           parent[responseKey] = result;
         },
@@ -1211,7 +1220,6 @@ function executeIslandNode(
   }
 
   // Root Island: write into ctx.data[responseKey].
-  const rootType = getDefinedRootType(ctx.schema, ctx.operation.operation);
   const info = {
     ...(ctx.infoStub as any),
     schema: ctx.schema,
@@ -1226,7 +1234,7 @@ function executeIslandNode(
   };
 
   return handleMaybePromise(
-    () => field.resolve!(ctx.rootValue, args, ctx.contextValue, info),
+    () => resolve!(ctx.rootValue, args, ctx.contextValue, info),
     (result) => {
       ctx.data[responseKey] = result;
       // continue: dataflow hop, not tree execute

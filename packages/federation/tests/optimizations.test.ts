@@ -132,11 +132,10 @@ describe('Optimizations', () => {
     });
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
-      // Backbone plan: one inventory hop. Field-resolver wrap suppresses most
-      // classic mergeFields re-entry (was 3 with clone-less / null-context).
-      inventory: 2,
-      products: 3,
-      reviews: 2,
+      // Sibling roots join the in-flight plan (no classic topProducts re-merge).
+      inventory: 1,
+      products: 2,
+      reviews: 1,
     });
   });
 });

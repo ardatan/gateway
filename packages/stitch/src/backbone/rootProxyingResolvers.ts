@@ -154,14 +154,6 @@ export function installRootProxyingResolvers(
         context,
         info,
       ) {
-        // Nested/backbone Island path: call the real local resolver.
-        if (
-          context != null &&
-          typeof context === 'object' &&
-          (context as any)[BACKBONE_EXECUTING]
-        ) {
-          return previousResolve(root, args, context, info);
-        }
         // @defer/@stream: classic incremental execute. The backbone executor
         // falls back to schemaExecutor for these, which would re-enter this
         // proxy and recurse forever if we ran the plan here.
@@ -178,6 +170,11 @@ export function installRootProxyingResolvers(
           return previousResolve(root, args, context, info);
         }
         const responseKey = info.path.key;
+
+        // Share one plan across sibling roots. Never fall through to classic
+        // proxying while a plan is in flight — that re-delegates e.g.
+        // topProducts and schedules a duplicate inventory mergeFields hop.
+        // Root Islands call getOriginalRootResolve() so they do not hit this.
         const cached = (context as any)[CONTEXT_PLAN_RESULT];
         if (cached != null) {
           return applyBackboneResult(cached, responseKey);
