@@ -789,9 +789,7 @@ function handleFlattenedParent<TContext extends Record<string, any>>(
   info: GraphQLResolveInfo,
 ) {
   // If this subschema is satisfied now, try to resolve the deferred fields
-  if (
-    parentSatisfiedSelectionSet(flattenedParent, selectionSet, info.schema)
-  ) {
+  if (parentSatisfiedSelectionSet(flattenedParent, selectionSet, info.schema)) {
     const missingFieldNodes =
       leftOver.missingFieldsParentMap.get(leftOverParent);
     if (missingFieldNodes) {

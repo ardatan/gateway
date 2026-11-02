@@ -112,10 +112,7 @@ function calculateDelegationStage(
    * Schedule @requires selections for a deferred computed field so the next
    * stage can re-enter once deps are fetched (clone-less multi-stage).
    */
-  function scheduleRequiresFetch(
-    target: Subschema,
-    fieldName: string,
-  ): void {
+  function scheduleRequiresFetch(target: Subschema, fieldName: string): void {
     const req = fieldSelectionSets.get(target)?.[fieldName];
     if (req == null) {
       return;
@@ -780,9 +777,8 @@ function seedFetchedFieldsFromParent(
       }
     } else {
       const childType =
-        (typeof value.__typename === 'string'
-          ? value.__typename
-          : undefined) ?? declared;
+        (typeof value.__typename === 'string' ? value.__typename : undefined) ??
+        declared;
       if (childType) {
         seedFetchedFieldsFromParent(
           fetchedFieldsByType,
@@ -1070,8 +1066,7 @@ function subschemaOwnsField(
   // Field only used via @requires / not in ownership maps — schema presence.
   const t = subschema.transformedSchema.getType(typeName);
   return (
-    (isObjectType(t) || isInterfaceType(t)) &&
-    t.getFields()[fieldName] != null
+    (isObjectType(t) || isInterfaceType(t)) && t.getFields()[fieldName] != null
   );
 }
 

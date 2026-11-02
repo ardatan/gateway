@@ -4,7 +4,6 @@ import {
   Subschema,
   SubschemaConfig,
 } from '@graphql-tools/delegate';
-import { classicMergedResolver } from './classicMergedResolver.js';
 import {
   applyExtensions,
   mergeExtensions,
@@ -22,7 +21,6 @@ import {
   extendSchema,
   getNamedType,
   GraphQLDirective,
-  type GraphQLFieldResolver,
   GraphQLNamedType,
   GraphQLObjectType,
   GraphQLSchema,
@@ -32,10 +30,12 @@ import {
   isObjectType,
   isSpecifiedDirective,
   specifiedDirectives,
+  type GraphQLFieldResolver,
 } from 'graphql';
 import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
 import { isClassicStitchingEnabled } from './backbone/classicStitching.js';
 import { BACKBONE_EXECUTING } from './backbone/rootProxyingResolvers.js';
+import { classicMergedResolver } from './classicMergedResolver.js';
 import { defaultMergedResolver as backboneDefaultMergedResolver } from './defaultMergedResolver.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
 import {

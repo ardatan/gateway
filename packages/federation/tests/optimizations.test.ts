@@ -127,9 +127,6 @@ describe('Optimizations', () => {
       schema,
       document: parse(query),
     });
-    const classic =
-      process.env.GRAPHQL_TOOLS_CLASSIC_STITCHING === '1' ||
-      process.env.GRAPHQL_TOOLS_CLASSIC_STITCHING === 'true';
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
       // inventory: 1, (when computed fields definition removed)

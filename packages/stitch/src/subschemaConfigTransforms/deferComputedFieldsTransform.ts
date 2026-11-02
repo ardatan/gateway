@@ -1,5 +1,6 @@
 import {
   DelegationContext,
+  getVariableValues,
   SubschemaConfig,
   Transform,
 } from '@graphql-tools/delegate';
@@ -10,10 +11,9 @@ import {
 } from '@graphql-tools/utils';
 import {
   DocumentNode,
-  FragmentDefinitionNode,
   getNamedType,
   GraphQLSchema,
-  isCompositeType,
+  isObjectType,
   Kind,
   SelectionNode,
   TypeInfo,
@@ -33,9 +33,9 @@ import {
  * (`@key` / `selectionSet`) so the parent still carries identity for later
  * leftover hops.
  */
-export class DeferComputedFieldsTransform<TContext = Record<string, any>>
-  implements Transform<Record<string, any>, TContext>
-{
+export class DeferComputedFieldsTransform<
+  TContext = Record<string, any>,
+> implements Transform<Record<string, any>, TContext> {
   private readonly computedByType: Map<string, Set<string>>;
   private readonly keyFieldsByType: Map<string, Set<string>>;
   private readonly mergeEntryFieldNames: Set<string>;
@@ -173,11 +173,17 @@ function collectKeyFieldNames(
     return [];
   }
   const type = schema.getType(typeName);
-  if (!type || !isCompositeType(type)) {
+  if (!type || !isObjectType(type)) {
     return [];
   }
   const parsed = parseSelectionSet(selectionSetStr, { noLocation: true });
-  const collected = collectFields(schema, {}, {}, type, parsed);
+  const collected = collectFields(
+    schema,
+    {},
+    getVariableValues(undefined),
+    type,
+    parsed,
+  );
   return Array.from(collected.fields.keys());
 }
 

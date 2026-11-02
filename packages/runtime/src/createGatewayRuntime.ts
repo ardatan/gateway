@@ -230,7 +230,8 @@ export function createGatewayRuntime<
   // TODO: Will be deleted after v0
   const onDelegateHooks: OnDelegateHook<unknown>[] = [];
 
-  let unifiedGraph: GraphQLSchema;  let schemaInvalidator: () => void;
+  let unifiedGraph: GraphQLSchema;
+  let schemaInvalidator: () => void;
   let getSchema: () => MaybePromise<GraphQLSchema> = () => unifiedGraph;
   let contextBuilder: <T>(context: T) => MaybePromise<T> | undefined;
   let readinessChecker: () => MaybePromise<boolean>;
@@ -699,7 +700,8 @@ export function createGatewayRuntime<
       },
       onDelegateHooks,
       onSubgraphExecuteHooks,
-      additionalTypeDefs: config.additionalTypeDefs,      additionalResolvers: config.additionalResolvers as IResolvers[],
+      additionalTypeDefs: config.additionalTypeDefs,
+      additionalResolvers: config.additionalResolvers as IResolvers[],
       instrumentation: () => instrumentation,
       batch: config.__experimental__batchExecution,
       batchDelegateOptions: config.__experimental__batchDelegateOptions,

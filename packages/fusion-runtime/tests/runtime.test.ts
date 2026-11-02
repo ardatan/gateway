@@ -1,6 +1,6 @@
 import { buildSubgraphSchema } from '@apollo/subgraph';
 import { usingHiveRouterRuntime } from '~internal/env';
-import { buildSchema, GraphQLSchema, parse } from 'graphql';
+import { buildSchema, parse } from 'graphql';
 import { describe, expect, it } from 'vitest';
 import { handleFederationSubschema } from '../src/federation/subgraph';
 import { composeAndGetExecutor } from './utils';

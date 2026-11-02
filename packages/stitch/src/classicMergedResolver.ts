@@ -53,11 +53,5 @@ function hydrateIfMerged(
     return value;
   }
   const provided = stitchingInfo.localFields?.get(returnTypeName);
-  return resolveLocalFieldResult(
-    value,
-    context,
-    info,
-    stitchingInfo,
-    provided,
-  );
+  return resolveLocalFieldResult(value, context, info, stitchingInfo, provided);
 }
