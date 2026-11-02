@@ -26,14 +26,20 @@ import {
   SelectionNode,
   SelectionSetNode,
 } from 'graphql';
-import { optimizeDelegationMap } from './delegationPlanOptimize.js';
+import {
+  coalesceAdjacentDelegationMaps,
+  optimizeDelegationMap,
+} from './delegationPlanOptimize.js';
 import { getFieldsNotInSubschema } from './getFieldsNotInSubschema.js';
 import {
   memoizeDelegationPlanBuilder,
   parentFieldPresenceKey,
 } from './memoizeDelegationPlanBuilder.js';
 
-export { optimizeDelegationMap } from './delegationPlanOptimize.js';
+export {
+  coalesceAdjacentDelegationMaps,
+  optimizeDelegationMap,
+} from './delegationPlanOptimize.js';
 
 function calculateDelegationStage(
   mergedTypeInfo: MergedTypeInfo,
@@ -670,6 +676,12 @@ export function createDelegationPlanBuilder(
           }
         }
       }
+
+      delegationMaps = coalesceAdjacentDelegationMaps(
+        delegationMaps,
+        typeName,
+        stitchingInfo,
+      );
 
       if (
         delegationStage.unproxiableFieldNodes.length &&

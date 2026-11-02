@@ -12,8 +12,9 @@ export type PathSegment = string | number;
 
 /**
  * One hop inside a multi-type BatchFetch. The batched document uses a single
- * `_entities(representations:)` with inline fragments; `alias` is only a stable id for
- * plan dumps / debugging (results are sliced by representation ranges).
+ * merge field (from MergedTypeConfig.fieldName) with inline fragments when
+ * needed; `alias` is only a stable id for plan dumps / debugging (results are
+ * sliced by key ranges).
  */
 export interface StitchBatchAlias {
   /** Stable id for this hop (`_e0`, …) — not a response field alias. */
@@ -22,7 +23,7 @@ export interface StitchBatchAlias {
   /** Subgraph-local selection (foreign fields stripped at plan time). */
   selectionSet: SelectionSetNode;
   flattenPaths: PathSegment[][];
-  /** Shared representations variable (`representations`). */
+  /** Shared merge-arg variable name from argsFromKeys (e.g. `representations`). */
   representationsVariable?: string;
 }
 
@@ -45,7 +46,7 @@ export type StitchPlanNode =
       subschema: Subschema;
       /** Root field hops write into `data[responseKey]`. */
       rootField?: FieldNode;
-      /** Entity hops: type used for `_entities` / merge resolver. */
+      /** Entity hops: type used for merge field / merge resolver. */
       entityTypeName?: string;
       /** Selections to request from the target subschema. */
       selectionSet: SelectionSetNode;
@@ -53,7 +54,7 @@ export type StitchPlanNode =
       flattenPath?: PathSegment[];
       /**
        * Hive-QP BatchFetch: same entity selection applied at multiple flatten
-       * paths in one hop (one DataLoader/_entities wave).
+       * paths in one hop (one DataLoader / merge-field wave).
        */
       flattenPaths?: PathSegment[][];
       /**
@@ -74,7 +75,7 @@ export type StitchPlanNode =
       subschema: Subschema;
       /** Multi-type / multi-selection hops → one subgraph HTTP call. */
       aliases: StitchBatchAlias[];
-      /** Prebuilt single `_entities` document for one HTTP round-trip. */
+      /** Prebuilt single merge-field document for one HTTP round-trip. */
       document?: DocumentNode;
     }
   | {

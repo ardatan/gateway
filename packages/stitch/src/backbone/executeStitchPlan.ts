@@ -47,6 +47,7 @@ import {
   VariableDefinitionNode,
   visit,
 } from 'graphql';
+import { getBatchedMergeEntry } from './mergeEntry.js';
 import {
   BACKBONE_EXECUTING,
   getOriginalRootResolve,
@@ -1017,9 +1018,9 @@ function executeFetchNode(
 }
 
 /**
- * Federation entity hop like Hive: project keys once, one batchDelegate
- * (_entities) for all parents, index-merge. Falls back when merge config
- * is not argsFromKeys/_entities shaped.
+ * Batched type-merge hop: project keys once, one merge-field call for all
+ * parents, index-merge. Uses MergedTypeConfig (`fieldName`/`argsFromKeys`) —
+ * federation `_entities` or plain stitching `usersByIds` alike.
  */
 function tryExecuteEntitiesBatch(
   node: Extract<StitchPlanNode, { kind: 'Fetch' }>,
@@ -1030,19 +1031,8 @@ function tryExecuteEntitiesBatch(
   type: GraphQLOutputType,
 ): MaybePromise<void> | undefined {
   const typeName = node.entityTypeName!;
-  const mergeConfig = hopSubschema.merge?.[typeName];
-  const entry =
-    mergeConfig?.key != null &&
-    mergeConfig.argsFromKeys != null &&
-    mergeConfig.fieldName === '_entities'
-      ? mergeConfig
-      : mergeConfig?.entryPoints?.find(
-          (e) =>
-            e.key != null &&
-            e.argsFromKeys != null &&
-            e.fieldName === '_entities',
-        );
-  if (!entry?.key || !entry.argsFromKeys) {
+  const entry = getBatchedMergeEntry(hopSubschema, typeName);
+  if (!entry) {
     return undefined;
   }
 
@@ -1101,45 +1091,31 @@ function tryExecuteEntitiesBatch(
   };
 
   // Prebuilt document skips Transformer — only safe for leaf-only selections
-  // (Hive inventory/username style). Nested/abstract/requires need
-  // prepareGatewayDocument (wrapConcreteTypes, fieldNodesByField, transforms).
-  if (node.document && isLeafOnlySelection(node.selectionSet)) {
-    const args = entry.argsFromKeys!(keys) as Record<string, any>;
-    const executor = getSubschemaExecutor(hopSubschema);
-    return handleMaybePromise(
-      () =>
-        executor({
-          document: node.document!,
-          variables: args,
-          context: ctx.contextValue,
-          rootValue: ctx.rootValue,
-          operationType: OperationTypeNode.QUERY,
-          signal: ctx.signal,
-          subgraphName: hopSubschema.name,
-        } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
-      (result: ExecutionResult) => {
-        if (result.errors?.length) {
-          ctx.errors.push(...result.errors);
-        }
-        mergeResults(result.data?.['_entities']);
-      },
-    );
+  // (inventory/username style). Nested selections (field args, deep merges)
+  // fall through to per-parent merge resolvers so batchDelegate DataLoader
+  // keys include field arguments (sharedRootValue / sortBy memoization).
+  if (!(node.document && isLeafOnlySelection(node.selectionSet))) {
+    return undefined;
   }
-
+  const args = entry.argsFromKeys(keys) as Record<string, any>;
+  const executor = getSubschemaExecutor(hopSubschema);
   return handleMaybePromise(
     () =>
-      delegateToSchema({
-        schema: hopSubschema,
-        operation: OperationTypeNode.QUERY,
-        fieldName: '_entities',
-        returnType: new GraphQLList(type),
-        args: entry.argsFromKeys!(keys),
-        selectionSet: node.selectionSet,
+      executor({
+        document: node.document!,
+        variables: args,
         context: ctx.contextValue,
-        info: info as any,
-        skipTypeMerging: true,
-      }),
-    mergeResults,
+        rootValue: ctx.rootValue,
+        operationType: OperationTypeNode.QUERY,
+        signal: ctx.signal,
+        subgraphName: hopSubschema.name,
+      } satisfies ExecutionRequest) as MaybePromise<ExecutionResult>,
+    (result: ExecutionResult) => {
+      if (result.errors?.length) {
+        ctx.errors.push(...result.errors);
+      }
+      mergeResults(result.data?.[entry.fieldName]);
+    },
   );
 }
 
@@ -1679,23 +1655,13 @@ function projectRepresentations(
   keys: any[];
   parentKeyIndex: number[];
   entry: {
+    fieldName: string;
     key: (p: any) => any;
     argsFromKeys: (keys: ReadonlyArray<any>) => Record<string, any>;
   };
 } | null {
-  const mergeConfig = hopSubschema.merge?.[entityTypeName];
-  const entry =
-    mergeConfig?.key != null &&
-    mergeConfig.argsFromKeys != null &&
-    mergeConfig.fieldName === '_entities'
-      ? mergeConfig
-      : mergeConfig?.entryPoints?.find(
-          (e) =>
-            e.key != null &&
-            e.argsFromKeys != null &&
-            e.fieldName === '_entities',
-        );
-  if (!entry?.key || !entry.argsFromKeys) {
+  const entry = getBatchedMergeEntry(hopSubschema, entityTypeName);
+  if (!entry) {
     return null;
   }
   const cacheKeyFn = entry.dataLoaderOptions?.cacheKeyFn;
@@ -1721,7 +1687,11 @@ function projectRepresentations(
   return {
     keys,
     parentKeyIndex,
-    entry: { key: entry.key, argsFromKeys: entry.argsFromKeys },
+    entry: {
+      fieldName: entry.fieldName,
+      key: entry.key,
+      argsFromKeys: entry.argsFromKeys,
+    },
   };
 }
 
@@ -1755,11 +1725,10 @@ function isLeafOnlySelection(selectionSet: SelectionSetNode): boolean {
 }
 
 /**
- * Multi-type BatchFetch — one prebuilt `_entities` document with inline
+ * Multi-type BatchFetch — one prebuilt merge-field document with inline
  * fragments for every alias, one subgraph HTTP round-trip, then slice the
- * result array by representation ranges. Nested alias selections fall back
- * to parallel Fetches (gateway `batch` executor still collapses same-tick
- * `_entities` into one HTTP).
+ * result array by key ranges. Nested alias selections fall back to parallel
+ * Fetches (gateway `batch` executor still collapses same-tick merge fields).
  */
 function executeBatchFetchNode(
   node: Extract<StitchPlanNode, { kind: 'BatchFetch' }>,
@@ -1769,13 +1738,14 @@ function executeBatchFetchNode(
     return;
   }
 
-  // Prefer one concatenated `_entities` HTTP whenever the plan attached a
+  // Prefer one concatenated merge-field HTTP whenever the plan attached a
   // document. Alias selectionSets stay unfiltered for the parallel-Fetch
   // fallback; the document itself carries subgraph-filtered selections.
   if (node.document) {
     const prepared: BatchAliasPrep[] = [];
     const allKeys: any[] = [];
     let canRawBatch = true;
+    let mergeEntry: ReturnType<typeof getBatchedMergeEntry> = null;
 
     for (let i = 0; i < node.aliases.length; i++) {
       const a = node.aliases[i]!;
@@ -1803,6 +1773,7 @@ function executeBatchFetchNode(
         canRawBatch = false;
         break;
       }
+      mergeEntry ??= getBatchedMergeEntry(node.subschema, a.entityTypeName);
       const keyOffset = allKeys.length;
       for (const key of projected.keys) {
         allKeys.push(key);
@@ -1816,16 +1787,18 @@ function executeBatchFetchNode(
       });
     }
 
-    if (canRawBatch) {
+    if (canRawBatch && mergeEntry) {
       if (!allKeys.length) {
         return;
       }
+      const fieldName = mergeEntry.fieldName;
+      const variables = mergeEntry.argsFromKeys(allKeys);
       const executor = getSubschemaExecutor(node.subschema);
       return handleMaybePromise(
         () =>
           executor({
             document: node.document!,
-            variables: { representations: allKeys },
+            variables,
             context: ctx.contextValue,
             rootValue: ctx.rootValue,
             operationType: OperationTypeNode.QUERY,
@@ -1836,7 +1809,7 @@ function executeBatchFetchNode(
           if (result.errors?.length) {
             ctx.errors.push(...result.errors);
           }
-          const entities = result.data?.['_entities'];
+          const entities = result.data?.[fieldName];
           if (!Array.isArray(entities)) {
             return;
           }
@@ -1871,7 +1844,7 @@ function executeBatchFetchNode(
             errorFromFetchThrow(
               err,
               node.subschema,
-              node.aliases[0]?.alias ?? '_entities',
+              node.aliases[0]?.alias ?? fieldName,
             ),
           );
         },
@@ -1880,7 +1853,7 @@ function executeBatchFetchNode(
   }
 
   // Nested / abstract aliases: parallel Fetch (gateway batch executor merges
-  // same-tick `_entities` when `batch` is enabled).
+  // same-tick merge fields when `batch` is enabled).
   const jobs = node.aliases.map((a) =>
     executeFetchNode(
       {

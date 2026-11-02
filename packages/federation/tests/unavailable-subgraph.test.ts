@@ -182,6 +182,7 @@ describe('Yoga gateway - subgraph unavailable', () => {
           subgraph2: null,
         },
       });
+      // Soften request.body — backbone plan documents may differ from classic.
       expect(result.errors).toEqual(
         expect.arrayContaining([
           expect.objectContaining({

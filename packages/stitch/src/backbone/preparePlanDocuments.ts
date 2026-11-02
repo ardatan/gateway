@@ -9,12 +9,16 @@ import {
   isUnionType,
   Kind,
   OperationDefinitionNode,
-  OperationTypeNode,
   SelectionNode,
   SelectionSetNode,
   VariableDefinitionNode,
   visit,
 } from 'graphql';
+import {
+  buildBatchedMergeDocument,
+  getBatchedMergeEntry,
+  inferMergeArgName,
+} from './mergeEntry.js';
 import type { StitchBatchAlias, StitchPlanNode } from './types.js';
 
 const TYPENAME_FIELD: FieldNode = {
@@ -258,143 +262,6 @@ export function filterSelectionSetForSubschema(
   return { kind: Kind.SELECTION_SET, selections: next };
 }
 
-function anyTypeRef() {
-  return {
-    kind: Kind.NON_NULL_TYPE as const,
-    type: {
-      kind: Kind.LIST_TYPE as const,
-      type: {
-        kind: Kind.NON_NULL_TYPE as const,
-        type: {
-          kind: Kind.NAMED_TYPE as const,
-          name: { kind: Kind.NAME as const, value: '_Any' },
-        },
-      },
-    },
-  };
-}
-
-function buildEntitiesDocument(
-  typeName: string,
-  selectionSet: SelectionSetNode,
-): DocumentNode {
-  return {
-    kind: Kind.DOCUMENT,
-    definitions: [
-      {
-        kind: Kind.OPERATION_DEFINITION,
-        operation: 'query' as OperationTypeNode,
-        variableDefinitions: [
-          {
-            kind: Kind.VARIABLE_DEFINITION,
-            variable: {
-              kind: Kind.VARIABLE,
-              name: { kind: Kind.NAME, value: 'representations' },
-            },
-            type: anyTypeRef(),
-          },
-        ],
-        selectionSet: {
-          kind: Kind.SELECTION_SET,
-          selections: [
-            {
-              kind: Kind.FIELD,
-              name: { kind: Kind.NAME, value: '_entities' },
-              arguments: [
-                {
-                  kind: Kind.ARGUMENT,
-                  name: { kind: Kind.NAME, value: 'representations' },
-                  value: {
-                    kind: Kind.VARIABLE,
-                    name: { kind: Kind.NAME, value: 'representations' },
-                  },
-                },
-              ],
-              selectionSet: {
-                kind: Kind.SELECTION_SET,
-                selections: [
-                  {
-                    kind: Kind.INLINE_FRAGMENT,
-                    typeCondition: {
-                      kind: Kind.NAMED_TYPE,
-                      name: { kind: Kind.NAME, value: typeName },
-                    },
-                    selectionSet,
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      },
-    ],
-  };
-}
-
-/**
- * One `_entities(representations:)` with inline fragments for every alias — classic
- * batch-delegate shape. Results are sliced by representation ranges at
- * execute time (no `_e0`/`_e1` multi-alias fields).
- */
-function buildBatchEntitiesDocument(aliases: StitchBatchAlias[]): DocumentNode {
-  const inlineFragments = aliases.map((a) => ({
-    kind: Kind.INLINE_FRAGMENT as const,
-    typeCondition: {
-      kind: Kind.NAMED_TYPE as const,
-      name: {
-        kind: Kind.NAME as const,
-        value: a.entityTypeName,
-      },
-    },
-    selectionSet: a.selectionSet,
-  }));
-  return {
-    kind: Kind.DOCUMENT,
-    definitions: [
-      {
-        kind: Kind.OPERATION_DEFINITION,
-        operation: 'query' as OperationTypeNode,
-        variableDefinitions: [
-          {
-            kind: Kind.VARIABLE_DEFINITION as const,
-            variable: {
-              kind: Kind.VARIABLE as const,
-              name: { kind: Kind.NAME as const, value: 'representations' },
-            },
-            type: anyTypeRef(),
-          },
-        ],
-        selectionSet: {
-          kind: Kind.SELECTION_SET,
-          selections: [
-            {
-              kind: Kind.FIELD as const,
-              name: { kind: Kind.NAME as const, value: '_entities' },
-              arguments: [
-                {
-                  kind: Kind.ARGUMENT as const,
-                  name: { kind: Kind.NAME as const, value: 'representations' },
-                  value: {
-                    kind: Kind.VARIABLE as const,
-                    name: {
-                      kind: Kind.NAME as const,
-                      value: 'representations',
-                    },
-                  },
-                },
-              ],
-              selectionSet: {
-                kind: Kind.SELECTION_SET as const,
-                selections: inlineFragments,
-              },
-            },
-          ],
-        },
-      },
-    ],
-  };
-}
-
 function targetSchema(subschema: Subschema): GraphQLSchema {
   return subschema.schema;
 }
@@ -604,30 +471,60 @@ export function preparePlanDocuments(
       fragments,
       fieldNodesByField,
     );
+    const entry = getBatchedMergeEntry(root.subschema, root.entityTypeName);
+    const document =
+      entry != null
+        ? (buildBatchedMergeDocument(schema, entry, [
+            { entityTypeName: root.entityTypeName, selectionSet: filtered },
+          ]) ?? undefined)
+        : undefined;
     return {
       ...root,
-      document: buildEntitiesDocument(root.entityTypeName, filtered),
+      document,
     };
   }
   if (root.kind === 'BatchFetch') {
     const schema = targetSchema(root.subschema);
-    const aliases: StitchBatchAlias[] = root.aliases.map((a) => ({
+    const filteredAliases = root.aliases.map((a) => ({
       ...a,
-      // Shared representations var — execute concatenates per-alias keys.
-      representationsVariable: 'representations',
+      selectionSet: filterSelectionSetForSubschema(
+        a.selectionSet,
+        a.entityTypeName,
+        schema,
+        fragments,
+        fieldNodesByField,
+      ),
     }));
-    const document = buildBatchEntitiesDocument(
-      aliases.map((a) => ({
-        ...a,
-        selectionSet: filterSelectionSetForSubschema(
-          a.selectionSet,
-          a.entityTypeName,
-          schema,
-          fragments,
-          fieldNodesByField,
-        ),
-      })),
+    // One prebuilt doc only when every alias shares the same merge field + arg.
+    const entries = filteredAliases.map((a) =>
+      getBatchedMergeEntry(root.subschema, a.entityTypeName),
     );
+    const first = entries[0];
+    const argName =
+      first != null ? inferMergeArgName(first.argsFromKeys) : null;
+    const canBatchDoc =
+      first != null &&
+      argName != null &&
+      entries.every(
+        (e) =>
+          e != null &&
+          e.fieldName === first.fieldName &&
+          inferMergeArgName(e.argsFromKeys) === argName,
+      );
+    const aliases: StitchBatchAlias[] = filteredAliases.map((a) => ({
+      ...a,
+      representationsVariable: canBatchDoc ? argName! : undefined,
+    }));
+    const document = canBatchDoc
+      ? (buildBatchedMergeDocument(
+          schema,
+          first!,
+          aliases.map((a) => ({
+            entityTypeName: a.entityTypeName,
+            selectionSet: a.selectionSet,
+          })),
+        ) ?? undefined)
+      : undefined;
     return {
       ...root,
       aliases,
