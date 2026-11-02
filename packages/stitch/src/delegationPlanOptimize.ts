@@ -40,15 +40,3 @@ export function optimizeDelegationMap(
   }
   return delegationMap;
 }
-
-/**
- * Adjacent-stage isolation-clone coalesce removed with clone-less deferral.
- * Kept as a no-op so call sites stay stable.
- */
-export function coalesceAdjacentDelegationMaps(
-  delegationMaps: Array<Map<Subschema, SelectionSetNode>>,
-  _typeName: string,
-  _stitchingInfo?: StitchingInfo,
-): Array<Map<Subschema, SelectionSetNode>> {
-  return delegationMaps;
-}

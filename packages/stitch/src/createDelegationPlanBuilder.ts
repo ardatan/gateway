@@ -26,10 +26,7 @@ import {
   SelectionNode,
   SelectionSetNode,
 } from 'graphql';
-import {
-  coalesceAdjacentDelegationMaps,
-  optimizeDelegationMap,
-} from './delegationPlanOptimize.js';
+import { optimizeDelegationMap } from './delegationPlanOptimize.js';
 import { getFieldsNotInSubschema } from './getFieldsNotInSubschema.js';
 import {
   memoizeDelegationPlanBuilder,
@@ -676,12 +673,6 @@ export function createDelegationPlanBuilder(
           }
         }
       }
-
-      delegationMaps = coalesceAdjacentDelegationMaps(
-        delegationMaps,
-        typeName,
-        stitchingInfo,
-      );
 
       if (
         delegationStage.unproxiableFieldNodes.length &&
