@@ -6,4 +6,4 @@
 
 Remove `onDelegationPlan` / `onDelegationStageExecute` plugin hooks (and the debug plugin that depended on them). They conflicted with DPB memoization and were rarely useful.
 
-Restore selective DPB memoization for classic stitching: types without `@requires`/computed `fieldSelectionSets` reuse the old `memoize5of7` plan cache; types with parent-dependent requires stay non-memoized. Progressive override still forces non-memoized plans.
+Restore DPB memoization for classic stitching with a parent field-presence seed key: types without `@requires`/computed ignore parent (main-era cache behavior); types with `fieldSelectionSets` still memoize when parent shapes match so list merges stay fast without breaking clone-less requires. Progressive override still forces non-memoized plans.
