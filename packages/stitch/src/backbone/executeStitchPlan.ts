@@ -1315,6 +1315,9 @@ function runOneHop(
 /**
  * Shared-root Parallel: isolate per-subgraph errors then deep-merge (provides /
  * union-intersection — one owner errors while another returns data).
+ *
+ * Sibling errors must still surface when another owner returns data; otherwise
+ * a downed subgraph is silently null-patched with no `errors` entry.
  */
 function runSameKeyRootFetches(
   fetches: Array<Extract<StitchPlanNode, { kind: 'Fetch' }>>,
@@ -1340,20 +1343,22 @@ function runSameKeyRootFetches(
     () => allMaybePromises(jobs),
     (parts: Array<{ data: any; errors: any[] }>) => {
       let merged: any = undefined;
-      let anyData = false;
       for (const part of parts) {
-        if (part.data !== undefined) {
-          anyData = true;
+        // Errors-only siblings set `data[responseKey] = null`; skip that null
+        // so a successful sibling's object is not replaced by root null.
+        if (part.data != null) {
           merged = mergeRootValues(merged, part.data);
+        }
+        if (part.errors.length) {
+          ctx.errors.push(...part.errors);
         }
       }
       if (merged !== undefined) {
         ctx.data[responseKey] = merged;
-      }
-      if (!anyData) {
-        for (const part of parts) {
-          ctx.errors.push(...part.errors);
-        }
+      } else if (parts.some((part) => part.errors.length)) {
+        // Every sibling failed or returned null — expose null for nullability
+        // bubbling in finalizeRootResult.
+        ctx.data[responseKey] = null;
       }
     },
   );

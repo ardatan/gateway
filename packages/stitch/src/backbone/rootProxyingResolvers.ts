@@ -1,3 +1,7 @@
+import {
+  annotateExternalObject,
+  UNPATHED_ERRORS_SYMBOL,
+} from '@graphql-tools/delegate';
 import type { ExecutionRequest, Executor } from '@graphql-tools/utils';
 import {
   handleMaybePromise,
@@ -5,6 +9,7 @@ import {
 } from '@whatwg-node/promise-helpers';
 import {
   defaultFieldResolver,
+  GraphQLError,
   GraphQLFieldResolver,
   GraphQLSchema,
   isObjectType,
@@ -47,6 +52,62 @@ function selectionHasDeferOrStream(
     }
   }
   return false;
+}
+
+function fieldErrorsForKey(
+  errors: ReadonlyArray<GraphQLError> | undefined,
+  responseKey: string | number,
+): GraphQLError[] {
+  if (!errors?.length) {
+    return [];
+  }
+  return errors.filter(
+    (error) => !error.path?.length || error.path[0] === responseKey,
+  );
+}
+
+/**
+ * Surface backbone plan errors through stock graphql-js field resolution:
+ * - null field value → throw (graphql-js nulls + records the error)
+ * - partial object → stamp UNPATHED_ERRORS so nested merged resolvers report
+ *   them via resolveExternalValue (classic parity)
+ */
+function applyBackboneResult(
+  result: { data?: Record<string, any> | null; errors?: GraphQLError[] } | null,
+  responseKey: string | number,
+): any {
+  const value = result?.data?.[responseKey as string];
+  const fieldErrors = fieldErrorsForKey(result?.errors, responseKey);
+  if (fieldErrors.length && value == null) {
+    if (fieldErrors.length === 1) {
+      throw fieldErrors[0];
+    }
+    throw new AggregateError(
+      fieldErrors,
+      fieldErrors.map((e) => e.message).join(',\n'),
+    );
+  }
+  if (
+    fieldErrors.length &&
+    value != null &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  ) {
+    const existing = (value as any)[UNPATHED_ERRORS_SYMBOL] as
+      | GraphQLError[]
+      | undefined;
+    if (existing?.length) {
+      existing.push(...fieldErrors);
+    } else {
+      annotateExternalObject(
+        value,
+        fieldErrors,
+        undefined,
+        Object.create(null),
+      );
+    }
+  }
+  return value;
 }
 
 /**
@@ -113,10 +174,7 @@ export function installRootProxyingResolvers(
         const responseKey = info.path.key;
         const cached = (context as any)[CONTEXT_PLAN_RESULT];
         if (cached != null) {
-          if (cached.errors?.length && cached.data == null) {
-            throw cached.errors[0];
-          }
-          return cached.data?.[responseKey];
+          return applyBackboneResult(cached, responseKey);
         }
 
         let pending = (context as any)[CONTEXT_PLAN_PROMISE] as
@@ -149,12 +207,7 @@ export function installRootProxyingResolvers(
         }
         return handleMaybePromise(
           () => pending,
-          (result) => {
-            if (result?.errors?.length && result.data == null) {
-              throw result.errors[0];
-            }
-            return result?.data?.[responseKey];
-          },
+          (result) => applyBackboneResult(result, responseKey),
         );
       };
     }
