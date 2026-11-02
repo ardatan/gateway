@@ -12,7 +12,7 @@ import {
   type GraphQLFieldResolver,
   type GraphQLResolveInfo,
 } from 'graphql';
-import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
+import { resolveLocalFieldResult } from '../resolveLocalFieldResult.js';
 
 /**
  * Gateway default field resolver for stitched schemas (backbone era).

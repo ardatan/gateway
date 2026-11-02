@@ -38,9 +38,9 @@ import {
 } from 'graphql';
 import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
 import { isClassicStitchingEnabled } from './backbone/classicStitching.js';
+import { defaultMergedResolver as backboneDefaultMergedResolver } from './backbone/defaultMergedResolver.js';
 import { BACKBONE_EXECUTING } from './backbone/rootProxyingResolvers.js';
 import { classicMergedResolver } from './classicMergedResolver.js';
-import { defaultMergedResolver as backboneDefaultMergedResolver } from './defaultMergedResolver.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
 import {
   addStitchingInfo,

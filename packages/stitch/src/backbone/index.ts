@@ -6,6 +6,7 @@ export {
   resolveBackboneExecutorOptions,
   snapshotRootFieldResolves,
 } from './attachBackboneExecutor.js';
+export { defaultMergedResolver } from './defaultMergedResolver.js';
 export {
   CLASSIC_STITCHING_ENV,
   getStitchingExecutionMode,

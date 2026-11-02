@@ -472,7 +472,43 @@ it('should consistently explain the query plan', async () => {
       "extensions": {
         "plan": [
           {
-            "query": "query ($representations: [_Any!]!) {
+            "query": "query TestQuery {
+      topProducts {
+        ... on Product {
+          upc
+          name
+          price
+          weight
+        }
+        upc
+        name
+        price
+        weight
+        __typename
+      }
+    }",
+            "subgraphName": "products",
+            "variables": {},
+          },
+          {
+            "query": "query TestQuery {
+      users {
+        ... on User {
+          id
+          username
+          name
+        }
+        id
+        username
+        name
+        __typename
+      }
+    }",
+            "subgraphName": "accounts",
+            "variables": {},
+          },
+          {
+            "query": "query TestQuery($representations: [_Any!]!) {
       _entities(representations: $representations) {
         ... on Product {
           __typename
@@ -506,7 +542,7 @@ it('should consistently explain the query plan', async () => {
             },
           },
           {
-            "query": "query ($representations: [_Any!]!) {
+            "query": "query TestQuery($representations: [_Any!]!) {
       _entities(representations: $representations) {
         ... on Product {
           __typename
@@ -535,7 +571,7 @@ it('should consistently explain the query plan', async () => {
             },
           },
           {
-            "query": "query ($representations: [_Any!]!) {
+            "query": "query TestQuery($representations: [_Any!]!) {
       _entities(representations: $representations) {
         ... on User {
           __typename
@@ -647,7 +683,7 @@ it('should consistently explain the query plan', async () => {
             },
           },
           {
-            "query": "query ($representations: [_Any!]!) {
+            "query": "query TestQuery($representations: [_Any!]!) {
       _entities(representations: $representations) {
         ... on User {
           __typename
@@ -669,42 +705,6 @@ it('should consistently explain the query plan', async () => {
                 },
               ],
             },
-          },
-          {
-            "query": "query TestQuery {
-      topProducts {
-        ... on Product {
-          upc
-          name
-          price
-          weight
-        }
-        upc
-        name
-        price
-        weight
-        __typename
-      }
-    }",
-            "subgraphName": "products",
-            "variables": {},
-          },
-          {
-            "query": "query TestQuery {
-      users {
-        ... on User {
-          id
-          username
-          name
-        }
-        id
-        username
-        name
-        __typename
-      }
-    }",
-            "subgraphName": "accounts",
-            "variables": {},
           },
         ],
       },

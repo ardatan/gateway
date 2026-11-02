@@ -36,12 +36,6 @@ import {
 } from 'graphql';
 import { handleMaybePromiseMaybeAsyncIterable } from './utils';
 
-export type { PubsubPublishMetadata } from '@graphql-mesh/fusion-runtime';
-export {
-  getPubsubPublishMetadata,
-  handleResultWithPubSubPublish,
-} from '@graphql-mesh/fusion-runtime';
-
 /**
  * @pubsubOperation
  */

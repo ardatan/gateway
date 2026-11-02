@@ -5,8 +5,8 @@ import {
   stitchSchemas,
 } from '@graphql-tools/stitch';
 import { afterEach, describe, expect, it } from 'vitest';
+import { defaultMergedResolver as backboneDefaultMergedResolver } from '../src/backbone/defaultMergedResolver.js';
 import { classicMergedResolver } from '../src/classicMergedResolver.js';
-import { defaultMergedResolver as backboneDefaultMergedResolver } from '../src/defaultMergedResolver.js';
 
 const ENV = 'GRAPHQL_TOOLS_CLASSIC_STITCHING';
 

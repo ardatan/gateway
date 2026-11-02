@@ -4,7 +4,6 @@ export {
   createMultiEntryMergedTypeResolver,
 } from './createMergedTypeResolver.js';
 export { forwardArgsToSelectionSet } from './selectionSetArgs.js';
-export { defaultMergedResolver } from './defaultMergedResolver.js';
 
 export * from './subschemaConfigTransforms/index.js';
 export * from './types.js';

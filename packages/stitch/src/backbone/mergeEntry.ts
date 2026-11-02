@@ -10,6 +10,7 @@ import {
   Kind,
   ListTypeNode,
   NamedTypeNode,
+  NameNode,
   OperationTypeNode,
   SelectionSetNode,
   TypeNode,
@@ -203,11 +204,13 @@ function mergeFieldSelection(
 /**
  * Prebuilt merge hop document from MergedTypeConfig + subgraph schema
  * (not federation-hardcoded `_entities` / `representations` / `_Any`).
+ * Forwards the client operation name when present (subgraph tracing/logs).
  */
 export function buildBatchedMergeDocument(
   schema: GraphQLSchema,
   entry: BatchedMergeEntry,
   aliases: Array<{ entityTypeName: string; selectionSet: SelectionSetNode }>,
+  operationName?: NameNode | string | null,
 ): DocumentNode | null {
   if (!aliases.length) {
     return null;
@@ -226,12 +229,15 @@ export function buildBatchedMergeDocument(
   if (!fieldSelection) {
     return null;
   }
+  const nameValue =
+    typeof operationName === 'string' ? operationName : operationName?.value;
   return {
     kind: Kind.DOCUMENT,
     definitions: [
       {
         kind: Kind.OPERATION_DEFINITION,
         operation: 'query' as OperationTypeNode,
+        name: nameValue ? { kind: Kind.NAME, value: nameValue } : undefined,
         variableDefinitions: [
           {
             kind: Kind.VARIABLE_DEFINITION,

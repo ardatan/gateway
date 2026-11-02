@@ -474,9 +474,17 @@ export function preparePlanDocuments(
     const entry = getBatchedMergeEntry(root.subschema, root.entityTypeName);
     const document =
       entry != null
-        ? (buildBatchedMergeDocument(schema, entry, [
-            { entityTypeName: root.entityTypeName, selectionSet: filtered },
-          ]) ?? undefined)
+        ? (buildBatchedMergeDocument(
+            schema,
+            entry,
+            [
+              {
+                entityTypeName: root.entityTypeName,
+                selectionSet: filtered,
+              },
+            ],
+            operation.name,
+          ) ?? undefined)
         : undefined;
     return {
       ...root,
@@ -523,6 +531,7 @@ export function preparePlanDocuments(
             entityTypeName: a.entityTypeName,
             selectionSet: a.selectionSet,
           })),
+          operation.name,
         ) ?? undefined)
       : undefined;
     return {

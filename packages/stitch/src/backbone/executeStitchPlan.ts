@@ -967,14 +967,7 @@ function executeFetchNode(
 
   // Hive-style: one batched _entities hop for all parents (single
   // batchDelegateToSchema / DataLoader batch instead of N resolver entries).
-  const batched = tryExecuteEntitiesBatch(
-    node,
-    parents,
-    hopSubschema,
-    ctx,
-    info,
-    type as GraphQLOutputType,
-  );
+  const batched = tryExecuteEntitiesBatch(node, parents, hopSubschema, ctx);
   if (batched !== undefined) {
     return batched;
   }
@@ -1026,8 +1019,6 @@ function tryExecuteEntitiesBatch(
   parents: Array<Record<string, any>>,
   hopSubschema: Subschema,
   ctx: BackboneExecutionContext,
-  _info: Record<string, any>,
-  _type: GraphQLOutputType,
 ): MaybePromise<void> | undefined {
   const typeName = node.entityTypeName!;
   const entry = getBatchedMergeEntry(hopSubschema, typeName);
