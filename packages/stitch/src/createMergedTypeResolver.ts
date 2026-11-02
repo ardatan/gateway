@@ -1,10 +1,12 @@
 import { batchDelegateToSchema } from '@graphql-tools/batch-delegate';
 import {
   delegateToSchema,
+  MergedTypeConfig,
   MergedTypeResolver,
   MergedTypeResolverOptions,
   Subschema,
 } from '@graphql-tools/delegate';
+import { handleMaybePromise } from '@whatwg-node/promise-helpers';
 import {
   getNamedType,
   GraphQLList,
@@ -12,6 +14,7 @@ import {
   OperationTypeNode,
 } from 'graphql';
 import { GraphQLResolveInfo } from 'graphql/type';
+import { entryPointAppliesToParent } from './backbone/mergeEntry.js';
 
 function getMergeOperation(
   info: GraphQLResolveInfo,
@@ -30,6 +33,78 @@ function getMergeOperation(
     return 'mutation' as OperationTypeNode;
   }
   return 'query' as OperationTypeNode;
+}
+
+/**
+ * Multi-key merge on one subschema: try each entryPoint's `key` until one
+ * returns a non-null value, then batchDelegate with that entry's fieldName.
+ */
+export function createMultiEntryMergedTypeResolver<
+  TContext extends Record<string, any> = any,
+>(
+  mergedTypeConfig: MergedTypeConfig<any, any, TContext>,
+  mergedType?: GraphQLOutputType | string,
+): MergedTypeResolver<TContext> | undefined {
+  const entryPoints = mergedTypeConfig.entryPoints;
+  if (entryPoints == null || entryPoints.length < 2) {
+    return createMergedTypeResolver(mergedTypeConfig, mergedType);
+  }
+  const resolvers = entryPoints.map((ep) =>
+    createMergedTypeResolver(ep, mergedType),
+  );
+  return function multiEntryMergedTypeResolver(
+    originalResult,
+    context,
+    info,
+    subschema,
+    selectionSet,
+    _key,
+    type,
+    skipTypeMerging = true,
+  ) {
+    const tryAt = (i: number): ReturnType<MergedTypeResolver<TContext>> => {
+      if (i >= entryPoints.length) {
+        return originalResult;
+      }
+      const ep = entryPoints[i]!;
+      const resolver = resolvers[i];
+      if (resolver == null || !entryPointAppliesToParent(ep, originalResult)) {
+        return tryAt(i + 1);
+      }
+      // Batched entries expose `key`; single-result entries use `args` only.
+      if (ep.key == null) {
+        return resolver(
+          originalResult,
+          context,
+          info,
+          subschema,
+          selectionSet,
+          undefined,
+          type,
+          skipTypeMerging,
+        );
+      }
+      return handleMaybePromise(
+        () => ep.key!(originalResult),
+        (key) => {
+          if (key == null) {
+            return tryAt(i + 1);
+          }
+          return resolver(
+            originalResult,
+            context,
+            info,
+            subschema,
+            selectionSet,
+            key,
+            type,
+            skipTypeMerging,
+          );
+        },
+      );
+    };
+    return tryAt(0);
+  };
 }
 
 export function createMergedTypeResolver<
@@ -62,6 +137,18 @@ export function createMergedTypeResolver<
       type = getType(info),
       skipTypeMerging = true,
     ) {
+      // After the backbone plan has hydrated the tree, ignore classic
+      // leftover mergeFields → batchDelegate (that re-fetches inventory).
+      // Still allow batchDelegate while BACKBONE_EXECUTING so Island
+      // continues / planned entity hops via merge resolvers work.
+      if (
+        context != null &&
+        typeof context === 'object' &&
+        (context as any)[Symbol.for('graphql-tools.stitch.backboneHydrated')] &&
+        !(context as any)[Symbol.for('graphql-tools.stitch.backboneExecuting')]
+      ) {
+        return _originalResult;
+      }
       return batchDelegateToSchema({
         schema: subschema,
         operation: getMergeOperation(info, subschema, fieldName),

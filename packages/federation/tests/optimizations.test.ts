@@ -125,15 +125,72 @@ describe('Optimizations', () => {
     `;
     await normalizedExecutor({
       schema,
+      // Root proxy needs an object context to run the backbone plan.
+      contextValue: {},
       document: parse(query),
     });
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
-      // inventory: 1, (when computed fields definition removed)
-      inventory: 2,
+      // Sibling roots join the in-flight plan (no classic topProducts re-merge).
+      inventory: 1,
       products: 2,
-      reviews: 2,
+      reviews: 1,
     });
+  });
+
+  it('classic stitching also coalesces inventory @requires into one hop', async () => {
+    serviceCallCnt = {};
+    const serviceInputs = getServiceInputs();
+    const classicSchema = getStitchedSchemaFromSupergraphSdl({
+      classicStitching: true,
+      supergraphSdl: await getSupergraph(),
+      onSubschemaConfig(subschemaConfig) {
+        const subgraphName = subschemaConfig.name.toLowerCase();
+        const serviceInput = serviceInputs.find(
+          (input) => input.name === subgraphName,
+        );
+        if (!serviceInput) {
+          throw new Error(`Service ${subgraphName} not found`);
+        }
+        const executor = createDefaultExecutor(serviceInput.schema);
+        serviceCallCnt[subgraphName] = 0;
+        subschemaConfig.executor = (args) => {
+          serviceCallCnt[subgraphName]!++;
+          return executor(args);
+        };
+      },
+    });
+    const query = /* GraphQL */ `
+      fragment Product on Product {
+        inStock
+        name
+        price
+        shippingEstimate
+        upc
+        weight
+      }
+      query {
+        users {
+          id
+          reviews {
+            id
+            product {
+              ...Product
+            }
+          }
+        }
+        topProducts {
+          ...Product
+        }
+      }
+    `;
+    await normalizedExecutor({
+      schema: classicSchema,
+      contextValue: {},
+      document: parse(query),
+    });
+    // Adjacent-stage coalesce: inStock ∪ shippingEstimate after PRODUCTS deps.
+    expect(serviceCallCnt['inventory']).toBe(1);
   });
 });
 

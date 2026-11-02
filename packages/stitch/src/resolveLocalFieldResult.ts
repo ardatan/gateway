@@ -61,8 +61,8 @@ function valueSatisfiesSelectionSet(
  * - Payloads are raw resolver results keyed by literal field name, so
  *   aliased requests are matched by field name and aliased fields already in
  *   the payload are not fetched again. Hydrated results carry only literal
- *   field names; `defaultMergedResolver` falls back to the field name when
- *   the aliased response key is absent, so incoming query aliases resolve
+ *   field names; stitch `defaultMergedResolver` falls back to the field name
+ *   when the aliased response key is absent, so incoming query aliases resolve
  *   with plain graphql-js semantics.
  * - When merge keys of several subschemas are satisfied, a subschema without
  *   computed field dependencies starts the delegation. Type merging stays
@@ -269,6 +269,42 @@ function resolveOne<TContext extends Record<string, any>>(
           (resolved) => mergeDeep([value, resolved], false, false, false, true),
         );
       }
+    }
+  }
+  // Clone-less multi-entryPoints: try each entry's key selectionSet.
+  if (mergedTypeInfo.entryPointSelectionSets) {
+    const multiCandidates = [...mergedTypeInfo.entryPointSelectionSets].sort(
+      ([a], [b]) =>
+        Number(Boolean(a.merge?.[typeName]?.fields)) -
+        Number(Boolean(b.merge?.[typeName]?.fields)),
+    );
+    for (const [subschema, keySelectionSets] of multiCandidates) {
+      if (
+        !keySelectionSets.some((ks) => valueSatisfiesSelectionSet(value, ks))
+      ) {
+        continue;
+      }
+      const resolver = mergedTypeInfo.resolvers.get(subschema);
+      if (resolver == null) {
+        continue;
+      }
+      if (objectValue['__typename'] == null && !isAbstractType(returnType)) {
+        objectValue['__typename'] = typeName;
+      }
+      return handleMaybePromise(
+        () =>
+          resolver(
+            value,
+            context,
+            info,
+            subschema,
+            selectionSet,
+            undefined,
+            returnType,
+            false,
+          ),
+        (resolved) => mergeDeep([value, resolved], false, false, false, true),
+      );
     }
   }
   return value;

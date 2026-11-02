@@ -1,6 +1,9 @@
 import {
-  defaultMergedResolver,
+  getSubschema,
+  getUnpathedErrors,
+  isExternalObject,
   isSubschemaConfig,
+  resolveExternalValue,
   StitchingInfo,
   Subschema,
   SubschemaConfig,
@@ -31,7 +34,13 @@ import {
   isObjectType,
   isSpecifiedDirective,
   specifiedDirectives,
+  type GraphQLFieldResolver,
 } from 'graphql';
+import { attachBackboneExecutor } from './backbone/attachBackboneExecutor.js';
+import { isClassicStitchingEnabled } from './backbone/classicStitching.js';
+import { defaultMergedResolver as backboneDefaultMergedResolver } from './backbone/defaultMergedResolver.js';
+import { BACKBONE_EXECUTING } from './backbone/rootProxyingResolvers.js';
+import { classicMergedResolver } from './classicMergedResolver.js';
 import { resolveLocalFieldResult } from './resolveLocalFieldResult.js';
 import {
   addStitchingInfo,
@@ -39,7 +48,7 @@ import {
   createStitchingInfo,
 } from './stitchingInfo.js';
 import {
-  isolateComputedFieldsTransformer,
+  deferComputedFieldsTransformer,
   splitMergedTypeEntryPointsTransformer,
 } from './subschemaConfigTransforms/index.js';
 import { buildTypeCandidates, buildTypes } from './typeCandidates.js';
@@ -48,6 +57,11 @@ import {
   MergeTypeCandidate,
   SubschemaConfigTransform,
 } from './types.js';
+
+const BACKBONE_HYDRATED = Symbol.for('graphql-tools.stitch.backboneHydrated');
+const BACKBONE_EXECUTING_SYM = Symbol.for(
+  'graphql-tools.stitch.backboneExecuting',
+);
 
 export function stitchSchemas<
   TContext extends Record<string, any> = Record<string, any>,
@@ -120,16 +134,33 @@ export function stitchSchemas<
 
   stitchingInfo = completeStitchingInfo(stitchingInfo, finalResolvers, schema);
 
-  addLocalFieldResolvers(schema, finalResolvers, stitchingInfo, typeCandidates);
+  const classicStitching = isClassicStitchingEnabled({
+    classicStitching: options.classicStitching,
+  });
+  // Classic: resolve-time mergeFields (+ local hydration).
+  // Backbone: slim stitch defaultMergedResolver (plan owns entity hops).
+  const gatewayDefaultFieldResolver = classicStitching
+    ? classicMergedResolver
+    : backboneDefaultMergedResolver;
+
+  addLocalFieldResolvers(
+    schema,
+    finalResolvers,
+    stitchingInfo,
+    typeCandidates,
+    gatewayDefaultFieldResolver,
+  );
 
   schema = addResolversToSchema({
     schema,
-    defaultFieldResolver: defaultMergedResolver,
+    defaultFieldResolver: gatewayDefaultFieldResolver,
     resolvers: finalResolvers,
     resolverValidationOptions,
     inheritResolversFromInterfaces: false,
     updateResolversInPlace,
   });
+
+  wrapMergedTypeResolversForBackboneHydration(schema, stitchingInfo);
 
   const resolverValidationOptionsEntries = Object.entries(
     resolverValidationOptions,
@@ -152,7 +183,12 @@ export function stitchSchemas<
     applyExtensions(schema, mergedSchemaExtensions);
   }
 
-  return schema;
+  // Backbone executor + root proxying resolvers on the stitched schema (unless
+  // classicStitching / GRAPHQL_TOOLS_CLASSIC_STITCHING). Callers that mapSchema
+  // afterward (e.g. federation filter) must re-attach on the new instance.
+  return attachBackboneExecutor(schema, {
+    classicStitching: options.classicStitching,
+  });
 }
 
 function stripCustomDirectiveUsages(types: GraphQLNamedType[]): void {
@@ -247,11 +283,72 @@ function cloneResolverMap(
  * key fields of a merged type; those get delegated to the owning subschema so
  * the rest of the fields resolve through regular type merging.
  */
+/**
+ * Wrap merged-entity field resolvers: when the backbone plan has hydrated the
+ * tree (`BACKBONE_HYDRATED`), skip classic mergeFields on already-present
+ * fields. Otherwise call the previous resolver unchanged.
+ */
+function wrapMergedTypeResolversForBackboneHydration<
+  TContext extends Record<string, any>,
+>(schema: GraphQLSchema, stitchingInfo: StitchingInfo<TContext>): void {
+  for (const typeName of Object.keys(stitchingInfo.mergedTypes)) {
+    const type = schema.getType(typeName);
+    if (!isObjectType(type) && !isInterfaceType(type)) {
+      continue;
+    }
+    const locals = stitchingInfo.localFields?.get(typeName);
+    for (const [fieldName, field] of Object.entries(type.getFields())) {
+      if (locals?.has(fieldName)) {
+        continue;
+      }
+      const previous = field.resolve;
+      if (previous == null) {
+        continue;
+      }
+      field.resolve = function defaultMergedResolver(
+        parent: any,
+        args: any,
+        context: any,
+        info: any,
+      ) {
+        const backboneActive =
+          context != null &&
+          typeof context === 'object' &&
+          ((context as any)[BACKBONE_HYDRATED] ||
+            (context as any)[BACKBONE_EXECUTING_SYM]);
+        if (backboneActive && parent != null && isExternalObject(parent)) {
+          const responseKey =
+            info.fieldNodes[0]?.alias?.value ?? info.fieldName;
+          if (Object.prototype.hasOwnProperty.call(parent, responseKey)) {
+            return resolveExternalValue(
+              parent[responseKey],
+              getUnpathedErrors(parent),
+              getSubschema(parent, responseKey),
+              context,
+              info,
+              undefined,
+              true,
+            );
+          }
+          // Plan still running / already hydrated — do not schedule classic
+          // mergeFields DataLoader batches for missing entity fields.
+          if (Object.prototype.hasOwnProperty.call(parent, info.fieldName)) {
+            return parent[info.fieldName];
+          }
+          return undefined;
+        }
+        return previous(parent, args, context, info);
+      };
+    }
+  }
+}
+
 function addLocalFieldResolvers<TContext extends Record<string, any>>(
   schema: GraphQLSchema,
   resolvers: IResolvers,
   stitchingInfo: StitchingInfo<TContext>,
   typeCandidates: Record<string, Array<MergeTypeCandidate<TContext>>>,
+  gatewayDefaultFieldResolver: GraphQLFieldResolver<any, any>,
 ): void {
   const subschemaFields = new Set<string>();
   const localFields = new Map<string, Set<string>>();
@@ -297,6 +394,9 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
       fields.add(fieldName);
     }
   }
+  // Persist for the backbone planner (Island nodes).
+  stitchingInfo.localFields = localFields;
+
   for (const [typeName, fieldNames] of localFields) {
     const type = schema.getType(typeName);
     if (!isObjectType(type) && !isInterfaceType(type)) {
@@ -319,6 +419,13 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
       if (stitchingInfo.mergedTypes[namedType.name] == null) {
         continue;
       }
+      const originalResolve =
+        typeof existing === 'function' ? existing : existing?.resolve;
+      // Property-only locals use schema defaultFieldResolver (includes
+      // resolveLocalFieldResult). Only wrap real user resolvers.
+      if (originalResolve == null) {
+        continue;
+      }
       const namedTypeResolvers = resolvers[namedType.name];
       const providedFields =
         namedTypeResolvers != null && typeof namedTypeResolvers === 'object'
@@ -328,20 +435,36 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
               ),
             )
           : undefined;
-      const originalResolve =
-        typeof existing === 'function' ? existing : existing?.resolve;
-      // keep defaultMergedResolver as the base: it annotates delegated results
-      // as external objects on the way through, and falls back to plain
-      // property access for local payloads anyway
-      const baseResolve = originalResolve ?? defaultMergedResolver;
+      // After Island hydration, graphql-js re-walks and would re-invoke user
+      // resolvers without selectionSet deps — short-circuit via the gateway
+      // default. Otherwise run the user resolve then hydrate.
       const wrappedResolve = (
         parent: any,
         args: any,
         context: any,
         info: any,
-      ) =>
-        handleMaybePromise(
-          () => baseResolve(parent, args, context, info),
+      ) => {
+        if (
+          parent != null &&
+          typeof parent === 'object' &&
+          info != null &&
+          (context == null ||
+            typeof context !== 'object' ||
+            !(context as any)[BACKBONE_EXECUTING])
+        ) {
+          const responseKey =
+            typeof info.path?.key === 'string'
+              ? info.path.key
+              : (info.fieldName as string | undefined);
+          if (
+            responseKey != null &&
+            Object.prototype.hasOwnProperty.call(parent, responseKey)
+          ) {
+            return gatewayDefaultFieldResolver(parent, args, context, info);
+          }
+        }
+        return handleMaybePromise(
+          () => originalResolve(parent, args, context, info),
           (result) =>
             resolveLocalFieldResult(
               result,
@@ -351,6 +474,7 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
               providedFields,
             ),
         );
+      };
       if (existing != null && typeof existing === 'object') {
         existing.resolve = wrappedResolve;
       } else {
@@ -361,8 +485,11 @@ function addLocalFieldResolvers<TContext extends Record<string, any>>(
   }
 }
 
-const subschemaConfigTransformerPresets: Array<SubschemaConfigTransform<any>> =
-  [isolateComputedFieldsTransformer, splitMergedTypeEntryPointsTransformer];
+// Clone-less computed deferral + entrypoint split (isolation clones removed).
+const computedFieldPresets: Array<SubschemaConfigTransform<any>> = [
+  deferComputedFieldsTransformer,
+  splitMergedTypeEntryPointsTransformer,
+];
 
 function applySubschemaConfigTransforms<TContext = Record<string, any>>(
   subschemaConfigTransforms: Array<SubschemaConfigTransform<TContext>>,
@@ -390,7 +517,7 @@ function applySubschemaConfigTransforms<TContext = Record<string, any>>(
   }
 
   const transformedSubschemaConfigs = subschemaConfigTransforms
-    .concat(subschemaConfigTransformerPresets)
+    .concat(computedFieldPresets)
     .reduce(
       (transformedSubschemaConfigs, subschemaConfigTransform) =>
         transformedSubschemaConfigs.flatMap((ssConfig) =>

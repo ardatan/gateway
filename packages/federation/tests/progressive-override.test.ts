@@ -11,7 +11,7 @@ import { addMocksToSchema } from '@graphql-tools/mock';
 import { parse, print } from 'graphql';
 import { describe, expect, it } from 'vitest';
 
-describe.skip('Progressive Override', () => {
+describe('Progressive Override', () => {
   describe('Label processing', () => {
     it('from the root level', async () => {
       await using gw = createGatewayTester({

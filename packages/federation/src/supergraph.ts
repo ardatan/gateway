@@ -20,9 +20,12 @@ import {
   HTTPExecutorOptions,
 } from '@graphql-tools/executor-http';
 import {
+  attachBackboneExecutor,
   calculateSelectionScore,
   getDefaultFieldConfigMerger,
+  markChangedRootResolvesAsLocal,
   MergeFieldConfigCandidate,
+  snapshotRootFieldResolves,
   stitchSchemas,
   TypeMergingOptions,
   ValidationLevel,
@@ -183,6 +186,12 @@ export interface GetStitchingOptionsFromSupergraphSdlOpts {
   handleProgressiveOverride?: ProgressiveOverrideHandler;
 
   getRng?: () => number;
+
+  /**
+   * Classic resolve-time stitching instead of backbone. Also
+   * `GRAPHQL_TOOLS_CLASSIC_STITCHING=1`. Explicit value wins over env.
+   */
+  classicStitching?: boolean;
 }
 
 export interface ProgressiveOverrideInfo {
@@ -2343,6 +2352,7 @@ export function getStitchingOptionsFromSupergraphSdl(
       fieldConfigMerger,
     },
     schemaExtensions,
+    classicStitching: opts.classicStitching,
   };
 }
 
@@ -2360,12 +2370,27 @@ export function getStitchedSchemaFromSupergraphSdl(
   const stitchSchemasOpts = getStitchingOptionsFromSupergraphSdl(opts);
   opts.onStitchingOptions?.(stitchSchemasOpts);
   let supergraphSchema = stitchSchemas(stitchSchemasOpts);
+  // filterInternalFieldsAndTypes mapSchema → new schema; re-bind backbone.
   supergraphSchema = filterInternalFieldsAndTypes(supergraphSchema);
   if (opts.onStitchedSchema) {
+    const rootResolvesBefore = snapshotRootFieldResolves(supergraphSchema);
     supergraphSchema =
       opts.onStitchedSchema(supergraphSchema) || supergraphSchema;
+    // Late root resolver overrides (Query.me → local) must plan as Islands.
+    markChangedRootResolvesAsLocal(supergraphSchema, rootResolvesBefore);
   }
-  return supergraphSchema;
+  // Persist progressive-override plan-cache opts on schema.extensions so a
+  // later mapSchema + bare re-attach (e.g. filterInternalFieldsAndTypes) needs
+  // no options bag.
+  return attachBackboneExecutor(supergraphSchema, {
+    // Plan-cache keying only needs label + context; federation's handler also
+    // accepts resolve info when used as a field override callback.
+    handleProgressiveOverride: opts.handleProgressiveOverride
+      ? (label, context) =>
+          opts.handleProgressiveOverride!(label, context, undefined as any)
+      : undefined,
+    classicStitching: opts.classicStitching,
+  });
 }
 
 const anyTypeDefinitionNode: ScalarTypeDefinitionNode = {
