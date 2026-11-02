@@ -21,11 +21,19 @@ describe('Gateway', async () => {
     //     SUPERGRAPH: supergraph,
     //   },
     // }),
-    'Hive Gateway w/ Tools': await gateway({
+    'Hive Gateway w/ Tools (backbone)': await gateway({
       supergraph,
       env: {
         FORK: 1,
         NODE_ENV: 'production',
+      },
+    }),
+    'Hive Gateway w/ Tools (classic)': await gateway({
+      supergraph,
+      env: {
+        FORK: 1,
+        NODE_ENV: 'production',
+        GRAPHQL_TOOLS_CLASSIC_STITCHING: '1',
       },
     }),
     'Hive Gateway w/ Hive Router Query Planner': await gateway({
