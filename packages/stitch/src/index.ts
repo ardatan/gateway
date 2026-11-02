@@ -1,5 +1,8 @@
 export { stitchSchemas } from './stitchSchemas.js';
-export { createMergedTypeResolver } from './createMergedTypeResolver.js';
+export {
+  createMergedTypeResolver,
+  createMultiEntryMergedTypeResolver,
+} from './createMergedTypeResolver.js';
 export { forwardArgsToSelectionSet } from './selectionSetArgs.js';
 export { defaultMergedResolver } from './defaultMergedResolver.js';
 

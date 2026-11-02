@@ -154,6 +154,11 @@ function allKnownSubschemas(stitchingInfo: StitchingInfo): Subschema[] {
     for (const s of merged.selectionSets.keys()) {
       add(s);
     }
+    if (merged.entryPointSelectionSets) {
+      for (const s of merged.entryPointSelectionSets.keys()) {
+        add(s);
+      }
+    }
     for (const s of merged.resolvers.keys()) {
       add(s);
     }
@@ -1268,6 +1273,13 @@ function mergeKeySelectionsForType(
   };
   for (const selectionSet of mergedTypeInfo.selectionSets.values()) {
     addFrom(selectionSet);
+  }
+  if (mergedTypeInfo.entryPointSelectionSets) {
+    for (const sels of mergedTypeInfo.entryPointSelectionSets.values()) {
+      for (const selectionSet of sels) {
+        addFrom(selectionSet);
+      }
+    }
   }
   // Federation entities always key on `id` when present on the interface object.
   if (
@@ -4137,8 +4149,8 @@ function nestedEntityKeyDependsOn(
     return false;
   }
   const merged = stitchingInfo.mergedTypes[later.entityTypeName];
-  const keySel = merged?.selectionSets.get(later.subschema);
-  if (!keySel) {
+  const keySels = keySelectionSetsForSubschema(merged, later.subschema);
+  if (!keySels.length) {
     return false;
   }
   const laterPaths = fetchFlattenPaths(later);
@@ -4148,53 +4160,70 @@ function nestedEntityKeyDependsOn(
   if (!provided.size) {
     return false;
   }
-  for (const lp of laterPaths) {
-    for (const ep of earlierPaths) {
-      if (!(pathIsPrefix(lp, ep) && ep.length > lp.length)) {
-        continue;
-      }
-      const suffix = ep.slice(lp.length).map(String);
-      let cursor: SelectionSetNode | undefined = keySel;
-      for (let i = 0; i < suffix.length; i++) {
-        if (!cursor) {
-          break;
+  for (const keySel of keySels) {
+    for (const lp of laterPaths) {
+      for (const ep of earlierPaths) {
+        if (!(pathIsPrefix(lp, ep) && ep.length > lp.length)) {
+          continue;
         }
-        const seg = suffix[i]!;
-        let next: SelectionSetNode | undefined;
-        for (const sel of cursor.selections) {
-          if (sel.kind !== Kind.FIELD) {
-            continue;
+        const suffix = ep.slice(lp.length).map(String);
+        let cursor: SelectionSetNode | undefined = keySel;
+        for (let i = 0; i < suffix.length; i++) {
+          if (!cursor) {
+            break;
           }
-          const key = sel.alias?.value ?? sel.name.value;
-          if (key !== seg && sel.name.value !== seg) {
-            continue;
-          }
-          if (i === suffix.length - 1) {
-            // earlier is at this key field — need any nested key leaf it provides.
-            if (!sel.selectionSet) {
-              if (provided.has(sel.name.value)) {
-                return true;
-              }
-              break;
+          const seg = suffix[i]!;
+          let next: SelectionSetNode | undefined;
+          for (const sel of cursor.selections) {
+            if (sel.kind !== Kind.FIELD) {
+              continue;
             }
-            for (const leaf of sel.selectionSet.selections) {
-              if (
-                leaf.kind === Kind.FIELD &&
-                leaf.name.value !== '__typename' &&
-                provided.has(leaf.name.value)
-              ) {
-                return true;
+            const key = sel.alias?.value ?? sel.name.value;
+            if (key !== seg && sel.name.value !== seg) {
+              continue;
+            }
+            if (i === suffix.length - 1) {
+              // earlier is at this key field — need any nested key leaf it provides.
+              if (!sel.selectionSet) {
+                if (provided.has(sel.name.value)) {
+                  return true;
+                }
+                break;
+              }
+              for (const leaf of sel.selectionSet.selections) {
+                if (
+                  leaf.kind === Kind.FIELD &&
+                  leaf.name.value !== '__typename' &&
+                  provided.has(leaf.name.value)
+                ) {
+                  return true;
+                }
               }
             }
+            next = sel.selectionSet;
+            break;
           }
-          next = sel.selectionSet;
-          break;
+          cursor = next;
         }
-        cursor = next;
       }
     }
   }
   return false;
+}
+
+function keySelectionSetsForSubschema(
+  merged: StitchingInfo['mergedTypes'][string] | undefined,
+  subschema: Subschema,
+): SelectionSetNode[] {
+  if (!merged) {
+    return [];
+  }
+  const entrySels = merged.entryPointSelectionSets?.get(subschema);
+  if (entrySels != null && entrySels.length > 0) {
+    return entrySels;
+  }
+  const single = merged.selectionSets.get(subschema);
+  return single != null ? [single] : [];
 }
 
 /**
@@ -4235,9 +4264,9 @@ function entityKeyDependsOn(
   }
   // Only this hop's entity key selection — do not widen to every uniqueFields
   // entry (that falsely edges LINK↔PRICE via `price` and creates cycles).
+  // Multi-entryPoints: any key field from any entry can satisfy the hop.
   const keyFields = new Set<string>();
-  const keySel = merged.selectionSets.get(later.subschema);
-  if (keySel) {
+  for (const keySel of keySelectionSetsForSubschema(merged, later.subschema)) {
     for (const sel of keySel.selections) {
       if (sel.kind === Kind.FIELD && sel.name.value !== '__typename') {
         keyFields.add(sel.name.value);

@@ -271,5 +271,41 @@ function resolveOne<TContext extends Record<string, any>>(
       }
     }
   }
+  // Clone-less multi-entryPoints: try each entry's key selectionSet.
+  if (mergedTypeInfo.entryPointSelectionSets) {
+    const multiCandidates = [
+      ...mergedTypeInfo.entryPointSelectionSets,
+    ].sort(
+      ([a], [b]) =>
+        Number(Boolean(a.merge?.[typeName]?.fields)) -
+        Number(Boolean(b.merge?.[typeName]?.fields)),
+    );
+    for (const [subschema, keySelectionSets] of multiCandidates) {
+      if (!keySelectionSets.some((ks) => valueSatisfiesSelectionSet(value, ks))) {
+        continue;
+      }
+      const resolver = mergedTypeInfo.resolvers.get(subschema);
+      if (resolver == null) {
+        continue;
+      }
+      if (objectValue['__typename'] == null && !isAbstractType(returnType)) {
+        objectValue['__typename'] = typeName;
+      }
+      return handleMaybePromise(
+        () =>
+          resolver(
+            value,
+            context,
+            info,
+            subschema,
+            selectionSet,
+            undefined,
+            returnType,
+            false,
+          ),
+        (resolved) => mergeDeep([value, resolved], false, false, false, true),
+      );
+    }
+  }
   return value;
 }

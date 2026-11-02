@@ -63,14 +63,37 @@ function calculateDelegationStage(
   nonProxiableSubschemas: Array<Subschema>;
   unproxiableFieldNodes: Array<FieldNode>;
 } {
-  const { selectionSets, fieldSelectionSets, uniqueFields, nonUniqueFields } =
-    mergedTypeInfo;
+  const {
+    selectionSets,
+    entryPointSelectionSets,
+    fieldSelectionSets,
+    uniqueFields,
+    nonUniqueFields,
+  } = mergedTypeInfo;
 
   // Type-level merge-key only; field @requires checked per field below.
+  // Multi-entryPoints: proxiable when *any* entry's keys are already available
+  // (not require-all — that would regress multi-key federation).
   const proxiableSubschemas: Array<Subschema> = [];
   const nonProxiableSubschemas: Array<Subschema> = [];
 
   for (const t of targetSubschemas) {
+    const entrySels = entryPointSelectionSets?.get(t);
+    if (entrySels != null && entrySels.length > 0) {
+      const anyAvailable = entrySels.some((selectionSet) =>
+        subschemaTypesContainSelectionSet(
+          mergedTypeInfo,
+          sourceSubschemas,
+          selectionSet,
+        ),
+      );
+      if (anyAvailable) {
+        proxiableSubschemas.push(t);
+      } else {
+        nonProxiableSubschemas.push(t);
+      }
+      continue;
+    }
     const selectionSet = selectionSets.get(t);
     if (
       selectionSet != null &&
@@ -181,16 +204,31 @@ function calculateDelegationStage(
       if (provider == null) {
         continue;
       }
-      const typeSelectionSet = selectionSets.get(provider);
-      if (
-        typeSelectionSet != null &&
-        !subschemaTypesContainSelectionSet(
-          mergedTypeInfo,
-          sourceSubschemas,
-          typeSelectionSet,
-        )
-      ) {
-        continue;
+      const entrySels = entryPointSelectionSets?.get(provider);
+      if (entrySels != null && entrySels.length > 0) {
+        if (
+          !entrySels.some((selectionSet) =>
+            subschemaTypesContainSelectionSet(
+              mergedTypeInfo,
+              sourceSubschemas,
+              selectionSet,
+            ),
+          )
+        ) {
+          continue;
+        }
+      } else {
+        const typeSelectionSet = selectionSets.get(provider);
+        if (
+          typeSelectionSet != null &&
+          !subschemaTypesContainSelectionSet(
+            mergedTypeInfo,
+            sourceSubschemas,
+            typeSelectionSet,
+          )
+        ) {
+          continue;
+        }
       }
       const existing = delegationMap.get(provider);
       if (existing != null) {

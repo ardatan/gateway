@@ -142,6 +142,15 @@ export interface MergedTypeInfo<TContext = Record<string, any>> {
     Record<string, GraphQLNamedType>
   >;
   selectionSets: Map<Subschema<any, any, any, TContext>, SelectionSetNode>;
+  /**
+   * When a subschema keeps multiple `entryPoints` (no split clones), each
+   * entry's key selectionSet. DPB treats the subschema as proxiable when
+   * *any* entry's keys are already available on the sources.
+   */
+  entryPointSelectionSets?: Map<
+    Subschema<any, any, any, TContext>,
+    SelectionSetNode[]
+  >;
   fieldSelectionSets: Map<
     Subschema<any, any, any, TContext>,
     Record<string, SelectionSetNode>
