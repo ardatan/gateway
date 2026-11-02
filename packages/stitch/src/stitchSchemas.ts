@@ -1,5 +1,9 @@
 import {
+  getSubschema,
+  getUnpathedErrors,
+  isExternalObject,
   isSubschemaConfig,
+  resolveExternalValue,
   StitchingInfo,
   Subschema,
   SubschemaConfig,
@@ -53,6 +57,11 @@ import {
   MergeTypeCandidate,
   SubschemaConfigTransform,
 } from './types.js';
+
+const BACKBONE_HYDRATED = Symbol.for('graphql-tools.stitch.backboneHydrated');
+const BACKBONE_EXECUTING_SYM = Symbol.for(
+  'graphql-tools.stitch.backboneExecuting',
+);
 
 export function stitchSchemas<
   TContext extends Record<string, any> = Record<string, any>,
@@ -150,6 +159,8 @@ export function stitchSchemas<
     inheritResolversFromInterfaces: false,
     updateResolversInPlace,
   });
+
+  wrapMergedTypeResolversForBackboneHydration(schema, stitchingInfo);
 
   const resolverValidationOptionsEntries = Object.entries(
     resolverValidationOptions,
@@ -272,6 +283,66 @@ function cloneResolverMap(
  * key fields of a merged type; those get delegated to the owning subschema so
  * the rest of the fields resolve through regular type merging.
  */
+/**
+ * Wrap merged-entity field resolvers: when the backbone plan has hydrated the
+ * tree (`BACKBONE_HYDRATED`), skip classic mergeFields on already-present
+ * fields. Otherwise call the previous resolver unchanged.
+ */
+function wrapMergedTypeResolversForBackboneHydration<
+  TContext extends Record<string, any>,
+>(schema: GraphQLSchema, stitchingInfo: StitchingInfo<TContext>): void {
+  for (const typeName of Object.keys(stitchingInfo.mergedTypes)) {
+    const type = schema.getType(typeName);
+    if (!isObjectType(type) && !isInterfaceType(type)) {
+      continue;
+    }
+    const locals = stitchingInfo.localFields?.get(typeName);
+    for (const [fieldName, field] of Object.entries(type.getFields())) {
+      if (locals?.has(fieldName)) {
+        continue;
+      }
+      const previous = field.resolve;
+      if (previous == null) {
+        continue;
+      }
+      field.resolve = function defaultMergedResolver(
+        parent: any,
+        args: any,
+        context: any,
+        info: any,
+      ) {
+        const backboneActive =
+          context != null &&
+          typeof context === 'object' &&
+          ((context as any)[BACKBONE_HYDRATED] ||
+            (context as any)[BACKBONE_EXECUTING_SYM]);
+        if (backboneActive && parent != null && isExternalObject(parent)) {
+          const responseKey =
+            info.fieldNodes[0]?.alias?.value ?? info.fieldName;
+          if (Object.prototype.hasOwnProperty.call(parent, responseKey)) {
+            return resolveExternalValue(
+              parent[responseKey],
+              getUnpathedErrors(parent),
+              getSubschema(parent, responseKey),
+              context,
+              info,
+              undefined,
+              true,
+            );
+          }
+          // Plan still running / already hydrated — do not schedule classic
+          // mergeFields DataLoader batches for missing entity fields.
+          if (Object.prototype.hasOwnProperty.call(parent, info.fieldName)) {
+            return parent[info.fieldName];
+          }
+          return undefined;
+        }
+        return previous(parent, args, context, info);
+      };
+    }
+  }
+}
+
 function addLocalFieldResolvers<TContext extends Record<string, any>>(
   schema: GraphQLSchema,
   resolvers: IResolvers,

@@ -472,8 +472,71 @@ it('should consistently explain the query plan', async () => {
       "extensions": {
         "plan": [
           {
-            "query": "query ($__batch_reps_0: [_Any!]!, $__batch_reps_1: [_Any!]!) {
-      _e0: _entities(representations: $__batch_reps_0) {
+            "query": "query ($representations: [_Any!]!) {
+      _entities(representations: $representations) {
+        ... on Product {
+          __typename
+          inStock
+          shippingEstimate
+        }
+      }
+    }",
+            "subgraphName": "inventory",
+            "variables": {
+              "representations": [
+                {
+                  "__typename": "Product",
+                  "price": 899,
+                  "upc": "1",
+                  "weight": 100,
+                },
+                {
+                  "__typename": "Product",
+                  "price": 1299,
+                  "upc": "2",
+                  "weight": 1000,
+                },
+                {
+                  "__typename": "Product",
+                  "price": 54,
+                  "upc": "3",
+                  "weight": 50,
+                },
+              ],
+            },
+          },
+          {
+            "query": "query ($representations: [_Any!]!) {
+      _entities(representations: $representations) {
+        ... on Product {
+          __typename
+          name
+          price
+          weight
+        }
+      }
+    }",
+            "subgraphName": "products",
+            "variables": {
+              "representations": [
+                {
+                  "__typename": "Product",
+                  "upc": "1",
+                },
+                {
+                  "__typename": "Product",
+                  "upc": "2",
+                },
+                {
+                  "__typename": "Product",
+                  "upc": "3",
+                },
+              ],
+            },
+          },
+          {
+            "query": "query ($representations: [_Any!]!) {
+      _entities(representations: $representations) {
         ... on User {
           __typename
           reviews {
@@ -522,8 +585,6 @@ it('should consistently explain the query plan', async () => {
             }
           }
         }
-      }
-      _e1: _entities(representations: $__batch_reps_1) {
         ... on Product {
           __typename
           reviews {
@@ -561,7 +622,7 @@ it('should consistently explain the query plan', async () => {
     }",
             "subgraphName": "reviews",
             "variables": {
-              "__batch_reps_0": [
+              "representations": [
                 {
                   "__typename": "User",
                   "id": "1",
@@ -570,71 +631,6 @@ it('should consistently explain the query plan', async () => {
                   "__typename": "User",
                   "id": "2",
                 },
-              ],
-              "__batch_reps_1": [
-                {
-                  "__typename": "Product",
-                  "upc": "1",
-                },
-                {
-                  "__typename": "Product",
-                  "upc": "2",
-                },
-                {
-                  "__typename": "Product",
-                  "upc": "3",
-                },
-              ],
-            },
-          },
-          {
-            "query": "query ($representations: [_Any!]!) {
-      _entities(representations: $representations) {
-        ... on Product {
-          __typename
-          inStock
-          shippingEstimate
-        }
-      }
-    }",
-            "subgraphName": "inventory",
-            "variables": {
-              "representations": [
-                {
-                  "__typename": "Product",
-                  "price": 899,
-                  "upc": "1",
-                  "weight": 100,
-                },
-                {
-                  "__typename": "Product",
-                  "price": 1299,
-                  "upc": "2",
-                  "weight": 1000,
-                },
-                {
-                  "__typename": "Product",
-                  "price": 54,
-                  "upc": "3",
-                  "weight": 50,
-                },
-              ],
-            },
-          },
-          {
-            "query": "query ($representations: [_Any!]!) {
-      _entities(representations: $representations) {
-        ... on Product {
-          __typename
-          name
-          price
-          weight
-        }
-      }
-    }",
-            "subgraphName": "products",
-            "variables": {
-              "representations": [
                 {
                   "__typename": "Product",
                   "upc": "1",

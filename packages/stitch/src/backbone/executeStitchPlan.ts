@@ -55,6 +55,9 @@ import type {
   StitchPlanNode,
 } from './types.js';
 
+/** Same key as stitchSchemas wrap — skip classic mergeFields after plan hop. */
+const BACKBONE_HYDRATED = Symbol.for('graphql-tools.stitch.backboneHydrated');
+
 /**
  * Subgraph executor as configured on the Subschema. Gateway/fusion already
  * wraps with getBatchingExecutor when `batch` is enabled — do not re-wrap.
@@ -1718,6 +1721,9 @@ type BatchAliasPrep = {
   alias: string;
   parents: Array<Record<string, any>>;
   parentKeyIndex: number[];
+  /** Offset of this alias's keys inside the concatenated `representations` array. */
+  keyOffset: number;
+  keyCount: number;
 };
 
 /**
@@ -1741,10 +1747,11 @@ function isLeafOnlySelection(selectionSet: SelectionSetNode): boolean {
 }
 
 /**
- * Multi-type BatchFetch — Hive model: one prebuilt multi-alias `_entities`
- * document (`_e0`/`_e1`…), one subgraph HTTP round-trip, then per-alias merge.
- * Nested alias selections fall back to parallel Fetches (gateway `batch`
- * executor still collapses same-tick `_entities` into one HTTP).
+ * Multi-type BatchFetch — one prebuilt `_entities` document with inline
+ * fragments for every alias, one subgraph HTTP round-trip, then slice the
+ * result array by representation ranges. Nested alias selections fall back
+ * to parallel Fetches (gateway `batch` executor still collapses same-tick
+ * `_entities` into one HTTP).
  */
 function executeBatchFetchNode(
   node: Extract<StitchPlanNode, { kind: 'BatchFetch' }>,
@@ -1754,50 +1761,55 @@ function executeBatchFetchNode(
     return;
   }
 
-  // Prefer one multi-alias HTTP whenever the plan attached a document.
-  // Alias selectionSets stay unfiltered for the parallel-Fetch fallback;
-  // the document itself carries subgraph-filtered selections.
+  // Prefer one concatenated `_entities` HTTP whenever the plan attached a
+  // document. Alias selectionSets stay unfiltered for the parallel-Fetch
+  // fallback; the document itself carries subgraph-filtered selections.
   if (node.document) {
     const prepared: BatchAliasPrep[] = [];
-    const variables: Record<string, any> = Object.create(null);
-    let anyKeys = false;
+    const allKeys: any[] = [];
     let canRawBatch = true;
 
     for (let i = 0; i < node.aliases.length; i++) {
       const a = node.aliases[i]!;
-      const varName = a.representationsVariable ?? `__batch_reps_${i}`;
       const parents = collectAliasParents(
         ctx,
         a.entityTypeName,
         a.flattenPaths,
       );
       if (!parents.length) {
-        variables[varName] = [];
+        prepared.push({
+          alias: a.alias,
+          parents: [],
+          parentKeyIndex: [],
+          keyOffset: allKeys.length,
+          keyCount: 0,
+        });
         continue;
       }
-      const hopSubschema = node.subschema;
       const projected = projectRepresentations(
         parents,
-        hopSubschema,
+        node.subschema,
         a.entityTypeName,
       );
       if (!projected) {
         canRawBatch = false;
         break;
       }
-      variables[varName] = projected.keys;
-      if (projected.keys.length) {
-        anyKeys = true;
+      const keyOffset = allKeys.length;
+      for (const key of projected.keys) {
+        allKeys.push(key);
       }
       prepared.push({
         alias: a.alias,
         parents,
         parentKeyIndex: projected.parentKeyIndex,
+        keyOffset,
+        keyCount: projected.keys.length,
       });
     }
 
     if (canRawBatch) {
-      if (!anyKeys) {
+      if (!allKeys.length) {
         return;
       }
       const executor = getSubschemaExecutor(node.subschema);
@@ -1805,7 +1817,7 @@ function executeBatchFetchNode(
         () =>
           executor({
             document: node.document!,
-            variables,
+            variables: { representations: allKeys },
             context: ctx.contextValue,
             rootValue: ctx.rootValue,
             operationType: OperationTypeNode.QUERY,
@@ -1816,13 +1828,12 @@ function executeBatchFetchNode(
           if (result.errors?.length) {
             ctx.errors.push(...result.errors);
           }
-          const data = result.data;
-          if (!data || typeof data !== 'object') {
+          const entities = result.data?.['_entities'];
+          if (!Array.isArray(entities)) {
             return;
           }
           for (const prep of prepared) {
-            const entities = (data as Record<string, any>)[prep.alias];
-            if (!Array.isArray(entities)) {
+            if (!prep.keyCount) {
               continue;
             }
             for (let i = 0; i < prep.parents.length; i++) {
@@ -1830,7 +1841,7 @@ function executeBatchFetchNode(
               if (ki < 0) {
                 continue;
               }
-              const entity = entities[ki];
+              const entity = entities[prep.keyOffset + ki];
               if (entity instanceof Error) {
                 ctx.errors.push(entity);
                 continue;
@@ -1920,6 +1931,7 @@ export function executeStitchPlan(
         return finalizeRootResult(ctx);
       } finally {
         delete (contextValue as any)[BACKBONE_EXECUTING];
+        (contextValue as any)[BACKBONE_HYDRATED] = true;
       }
     },
   );

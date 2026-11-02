@@ -10,15 +10,19 @@ import type {
 
 export type PathSegment = string | number;
 
-/** One alias inside a multi-type BatchFetch (Hive-style `_e0` / `_e1`). */
+/**
+ * One hop inside a multi-type BatchFetch. The batched document uses a single
+ * `_entities(representations:)` with inline fragments; `alias` is only a stable id for
+ * plan dumps / debugging (results are sliced by representation ranges).
+ */
 export interface StitchBatchAlias {
-  /** Response key in the batched `_entities` document (`_e0`, …). */
+  /** Stable id for this hop (`_e0`, …) — not a response field alias. */
   alias: string;
   entityTypeName: string;
   /** Subgraph-local selection (foreign fields stripped at plan time). */
   selectionSet: SelectionSetNode;
   flattenPaths: PathSegment[][];
-  /** Variable name for this alias's representations (`__batch_reps_0`). */
+  /** Shared representations variable (`representations`). */
   representationsVariable?: string;
 }
 
@@ -68,9 +72,9 @@ export type StitchPlanNode =
       completesIds?: string[];
       dependsOn?: string[];
       subschema: Subschema;
-      /** Multi-type / multi-selection aliases → one subgraph HTTP call. */
+      /** Multi-type / multi-selection hops → one subgraph HTTP call. */
       aliases: StitchBatchAlias[];
-      /** Prebuilt multi-alias `_entities` document for one HTTP round-trip. */
+      /** Prebuilt single `_entities` document for one HTTP round-trip. */
       document?: DocumentNode;
     }
   | {

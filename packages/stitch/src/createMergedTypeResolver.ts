@@ -62,6 +62,22 @@ export function createMergedTypeResolver<
       type = getType(info),
       skipTypeMerging = true,
     ) {
+      // After the backbone plan has hydrated the tree, ignore classic
+      // leftover mergeFields → batchDelegate (that re-fetches inventory).
+      // Still allow batchDelegate while BACKBONE_EXECUTING so Island
+      // continues / planned entity hops via merge resolvers work.
+      if (
+        context != null &&
+        typeof context === 'object' &&
+        (context as any)[
+          Symbol.for('graphql-tools.stitch.backboneHydrated')
+        ] &&
+        !(context as any)[
+          Symbol.for('graphql-tools.stitch.backboneExecuting')
+        ]
+      ) {
+        return _originalResult;
+      }
       return batchDelegateToSchema({
         schema: subschema,
         operation: getMergeOperation(info, subschema, fieldName),

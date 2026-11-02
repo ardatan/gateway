@@ -331,62 +331,64 @@ function buildEntitiesDocument(
   };
 }
 
+/**
+ * One `_entities(representations:)` with inline fragments for every alias — classic
+ * batch-delegate shape. Results are sliced by representation ranges at
+ * execute time (no `_e0`/`_e1` multi-alias fields).
+ */
 function buildBatchEntitiesDocument(aliases: StitchBatchAlias[]): DocumentNode {
-  const variableDefinitions = aliases.map((a, i) => {
-    const varName = a.representationsVariable ?? `__batch_reps_${i}`;
-    return {
-      kind: Kind.VARIABLE_DEFINITION as const,
-      variable: {
-        kind: Kind.VARIABLE as const,
-        name: { kind: Kind.NAME as const, value: varName },
+  const inlineFragments = aliases.map((a) => ({
+    kind: Kind.INLINE_FRAGMENT as const,
+    typeCondition: {
+      kind: Kind.NAMED_TYPE as const,
+      name: {
+        kind: Kind.NAME as const,
+        value: a.entityTypeName,
       },
-      type: anyTypeRef(),
-    };
-  });
-  const selections = aliases.map((a, i) => {
-    const varName = a.representationsVariable ?? `__batch_reps_${i}`;
-    return {
-      kind: Kind.FIELD as const,
-      alias: { kind: Kind.NAME as const, value: a.alias },
-      name: { kind: Kind.NAME as const, value: '_entities' },
-      arguments: [
-        {
-          kind: Kind.ARGUMENT as const,
-          name: { kind: Kind.NAME as const, value: 'representations' },
-          value: {
-            kind: Kind.VARIABLE as const,
-            name: { kind: Kind.NAME as const, value: varName },
-          },
-        },
-      ],
-      selectionSet: {
-        kind: Kind.SELECTION_SET as const,
-        selections: [
-          {
-            kind: Kind.INLINE_FRAGMENT as const,
-            typeCondition: {
-              kind: Kind.NAMED_TYPE as const,
-              name: {
-                kind: Kind.NAME as const,
-                value: a.entityTypeName,
-              },
-            },
-            selectionSet: a.selectionSet,
-          },
-        ],
-      },
-    };
-  });
+    },
+    selectionSet: a.selectionSet,
+  }));
   return {
     kind: Kind.DOCUMENT,
     definitions: [
       {
         kind: Kind.OPERATION_DEFINITION,
         operation: 'query' as OperationTypeNode,
-        variableDefinitions,
+        variableDefinitions: [
+          {
+            kind: Kind.VARIABLE_DEFINITION as const,
+            variable: {
+              kind: Kind.VARIABLE as const,
+              name: { kind: Kind.NAME as const, value: 'representations' },
+            },
+            type: anyTypeRef(),
+          },
+        ],
         selectionSet: {
           kind: Kind.SELECTION_SET,
-          selections,
+          selections: [
+            {
+              kind: Kind.FIELD as const,
+              name: { kind: Kind.NAME as const, value: '_entities' },
+              arguments: [
+                {
+                  kind: Kind.ARGUMENT as const,
+                  name: { kind: Kind.NAME as const, value: 'representations' },
+                  value: {
+                    kind: Kind.VARIABLE as const,
+                    name: {
+                      kind: Kind.NAME as const,
+                      value: 'representations',
+                    },
+                  },
+                },
+              ],
+              selectionSet: {
+                kind: Kind.SELECTION_SET as const,
+                selections: inlineFragments,
+              },
+            },
+          ],
         },
       },
     ],
@@ -609,9 +611,10 @@ export function preparePlanDocuments(
   }
   if (root.kind === 'BatchFetch') {
     const schema = targetSchema(root.subschema);
-    const aliases: StitchBatchAlias[] = root.aliases.map((a, i) => ({
+    const aliases: StitchBatchAlias[] = root.aliases.map((a) => ({
       ...a,
-      representationsVariable: a.representationsVariable ?? `__batch_reps_${i}`,
+      // Shared representations var — execute concatenates per-alias keys.
+      representationsVariable: 'representations',
     }));
     const document = buildBatchEntitiesDocument(
       aliases.map((a) => ({

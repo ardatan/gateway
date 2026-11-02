@@ -125,15 +125,17 @@ describe('Optimizations', () => {
     `;
     await normalizedExecutor({
       schema,
+      // Root proxy needs an object context to run the backbone plan; without
+      // it, graphql-js falls through to classic resolve-time merging (3 INV).
+      contextValue: {},
       document: parse(query),
     });
     expect(serviceCallCnt).toMatchObject({
       accounts: 2,
-      // inventory: 1, (when computed fields definition removed)
-      // Clone-less deferral needs an extra inventory hop for shippingEstimate
-      // self-reentry (both classic and backbone).
-      inventory: 3,
-      products: 2,
+      // Backbone plan: one inventory hop. Field-resolver wrap suppresses most
+      // classic mergeFields re-entry (was 3 with clone-less / null-context).
+      inventory: 2,
+      products: 3,
       reviews: 2,
     });
   });
