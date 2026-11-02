@@ -524,7 +524,14 @@ function resolveMissingFieldFromSourceSubschema(
   // resolver is defaultMergedResolver again. Calling it with the same parent
   // recurses. Re-fetch via the nested schema's merged-type resolver for the
   // field owner when available.
-  if (resolve === defaultMergedResolver) {
+  //
+  // Match by identity *or* name: stitch's backbone hydration wrap is also
+  // named `defaultMergedResolver` but is a different function instance
+  // (wrapSchema-over-stitch + @defer without SubschemaConfig.defer).
+  if (
+    resolve === defaultMergedResolver ||
+    resolve.name === 'defaultMergedResolver'
+  ) {
     const innerStitchingInfo = originalSchema.extensions?.['stitchingInfo'] as
       | StitchingInfo
       | undefined;

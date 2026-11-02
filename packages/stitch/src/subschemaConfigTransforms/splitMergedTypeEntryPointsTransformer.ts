@@ -1,7 +1,4 @@
-import {
-  MergedTypeConfig,
-  SubschemaConfig,
-} from '@graphql-tools/delegate';
+import { MergedTypeConfig, SubschemaConfig } from '@graphql-tools/delegate';
 
 /**
  * Normalize merged-type `entryPoints` without cloning the subschema.

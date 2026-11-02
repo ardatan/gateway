@@ -1,7 +1,4 @@
-import type {
-  MergedTypeEntryPoint,
-  Subschema,
-} from '@graphql-tools/delegate';
+import type { MergedTypeEntryPoint, Subschema } from '@graphql-tools/delegate';
 import { parseSelectionSet } from '@graphql-tools/utils';
 import {
   DocumentNode,
@@ -11,6 +8,8 @@ import {
   isListType,
   isNonNullType,
   Kind,
+  ListTypeNode,
+  NamedTypeNode,
   OperationTypeNode,
   SelectionSetNode,
   TypeNode,
@@ -153,7 +152,10 @@ export function inferMergeArgName(
 
 function typeToAST(type: GraphQLType): TypeNode {
   if (isNonNullType(type)) {
-    return { kind: Kind.NON_NULL_TYPE, type: typeToAST(type.ofType) };
+    // GraphQLNonNull.ofType is never itself NonNull; AST NonNull only wraps
+    // Named | List.
+    const ofType = typeToAST(type.ofType) as NamedTypeNode | ListTypeNode;
+    return { kind: Kind.NON_NULL_TYPE, type: ofType };
   }
   if (isListType(type)) {
     return { kind: Kind.LIST_TYPE, type: typeToAST(type.ofType) };

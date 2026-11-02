@@ -34,7 +34,6 @@ import {
   FieldNode,
   getNamedType,
   GraphQLError,
-  GraphQLList,
   GraphQLOutputType,
   GraphQLSchema,
   isInterfaceType,
@@ -1027,8 +1026,8 @@ function tryExecuteEntitiesBatch(
   parents: Array<Record<string, any>>,
   hopSubschema: Subschema,
   ctx: BackboneExecutionContext,
-  info: Record<string, any>,
-  type: GraphQLOutputType,
+  _info: Record<string, any>,
+  _type: GraphQLOutputType,
 ): MaybePromise<void> | undefined {
   const typeName = node.entityTypeName!;
   const entry = getBatchedMergeEntry(hopSubschema, typeName);

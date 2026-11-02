@@ -273,15 +273,15 @@ function resolveOne<TContext extends Record<string, any>>(
   }
   // Clone-less multi-entryPoints: try each entry's key selectionSet.
   if (mergedTypeInfo.entryPointSelectionSets) {
-    const multiCandidates = [
-      ...mergedTypeInfo.entryPointSelectionSets,
-    ].sort(
+    const multiCandidates = [...mergedTypeInfo.entryPointSelectionSets].sort(
       ([a], [b]) =>
         Number(Boolean(a.merge?.[typeName]?.fields)) -
         Number(Boolean(b.merge?.[typeName]?.fields)),
     );
     for (const [subschema, keySelectionSets] of multiCandidates) {
-      if (!keySelectionSets.some((ks) => valueSatisfiesSelectionSet(value, ks))) {
+      if (
+        !keySelectionSets.some((ks) => valueSatisfiesSelectionSet(value, ks))
+      ) {
         continue;
       }
       const resolver = mergedTypeInfo.resolvers.get(subschema);

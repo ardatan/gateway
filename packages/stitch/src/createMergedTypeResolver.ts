@@ -42,7 +42,7 @@ function getMergeOperation(
 export function createMultiEntryMergedTypeResolver<
   TContext extends Record<string, any> = any,
 >(
-  mergedTypeConfig: MergedTypeConfig,
+  mergedTypeConfig: MergedTypeConfig<any, any, TContext>,
   mergedType?: GraphQLOutputType | string,
 ): MergedTypeResolver<TContext> | undefined {
   const entryPoints = mergedTypeConfig.entryPoints;
@@ -144,12 +144,8 @@ export function createMergedTypeResolver<
       if (
         context != null &&
         typeof context === 'object' &&
-        (context as any)[
-          Symbol.for('graphql-tools.stitch.backboneHydrated')
-        ] &&
-        !(context as any)[
-          Symbol.for('graphql-tools.stitch.backboneExecuting')
-        ]
+        (context as any)[Symbol.for('graphql-tools.stitch.backboneHydrated')] &&
+        !(context as any)[Symbol.for('graphql-tools.stitch.backboneExecuting')]
       ) {
         return _originalResult;
       }
